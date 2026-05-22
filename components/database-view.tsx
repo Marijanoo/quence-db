@@ -23,9 +23,15 @@ import { SearchCursor } from '@codemirror/search'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
+function getIpc(dbType: 'postgres' | 'mysql' | 'mongodb') {
+  if (dbType === 'mongodb') return window.electronAPI!.mongodb
+  if (dbType === 'mysql') return window.electronAPI!.mysql
+  return window.electronAPI!.pg
+}
+
 interface DbConnection {
   id: string
-  dbType: 'postgres' | 'mysql'
+  dbType: 'postgres' | 'mysql' | 'mongodb'
   label: string   // user-defined display name
   name: string    // auto-generated "host:port / db"
   host: string
@@ -182,6 +188,7 @@ interface QueryTab {
   databaseName: string | null
   schemaName?: string
   tableName?: string
+  dbType?: 'postgres' | 'mysql' | 'mongodb'
   page?: number
   pageSize?: number
   totalRows?: number
@@ -302,12 +309,12 @@ function vpnFileName(p: string) {
   return p.split(/[\\/]/).pop() ?? p
 }
 
-function parseConnectionString(str: string, dbType: 'postgres' | 'mysql'): Partial<{ host: string; port: string; database: string; user: string; password: string; ssl: boolean }> {
+function parseConnectionString(str: string, dbType: 'postgres' | 'mysql' | 'mongodb'): Partial<{ host: string; port: string; database: string; user: string; password: string; ssl: boolean }> {
   try {
     const url = new URL(str)
     return {
       host: url.hostname || 'localhost',
-      port: url.port || (dbType === 'mysql' ? '3306' : '5432'),
+      port: url.port || (dbType === 'mysql' ? '3306' : dbType === 'mongodb' ? '27017' : '5432'),
       database: url.pathname.replace(/^\//, '') || '',
       user: url.username ? decodeURIComponent(url.username) : '',
       password: url.password ? decodeURIComponent(url.password) : '',
@@ -319,7 +326,7 @@ function parseConnectionString(str: string, dbType: 'postgres' | 'mysql'): Parti
 }
 
 function NewConnectionDialog({ onConnect, onClose }: NewConnectionDialogProps) {
-  const [dbType, setDbType] = useState<'postgres' | 'mysql'>('postgres')
+  const [dbType, setDbType] = useState<'postgres' | 'mysql' | 'mongodb'>('postgres')
   const [connString, setConnString] = useState('')
   const [label, setLabel] = useState('')
   const [host, setHost] = useState('localhost')
@@ -336,17 +343,27 @@ function NewConnectionDialog({ onConnect, onClose }: NewConnectionDialogProps) {
   const [testResult, setTestResult] = useState<{ ok: boolean; msg: string } | null>(null)
   const [error, setError] = useState('')
 
-  const defaultPort = dbType === 'mysql' ? '3306' : '5432'
-  const name = `${host}:${port}${database ? ' / ' + database : ''}`
+  const defaultPort = dbType === 'mysql' ? '3306' : dbType === 'mongodb' ? '27017' : '5432'
+  const name = dbType === 'mongodb' ? (database ? `MongoDB / ${database}` : 'MongoDB') : `${host}:${port}${database ? ' / ' + database : ''}`
 
-  function switchDbType(t: 'postgres' | 'mysql') {
+  function switchDbType(t: 'postgres' | 'mysql' | 'mongodb') {
     setDbType(t)
     setTestResult(null)
     // Only auto-update port if it's still the default for the current type
-    setPort(prev => (prev === '5432' || prev === '3306') ? (t === 'mysql' ? '3306' : '5432') : prev)
+    setPort(prev => (prev === '5432' || prev === '3306' || prev === '27017') ? (t === 'mysql' ? '3306' : t === 'mongodb' ? '27017' : '5432') : prev)
+    if (t === 'mongodb') {
+      setHost(prev => prev.startsWith('mongodb') ? prev : 'mongodb://localhost:27017')
+    } else {
+      setHost(prev => prev.startsWith('mongodb') ? 'localhost' : prev)
+    }
   }
 
   function applyConnString(str: string) {
+    if (dbType === 'mongodb') {
+      setHost(str.trim())
+      setTestResult(null)
+      return
+    }
     const parsed = parseConnectionString(str.trim(), dbType)
     if (parsed.host) setHost(parsed.host)
     if (parsed.port) setPort(parsed.port)
@@ -357,13 +374,13 @@ function NewConnectionDialog({ onConnect, onClose }: NewConnectionDialogProps) {
     setTestResult(null)
   }
 
-  const ipc = dbType === 'mysql' ? window.electronAPI!.mysql : window.electronAPI!.pg
+  const ipc = getIpc(dbType)
 
   async function handleTest() {
     setTesting(true)
     setTestResult(null)
     const tempId = `test-${Date.now()}`
-    const res = await ipc.connect({ id: tempId, host, port: parseInt(port) || (dbType === 'mysql' ? 3306 : 5432), database, user, password, ssl, vpnConfigPath: vpnConfigPath || undefined, vpnUsername: vpnUsername || undefined, vpnPassword: vpnPassword || undefined })
+    const res = await ipc.connect({ id: tempId, host, port: parseInt(port) || (dbType === 'mysql' ? 3306 : dbType === 'mongodb' ? 27017 : 5432), database, user, password, ssl, vpnConfigPath: vpnConfigPath || undefined, vpnUsername: vpnUsername || undefined, vpnPassword: vpnPassword || undefined })
     await ipc.disconnect(tempId)
     setTestResult(res.ok ? { ok: true, msg: 'Connection successful' } : { ok: false, msg: res.error ?? 'Failed' })
     setTesting(false)
@@ -374,7 +391,7 @@ function NewConnectionDialog({ onConnect, onClose }: NewConnectionDialogProps) {
     setError('')
     setLoading(true)
     try {
-      await onConnect({ dbType, label: label.trim(), name, host, port: parseInt(port) || (dbType === 'mysql' ? 3306 : 5432), database, user, password, ssl, vpnConfigPath: vpnConfigPath || undefined, vpnUsername: vpnUsername || undefined, vpnPassword: vpnPassword || undefined })
+      await onConnect({ dbType, label: label.trim(), name, host, port: parseInt(port) || (dbType === 'mysql' ? 3306 : dbType === 'mongodb' ? 27017 : 5432), database, user, password, ssl, vpnConfigPath: vpnConfigPath || undefined, vpnUsername: vpnUsername || undefined, vpnPassword: vpnPassword || undefined })
       onClose()
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
@@ -398,7 +415,7 @@ function NewConnectionDialog({ onConnect, onClose }: NewConnectionDialogProps) {
         <form onSubmit={handleConnect} className="p-5 space-y-3">
           {/* DB type toggle */}
           <div className="flex items-center gap-1 p-0.5 bg-muted/40 rounded-md border border-border w-fit">
-            {(['postgres', 'mysql'] as const).map(t => (
+            {(['postgres', 'mysql', 'mongodb'] as const).map(t => (
               <button
                 key={t} type="button" onClick={() => switchDbType(t)}
                 className={cn(
@@ -406,29 +423,33 @@ function NewConnectionDialog({ onConnect, onClose }: NewConnectionDialogProps) {
                   dbType === t ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'
                 )}
               >
-                {t === 'postgres' ? 'PostgreSQL' : 'MySQL'}
+                {t === 'postgres' ? 'PostgreSQL' : t === 'mysql' ? 'MySQL' : 'MongoDB'}
               </button>
             ))}
           </div>
 
           {/* Connection string */}
           <div className="space-y-1">
-            <label className="text-xs text-muted-foreground">Connection String <span className="text-muted-foreground/50">(optional — paste to populate fields)</span></label>
+            <label className="text-xs text-muted-foreground">
+              {dbType === 'mongodb' ? 'Connection URI' : 'Connection String'} <span className="text-muted-foreground/50">{dbType === 'mongodb' ? '' : '(optional — paste to populate fields)'}</span>
+            </label>
             <div className="flex gap-2">
               <input
-                value={connString}
-                onChange={e => setConnString(e.target.value)}
-                placeholder={dbType === 'mysql' ? 'mysql://user:pass@host:3306/db' : 'postgresql://user:pass@host:5432/db'}
+                value={dbType === 'mongodb' ? host : connString}
+                onChange={e => dbType === 'mongodb' ? setHost(e.target.value) : setConnString(e.target.value)}
+                placeholder={dbType === 'mysql' ? 'mysql://user:pass@host:3306/db' : dbType === 'mongodb' ? 'mongodb://localhost:27017' : 'postgresql://user:pass@host:5432/db'}
                 className={cn(inputCls, 'flex-1 font-mono text-xs')}
               />
-              <button
-                type="button"
-                onClick={() => applyConnString(connString)}
-                disabled={!connString.trim()}
-                className="px-2.5 py-1.5 rounded text-xs border border-border text-muted-foreground hover:text-foreground hover:bg-accent/20 transition-colors shrink-0 disabled:opacity-40"
-              >
-                Apply
-              </button>
+              {dbType !== 'mongodb' && (
+                <button
+                  type="button"
+                  onClick={() => applyConnString(connString)}
+                  disabled={!connString.trim()}
+                  className="px-2.5 py-1.5 rounded text-xs border border-border text-muted-foreground hover:text-foreground hover:bg-accent/20 transition-colors shrink-0 disabled:opacity-40"
+                >
+                  Apply
+                </button>
+              )}
             </div>
           </div>
 
@@ -439,77 +460,86 @@ function NewConnectionDialog({ onConnect, onClose }: NewConnectionDialogProps) {
             <input value={label} onChange={e => setLabel(e.target.value)} placeholder="e.g. Production DB" className={inputCls} />
           </div>
 
-          <div className="grid grid-cols-3 gap-3">
-            <div className="col-span-2 space-y-1">
-              <label className="text-xs text-muted-foreground">Host</label>
-              <input value={host} onChange={e => setHost(e.target.value)} placeholder="localhost" className={inputCls} />
-            </div>
+          {dbType === 'mongodb' ? (
             <div className="space-y-1">
-              <label className="text-xs text-muted-foreground">Port</label>
-              <input value={port} onChange={e => setPort(e.target.value)} placeholder={defaultPort} className={inputCls} />
+              <label className="text-xs text-muted-foreground">Default Database <span className="text-muted-foreground/50">(optional)</span></label>
+              <input value={database} onChange={e => setDatabase(e.target.value)} placeholder="e.g. admin" className={inputCls} />
             </div>
-          </div>
-
-          <div className="space-y-1">
-            <label className="text-xs text-muted-foreground">Database</label>
-            <input value={database} onChange={e => setDatabase(e.target.value)} placeholder={dbType === 'mysql' ? 'my_database' : 'postgres'} className={inputCls} />
-          </div>
-
-          <div className="grid grid-cols-2 gap-3">
-            <div className="space-y-1">
-              <label className="text-xs text-muted-foreground">User</label>
-              <input value={user} onChange={e => setUser(e.target.value)} placeholder={dbType === 'mysql' ? 'root' : 'postgres'} className={inputCls} />
-            </div>
-            <div className="space-y-1">
-              <label className="text-xs text-muted-foreground">Password</label>
-              <input type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="••••••••" className={inputCls} />
-            </div>
-          </div>
-
-          <div className="flex items-center gap-2">
-            <button
-              type="button" onClick={() => setSsl(!ssl)}
-              className={cn("h-4 w-4 rounded flex items-center justify-center transition-all border shadow-sm", ssl ? "bg-primary border-primary text-primary-foreground" : "border-border/85 bg-background hover:border-border")}
-            >
-              {ssl && <Check className="h-3 w-3 stroke-[3.5]" />}
-            </button>
-            <span className="text-xs text-muted-foreground select-none cursor-pointer" onClick={() => setSsl(!ssl)}>SSL Connection</span>
-          </div>
-
-          <div className="space-y-1">
-            <label className="text-xs text-muted-foreground flex items-center gap-1">
-              <Shield className="h-3 w-3" /> OpenVPN Config <span className="text-muted-foreground/50">(optional)</span>
-            </label>
-            <div className="flex items-center gap-2">
-              <div className="flex-1 bg-background border border-border rounded px-2 py-1.5 text-xs text-muted-foreground truncate">
-                {vpnConfigPath ? vpnFileName(vpnConfigPath) : 'No .ovpn file selected'}
+          ) : (
+            <>
+              <div className="grid grid-cols-3 gap-3">
+                <div className="col-span-2 space-y-1">
+                  <label className="text-xs text-muted-foreground">Host</label>
+                  <input value={host} onChange={e => setHost(e.target.value)} placeholder="localhost" className={inputCls} />
+                </div>
+                <div className="space-y-1">
+                  <label className="text-xs text-muted-foreground">Port</label>
+                  <input value={port} onChange={e => setPort(e.target.value)} placeholder={defaultPort} className={inputCls} />
+                </div>
               </div>
-              <button
-                type="button"
-                onClick={async () => { const p = await window.electronAPI!.pg.selectOvpnFile(); if (p) setVpnConfigPath(p) }}
-                className="px-2.5 py-1.5 rounded text-xs border border-border text-muted-foreground hover:text-foreground hover:bg-accent/20 transition-colors shrink-0"
-              >
-                Browse
-              </button>
-              {vpnConfigPath && (
-                <button type="button" onClick={() => { setVpnConfigPath(''); setVpnUsername(''); setVpnPassword('') }} className="text-muted-foreground hover:text-foreground transition-colors">
-                  <X className="h-3.5 w-3.5" />
+
+              <div className="space-y-1">
+                <label className="text-xs text-muted-foreground">Database</label>
+                <input value={database} onChange={e => setDatabase(e.target.value)} placeholder={dbType === 'mysql' ? 'my_database' : 'postgres'} className={inputCls} />
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div className="space-y-1">
+                  <label className="text-xs text-muted-foreground">User</label>
+                  <input value={user} onChange={e => setUser(e.target.value)} placeholder={dbType === 'mysql' ? 'root' : 'postgres'} className={inputCls} />
+                </div>
+                <div className="space-y-1">
+                  <label className="text-xs text-muted-foreground">Password</label>
+                  <input type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="••••••••" className={inputCls} />
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button" onClick={() => setSsl(!ssl)}
+                  className={cn("h-4 w-4 rounded flex items-center justify-center transition-all border shadow-sm", ssl ? "bg-primary border-primary text-primary-foreground" : "border-border/85 bg-background hover:border-border")}
+                >
+                  {ssl && <Check className="h-3 w-3 stroke-[3.5]" />}
                 </button>
-              )}
-            </div>
-            {vpnConfigPath && (
-              <div className="grid grid-cols-2 gap-2 pt-1">
-                <div className="space-y-1">
-                  <label className="text-xs text-muted-foreground">VPN Username <span className="text-muted-foreground/50">(if required)</span></label>
-                  <input value={vpnUsername} onChange={e => setVpnUsername(e.target.value)} placeholder="username" className={inputCls} />
-                </div>
-                <div className="space-y-1">
-                  <label className="text-xs text-muted-foreground">VPN Password <span className="text-muted-foreground/50">(if required)</span></label>
-                  <input type="password" value={vpnPassword} onChange={e => setVpnPassword(e.target.value)} placeholder="••••••••" className={inputCls} />
-                </div>
+                <span className="text-xs text-muted-foreground select-none cursor-pointer" onClick={() => setSsl(!ssl)}>SSL Connection</span>
               </div>
-            )}
-          </div>
+
+              <div className="space-y-1">
+                <label className="text-xs text-muted-foreground flex items-center gap-1">
+                  <Shield className="h-3 w-3" /> OpenVPN Config <span className="text-muted-foreground/50">(optional)</span>
+                </label>
+                <div className="flex items-center gap-2">
+                  <div className="flex-1 bg-background border border-border rounded px-2 py-1.5 text-xs text-muted-foreground truncate">
+                    {vpnConfigPath ? vpnFileName(vpnConfigPath) : 'No .ovpn file selected'}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={async () => { const p = await window.electronAPI!.pg.selectOvpnFile(); if (p) setVpnConfigPath(p) }}
+                    className="px-2.5 py-1.5 rounded text-xs border border-border text-muted-foreground hover:text-foreground hover:bg-accent/20 transition-colors shrink-0"
+                  >
+                    Browse
+                  </button>
+                  {vpnConfigPath && (
+                    <button type="button" onClick={() => { setVpnConfigPath(''); setVpnUsername(''); setVpnPassword('') }} className="text-muted-foreground hover:text-foreground transition-colors">
+                      <X className="h-3.5 w-3.5" />
+                    </button>
+                  )}
+                </div>
+                {vpnConfigPath && (
+                  <div className="grid grid-cols-2 gap-2 pt-1">
+                    <div className="space-y-1">
+                      <label className="text-xs text-muted-foreground">VPN Username <span className="text-muted-foreground/50">(if required)</span></label>
+                      <input value={vpnUsername} onChange={e => setVpnUsername(e.target.value)} placeholder="username" className={inputCls} />
+                    </div>
+                    <div className="space-y-1">
+                      <label className="text-xs text-muted-foreground">VPN Password <span className="text-muted-foreground/50">(if required)</span></label>
+                      <input type="password" value={vpnPassword} onChange={e => setVpnPassword(e.target.value)} placeholder="••••••••" className={inputCls} />
+                    </div>
+                  </div>
+                )}
+              </div>
+            </>
+          )}
 
           {error && (
             <div className="flex items-start gap-2 rounded-md border border-red-500/30 bg-red-950/60 px-3 py-2">
@@ -585,8 +615,8 @@ function EditConnectionDialog({ conn, onSave, onDisconnectAndEdit, onClose }: Ed
     setTesting(true)
     setTestResult(null)
     const tempId = `test-${Date.now()}`
-    const ipc = conn.dbType === 'mysql' ? window.electronAPI!.mysql : window.electronAPI!.pg
-    const res = await ipc.connect({ id: tempId, host, port: parseInt(port) || (conn.dbType === 'mysql' ? 3306 : 5432), database, user, password, ssl, vpnConfigPath: vpnConfigPath || undefined, vpnUsername: vpnUsername || undefined, vpnPassword: vpnPassword || undefined })
+    const ipc = getIpc(conn.dbType)
+    const res = await ipc.connect({ id: tempId, host, port: parseInt(port) || (conn.dbType === 'mysql' ? 3306 : conn.dbType === 'mongodb' ? 27017 : 5432), database, user, password, ssl, vpnConfigPath: vpnConfigPath || undefined, vpnUsername: vpnUsername || undefined, vpnPassword: vpnPassword || undefined })
     await ipc.disconnect(tempId)
     setTestResult(res.ok ? { ok: true, msg: 'Connection successful' } : { ok: false, msg: res.error ?? 'Failed' })
     setTesting(false)
@@ -603,9 +633,9 @@ function EditConnectionDialog({ conn, onSave, onDisconnectAndEdit, onClose }: Ed
     e.preventDefault()
     setError('')
     setLoading(true)
-    const name = `${host}:${port}${database ? ' / ' + database : ''}`
+    const name = conn.dbType === 'mongodb' ? (database ? `MongoDB / ${database}` : 'MongoDB') : `${host}:${port}${database ? ' / ' + database : ''}`
     try {
-      await onSave(conn.id, { dbType: conn.dbType, label: label.trim(), name, host, port: parseInt(port) || (conn.dbType === 'mysql' ? 3306 : 5432), database, user, password, ssl, vpnConfigPath: vpnConfigPath || undefined, vpnUsername: vpnUsername || undefined, vpnPassword: vpnPassword || undefined })
+      await onSave(conn.id, { dbType: conn.dbType, label: label.trim(), name, host, port: parseInt(port) || (conn.dbType === 'mysql' ? 3306 : conn.dbType === 'mongodb' ? 27017 : 5432), database, user, password, ssl, vpnConfigPath: vpnConfigPath || undefined, vpnUsername: vpnUsername || undefined, vpnPassword: vpnPassword || undefined })
       onClose()
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
@@ -655,96 +685,114 @@ function EditConnectionDialog({ conn, onSave, onDisconnectAndEdit, onClose }: Ed
               <input value={label} onChange={e => setLabel(e.target.value)} placeholder="e.g. Production DB"
                 className="w-full bg-background border border-border rounded px-2 py-1.5 text-sm text-foreground outline-none focus:ring-1 focus:ring-primary" />
             </div>
-            <div className="grid grid-cols-3 gap-3">
-              <div className="col-span-2 space-y-1">
-                <label className="text-xs text-muted-foreground">Host</label>
-                <input value={host} onChange={e => setHost(e.target.value)} placeholder="localhost"
-                  className="w-full bg-background border border-border rounded px-2 py-1.5 text-sm text-foreground outline-none focus:ring-1 focus:ring-primary" />
-              </div>
-              <div className="space-y-1">
-                <label className="text-xs text-muted-foreground">Port</label>
-                <input value={port} onChange={e => setPort(e.target.value)} placeholder="5432"
-                  className="w-full bg-background border border-border rounded px-2 py-1.5 text-sm text-foreground outline-none focus:ring-1 focus:ring-primary" />
-              </div>
-            </div>
-            <div className="space-y-1">
-              <label className="text-xs text-muted-foreground">Database</label>
-              <input value={database} onChange={e => setDatabase(e.target.value)} placeholder="postgres"
-                className="w-full bg-background border border-border rounded px-2 py-1.5 text-sm text-foreground outline-none focus:ring-1 focus:ring-primary" />
-            </div>
-            <div className="grid grid-cols-2 gap-3">
-              <div className="space-y-1">
-                <label className="text-xs text-muted-foreground">User</label>
-                <input value={user} onChange={e => setUser(e.target.value)} placeholder="postgres"
-                  className="w-full bg-background border border-border rounded px-2 py-1.5 text-sm text-foreground outline-none focus:ring-1 focus:ring-primary" />
-              </div>
-              <div className="space-y-1">
-                <label className="text-xs text-muted-foreground">Password</label>
-                <input type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="••••••••"
-                  className="w-full bg-background border border-border rounded px-2 py-1.5 text-sm text-foreground outline-none focus:ring-1 focus:ring-primary" />
-              </div>
-            </div>
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={() => setSsl(!ssl)}
-                className={cn(
-                  "h-4 w-4 rounded flex items-center justify-center transition-all border shadow-sm",
-                  ssl
-                    ? "bg-primary border-primary text-primary-foreground"
-                    : "border-border/85 bg-background hover:border-border"
-                )}
-              >
-                {ssl && <Check className="h-3 w-3 stroke-[3.5]" />}
-              </button>
-              <span className="text-xs text-muted-foreground select-none cursor-pointer" onClick={() => setSsl(!ssl)}>SSL Connection</span>
-            </div>
-            <div className="space-y-1">
-              <label className="text-xs text-muted-foreground flex items-center gap-1">
-                <Shield className="h-3 w-3" /> OpenVPN Config <span className="text-muted-foreground/50">(optional)</span>
-              </label>
-              <div className="flex items-center gap-2">
-                <div className="flex-1 bg-background border border-border rounded px-2 py-1.5 text-xs text-muted-foreground truncate">
-                  {vpnConfigPath ? vpnFileName(vpnConfigPath) : 'No .ovpn file selected'}
+
+            {conn.dbType === 'mongodb' ? (
+              <>
+                <div className="space-y-1">
+                  <label className="text-xs text-muted-foreground">Connection URI</label>
+                  <input value={host} onChange={e => setHost(e.target.value)} placeholder="mongodb://localhost:27017"
+                    className="w-full bg-background border border-border rounded px-2 py-1.5 text-sm text-foreground outline-none focus:ring-1 focus:ring-primary" />
                 </div>
-                <button
-                  type="button"
-                  onClick={async () => {
-                    const p = await window.electronAPI!.pg.selectOvpnFile()
-                    if (p) setVpnConfigPath(p)
-                  }}
-                  className="px-2.5 py-1.5 rounded text-xs border border-border text-muted-foreground hover:text-foreground hover:bg-accent/20 transition-colors shrink-0"
-                >
-                  Browse
-                </button>
-                {vpnConfigPath && (
-                  <button type="button" onClick={() => { setVpnConfigPath(''); setVpnUsername(''); setVpnPassword('') }} className="text-muted-foreground hover:text-foreground transition-colors">
-                    <X className="h-3.5 w-3.5" />
+                <div className="space-y-1">
+                  <label className="text-xs text-muted-foreground">Default Database <span className="text-muted-foreground/50">(optional)</span></label>
+                  <input value={database} onChange={e => setDatabase(e.target.value)} placeholder="e.g. admin"
+                    className="w-full bg-background border border-border rounded px-2 py-1.5 text-sm text-foreground outline-none focus:ring-1 focus:ring-primary" />
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="grid grid-cols-3 gap-3">
+                  <div className="col-span-2 space-y-1">
+                    <label className="text-xs text-muted-foreground">Host</label>
+                    <input value={host} onChange={e => setHost(e.target.value)} placeholder="localhost"
+                      className="w-full bg-background border border-border rounded px-2 py-1.5 text-sm text-foreground outline-none focus:ring-1 focus:ring-primary" />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-xs text-muted-foreground">Port</label>
+                    <input value={port} onChange={e => setPort(e.target.value)} placeholder="5432"
+                      className="w-full bg-background border border-border rounded px-2 py-1.5 text-sm text-foreground outline-none focus:ring-1 focus:ring-primary" />
+                  </div>
+                </div>
+                <div className="space-y-1">
+                  <label className="text-xs text-muted-foreground">Database</label>
+                  <input value={database} onChange={e => setDatabase(e.target.value)} placeholder="postgres"
+                    className="w-full bg-background border border-border rounded px-2 py-1.5 text-sm text-foreground outline-none focus:ring-1 focus:ring-primary" />
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="space-y-1">
+                    <label className="text-xs text-muted-foreground">User</label>
+                    <input value={user} onChange={e => setUser(e.target.value)} placeholder="postgres"
+                      className="w-full bg-background border border-border rounded px-2 py-1.5 text-sm text-foreground outline-none focus:ring-1 focus:ring-primary" />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-xs text-muted-foreground">Password</label>
+                    <input type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="••••••••"
+                      className="w-full bg-background border border-border rounded px-2 py-1.5 text-sm text-foreground outline-none focus:ring-1 focus:ring-primary" />
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setSsl(!ssl)}
+                    className={cn(
+                      "h-4 w-4 rounded flex items-center justify-center transition-all border shadow-sm",
+                      ssl
+                        ? "bg-primary border-primary text-primary-foreground"
+                        : "border-border/85 bg-background hover:border-border"
+                    )}
+                  >
+                    {ssl && <Check className="h-3 w-3 stroke-[3.5]" />}
                   </button>
-                )}
-              </div>
-              {vpnConfigPath && (
-                <div className="grid grid-cols-2 gap-2 pt-1">
-                  <div className="space-y-1">
-                    <label className="text-xs text-muted-foreground">VPN Username <span className="text-muted-foreground/50">(if required)</span></label>
-                    <input
-                      value={vpnUsername} onChange={e => setVpnUsername(e.target.value)}
-                      placeholder="username"
-                      className="w-full bg-background border border-border rounded px-2 py-1.5 text-sm text-foreground outline-none focus:ring-1 focus:ring-primary"
-                    />
-                  </div>
-                  <div className="space-y-1">
-                    <label className="text-xs text-muted-foreground">VPN Password <span className="text-muted-foreground/50">(if required)</span></label>
-                    <input
-                      type="password"
-                      value={vpnPassword} onChange={e => setVpnPassword(e.target.value)}
-                      placeholder="••••••••"
-                      className="w-full bg-background border border-border rounded px-2 py-1.5 text-sm text-foreground outline-none focus:ring-1 focus:ring-primary"
-                    />
-                  </div>
+                  <span className="text-xs text-muted-foreground select-none cursor-pointer" onClick={() => setSsl(!ssl)}>SSL Connection</span>
                 </div>
-              )}
-            </div>
+                <div className="space-y-1">
+                  <label className="text-xs text-muted-foreground flex items-center gap-1">
+                    <Shield className="h-3 w-3" /> OpenVPN Config <span className="text-muted-foreground/50">(optional)</span>
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <div className="flex-1 bg-background border border-border rounded px-2 py-1.5 text-xs text-muted-foreground truncate">
+                      {vpnConfigPath ? vpnFileName(vpnConfigPath) : 'No .ovpn file selected'}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        const p = await window.electronAPI!.pg.selectOvpnFile()
+                        if (p) setVpnConfigPath(p)
+                      }}
+                      className="px-2.5 py-1.5 rounded text-xs border border-border text-muted-foreground hover:text-foreground hover:bg-accent/20 transition-colors shrink-0"
+                    >
+                      Browse
+                    </button>
+                    {vpnConfigPath && (
+                      <button type="button" onClick={() => { setVpnConfigPath(''); setVpnUsername(''); setVpnPassword('') }} className="text-muted-foreground hover:text-foreground transition-colors">
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    )}
+                  </div>
+                  {vpnConfigPath && (
+                    <div className="grid grid-cols-2 gap-2 pt-1">
+                      <div className="space-y-1">
+                        <label className="text-xs text-muted-foreground">VPN Username <span className="text-muted-foreground/50">(if required)</span></label>
+                        <input
+                          value={vpnUsername} onChange={e => setVpnUsername(e.target.value)}
+                          placeholder="username"
+                          className="w-full bg-background border border-border rounded px-2 py-1.5 text-sm text-foreground outline-none focus:ring-1 focus:ring-primary"
+                        />
+                      </div>
+                      <div className="space-y-1">
+                        <label className="text-xs text-muted-foreground">VPN Password <span className="text-muted-foreground/50">(if required)</span></label>
+                        <input
+                          type="password"
+                          value={vpnPassword} onChange={e => setVpnPassword(e.target.value)}
+                          placeholder="••••••••"
+                          className="w-full bg-background border border-border rounded px-2 py-1.5 text-sm text-foreground outline-none focus:ring-1 focus:ring-primary"
+                        />
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
             {error && (
               <div className="flex items-start gap-2 rounded-md border border-red-500/30 bg-red-950/60 px-3 py-2">
                 <X className="h-3.5 w-3.5 text-red-300 shrink-0 mt-0.5" />
@@ -936,7 +984,7 @@ function ConnectionsPanel({
 
   const dbIpc = (connId: string) => {
     const conn = connections.find(c => c.id === connId)
-    return conn?.dbType === 'mysql' ? window.electronAPI!.mysql : window.electronAPI!.pg
+    return getIpc(conn?.dbType ?? 'postgres')
   }
 
   const selectConn = (id: string) => {
@@ -1108,6 +1156,8 @@ function ConnectionsPanel({
                 <span className="truncate flex-1">{conn.label || conn.name}</span>
                 {conn.dbType === 'mysql'
                   ? <span className="shrink-0 text-[9px] font-semibold px-1 rounded bg-orange-500/20 text-orange-400 leading-4">MySQL</span>
+                  : conn.dbType === 'mongodb'
+                  ? <span className="shrink-0 text-[9px] font-semibold px-1 rounded bg-emerald-500/20 text-emerald-400 leading-4">Mongo</span>
                   : <span className="shrink-0 text-[9px] font-semibold px-1 rounded bg-blue-500/20 text-blue-400 leading-4">PgSQL</span>
                 }
                 {conn.status === 'connecting' && <Loader2 className="h-3 w-3 animate-spin shrink-0" />}
@@ -1202,7 +1252,7 @@ function ConnectionsPanel({
                   {/* Schemas */}
                   {(needle ? true : db.open) && db.schemas.filter(schema => !needle || matchingSchemas.has(`${conn.id}::${db.name}::${schema.name}`)).map(schema => {
                     const schemaKey = `${conn.id}::${db.name}::${schema.name}`
-                    const isMysql = conn.dbType === 'mysql'
+                    const isMysql = conn.dbType === 'mysql' || conn.dbType === 'mongodb'
                     const groupIndent = isMysql ? 32 : 48
                     const itemIndent = isMysql ? 48 : 64
                     const enumItemIndent = isMysql ? 56 : 72
@@ -1248,7 +1298,7 @@ function ConnectionsPanel({
                                 >
                                   {open ? <ChevronDown className="h-3 w-3 shrink-0" /> : <ChevronRight className="h-3 w-3 shrink-0" />}
                                   <Table2 className="h-3 w-3 text-primary shrink-0" />
-                                  <span>Tables</span>
+                                  <span>{conn.dbType === 'mongodb' ? 'Collections' : 'Tables'}</span>
                                   <span className="ml-1 text-muted-foreground/50">({needle ? visibleTables.length : schema.tables.length})</span>
                                 </button>
                                 {open && (
@@ -1273,7 +1323,7 @@ function ConnectionsPanel({
                                             : <Table2 className="h-3.5 w-3.5 text-primary shrink-0" />
                                           }
                                           <span className="truncate flex-1">{t.name}</span>
-                                          {t.type !== 'VIEW' && (
+                                          {t.type !== 'VIEW' && conn.dbType !== 'mongodb' && (
                                             <button
                                               onClick={e => { e.stopPropagation(); onOpenTableDesign(conn.id, db.name, schema.name, t.name) }}
                                               title="Design table schema"
@@ -1287,7 +1337,7 @@ function ConnectionsPanel({
                                     })
                                   ) : (
                                     <div className="text-muted-foreground/45 text-[10px] py-0.5 select-none font-sans italic" style={{ paddingLeft: itemIndent }}>
-                                      No tables
+                                      {conn.dbType === 'mongodb' ? 'No collections' : 'No tables'}
                                     </div>
                                   )
                                 )}
@@ -1703,7 +1753,7 @@ function QueryTabBar({
 
 // ── Results grid (standalone to avoid inline-component remount lag) ────────────
 
-function SingleResultGrid({ result, columnTypes }: { result: QueryResult; columnTypes?: ColumnInfo[] }) {
+function SingleResultGrid({ result, columnTypes, dbType }: { result: QueryResult; columnTypes?: ColumnInfo[]; dbType?: 'postgres' | 'mysql' | 'mongodb' }) {
   const [selectedCell, setSelectedCell] = useState<{ ri: number; col: string } | null>(null)
   const [editingCell, setEditingCell] = useState<{ ri: number; col: string } | null>(null)
   const [rowSearch, setRowSearch] = useState('')
@@ -1711,10 +1761,51 @@ function SingleResultGrid({ result, columnTypes }: { result: QueryResult; column
   const [exportMenuOpen, setExportMenuOpen] = useState(false)
   const [sortCol, setSortCol] = useState<string | null>(null)
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc')
+  const [expandedColumns, setExpandedColumns] = useState<Set<string>>(new Set())
   const gridRef = React.useRef<HTMLDivElement>(null)
   const exportBtnRef = React.useRef<HTMLButtonElement>(null)
 
-  useEffect(() => { setSelectedCell(null); setEditingCell(null); setRowSearch(''); setRowFilter(''); setExportMenuOpen(false); setSortCol(null) }, [result])
+  const visibleFields = React.useMemo(() => {
+    const rootFields = result.fields.filter(f => !f.includes('.') || !result.fields.includes(f.split('.')[0]))
+    if (rootFields.length === 0) return result.fields
+
+    const fieldsList: string[] = []
+    const visited = new Set<string>()
+
+    function addFieldAndChildren(field: string) {
+      if (visited.has(field)) return
+      visited.add(field)
+      fieldsList.push(field)
+
+      if (expandedColumns.has(field)) {
+        const childKeys = new Set<string>()
+        for (const row of result.rows) {
+          const val = getNestedValue(row, field)
+          if (
+            val !== null &&
+            typeof val === 'object' &&
+            !Array.isArray(val) &&
+            !(val instanceof Date) &&
+            val.constructor?.name !== 'ObjectID' &&
+            val.constructor?.name !== 'ObjectId' &&
+            !(val as any)._bsontype
+          ) {
+            Object.keys(val).forEach(k => {
+              childKeys.add(`${field}.${k}`)
+            })
+          }
+        }
+        Array.from(childKeys).sort().forEach(childField => {
+          addFieldAndChildren(childField)
+        })
+      }
+    }
+
+    rootFields.forEach(f => addFieldAndChildren(f))
+    return fieldsList
+  }, [result.fields, result.rows, expandedColumns, dbType])
+
+  useEffect(() => { setSelectedCell(null); setEditingCell(null); setRowSearch(''); setRowFilter(''); setExportMenuOpen(false); setSortCol(null); setExpandedColumns(new Set()) }, [result])
 
   const handleSortClick = (col: string) => {
     if (sortCol === col) {
@@ -1755,10 +1846,10 @@ function SingleResultGrid({ result, columnTypes }: { result: QueryResult; column
 
   const handleExportCsv = () => {
     if (result.rows.length === 0) return
-    const headers = result.fields.join(',')
+    const headers = visibleFields.join(',')
     const rows = result.rows.map(row => 
-      result.fields.map(field => {
-        const val = row[field]
+      visibleFields.map(field => {
+        const val = getNestedValue(row, field)
         if (val === null) return ''
         const str = typeof val === 'object' ? JSON.stringify(val) : String(val)
         if (str.includes(',') || str.includes('"') || str.includes('\n')) {
@@ -1788,11 +1879,11 @@ function SingleResultGrid({ result, columnTypes }: { result: QueryResult; column
 
   const handleCopyMarkdown = () => {
     if (result.rows.length === 0) return
-    const headers = '| ' + result.fields.join(' | ') + ' |'
-    const separators = '| ' + result.fields.map(() => '---').join(' | ') + ' |'
+    const headers = '| ' + visibleFields.join(' | ') + ' |'
+    const separators = '| ' + visibleFields.map(() => '---').join(' | ') + ' |'
     const rows = result.rows.map(row => 
-      '| ' + result.fields.map(field => {
-        const val = row[field]
+      '| ' + visibleFields.map(field => {
+        const val = getNestedValue(row, field)
         if (val === null) return '*null*'
         const str = typeof val === 'object' ? JSON.stringify(val) : String(val)
         return str.replace(/\|/g, '\\|').replace(/\n/g, ' ')
@@ -1820,7 +1911,7 @@ function SingleResultGrid({ result, columnTypes }: { result: QueryResult; column
 
   useEffect(() => {
     if (!selectedCell || editingCell) return
-    const fields = result.fields
+    const fields = visibleFields
     const rowCount = result.rows.length
     const handler = (e: KeyboardEvent) => {
       if (!['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key)) return
@@ -1838,7 +1929,7 @@ function SingleResultGrid({ result, columnTypes }: { result: QueryResult; column
     }
     document.addEventListener('keydown', handler)
     return () => document.removeEventListener('keydown', handler)
-  }, [selectedCell, editingCell, result])
+  }, [selectedCell, editingCell, result, visibleFields])
 
   if (result.error) {
     return (
@@ -1941,17 +2032,18 @@ function SingleResultGrid({ result, columnTypes }: { result: QueryResult; column
         </div>
       </div>
       <div ref={gridRef} className="flex-1 overflow-auto min-h-0" onClick={() => { if (!editingCell) setSelectedCell(null) }}>
-        <table className="w-full text-xs border-collapse">
+        <table className="w-max text-xs border-collapse table-fixed">
           <thead>
             <tr className="bg-card border-b border-border sticky top-0 z-10">
-              {result.fields.map(col => {
+              {visibleFields.map(col => {
                 const colType = columnTypes?.find(c => c.name === col)?.type
                 const isSorted = sortCol === col
                 return (
                   <th
                     key={col}
                     onClick={() => handleSortClick(col)}
-                    className="text-left px-3 py-1 font-medium text-muted-foreground border-r border-border last:border-r-0 whitespace-nowrap cursor-pointer select-none hover:bg-accent/10 transition-colors"
+                    className="text-left px-3 py-1 font-medium text-muted-foreground border-r border-border whitespace-nowrap cursor-pointer select-none hover:bg-accent/10 transition-colors"
+                    style={{ width: '180px', minWidth: '180px', maxWidth: '180px' }}
                   >
                     <div className="flex items-center gap-1">
                       <span>{col}</span>
@@ -1968,22 +2060,64 @@ function SingleResultGrid({ result, columnTypes }: { result: QueryResult; column
           <tbody>
             {sortedRows.map((row, ri) => (
               <tr key={ri} className={cn('border-b border-border/50', selectedCell?.ri === ri ? 'bg-primary/10' : 'hover:bg-accent/10')}>
-                {result.fields.map(col => {
+                {visibleFields.map(col => {
                   const isSelected = selectedCell?.ri === ri && selectedCell?.col === col
                   const isEditing = editingCell?.ri === ri && editingCell?.col === col
-                  const raw = row[col]
-                  const display = raw === null ? null : typeof raw === 'object' ? JSON.stringify(raw) : String(raw)
+                  const raw = getNestedValue(row, col)
+                  let display = ''
+                  let isDoc = false
+                  if (raw === null || raw === undefined) {
+                    display = 'null'
+                  } else if (
+                    dbType === 'mongodb' &&
+                    typeof raw === 'object' &&
+                    !Array.isArray(raw) &&
+                    raw.constructor?.name !== 'ObjectID' &&
+                    raw.constructor?.name !== 'ObjectId' &&
+                    !(raw as any)._bsontype
+                  ) {
+                    isDoc = true
+                    const keysCount = Object.keys(raw).length
+                    display = `Document (${keysCount})`
+                  } else {
+                    display = typeof raw === 'object' ? JSON.stringify(raw) : String(raw)
+                  }
+
+                  const isExpanded = expandedColumns.has(col)
+
                   return (
                     <td
                       key={col}
                       onClick={e => { e.stopPropagation(); setSelectedCell({ ri, col }); if (editingCell && !(editingCell.ri === ri && editingCell.col === col)) setEditingCell(null) }}
-                      onDoubleClick={e => { e.stopPropagation(); setSelectedCell({ ri, col }); setEditingCell({ ri, col }) }}
-                      className={cn('border-r border-border/50 last:border-r-0 font-mono whitespace-nowrap max-w-xs', isEditing ? 'p-0' : 'px-3 py-1.5 truncate cursor-default', isSelected && !isEditing ? 'ring-1 ring-inset ring-primary bg-primary/5' : '')}
+                      onDoubleClick={e => {
+                        e.stopPropagation()
+                        setSelectedCell({ ri, col })
+                        if (isDoc) {
+                          setExpandedColumns(prev => {
+                            const next = new Set(prev)
+                            if (next.has(col)) {
+                              next.delete(col)
+                              for (const key of Array.from(next)) {
+                                if (key.startsWith(col + '.')) next.delete(key)
+                              }
+                            } else {
+                              next.add(col)
+                            }
+                            return next
+                          })
+                        } else {
+                          setEditingCell({ ri, col })
+                        }
+                      }}
+                      className={cn('border-r border-border/50 font-mono whitespace-nowrap max-w-xs', isEditing ? 'p-0' : 'px-3 py-1.5 truncate', isDoc ? 'cursor-pointer' : 'cursor-default', isSelected && !isEditing ? 'ring-1 ring-inset ring-primary bg-primary/5' : '')}
+                      style={{ width: '180px', minWidth: '180px', maxWidth: '180px' }}
                     >
                       {isEditing ? (
-                        <input autoFocus readOnly defaultValue={display ?? ''} onKeyDown={e => e.key === 'Escape' && setEditingCell(null)} className="w-full h-full px-3 py-1.5 bg-primary/10 text-foreground text-xs font-mono outline-none border-none ring-1 ring-inset ring-primary select-all" />
-                      ) : raw === null ? (
+                        <input autoFocus readOnly defaultValue={typeof raw === 'object' ? JSON.stringify(raw) : (display ?? '')} onKeyDown={e => e.key === 'Escape' && setEditingCell(null)} className="w-full h-full px-3 py-1.5 bg-primary/10 text-foreground text-xs font-mono outline-none border-none ring-1 ring-inset ring-primary select-all" />
+                      ) : raw === null || raw === undefined ? (
                         <span className="text-muted-foreground/50 italic">null</span>
+                      ) : isDoc ? (
+                        <span className="text-primary font-semibold">{display}</span>
                       ) : typeof raw === 'object' ? (
                         <span className="text-muted-foreground/80">{display}</span>
                       ) : display}
@@ -1999,11 +2133,12 @@ function SingleResultGrid({ result, columnTypes }: { result: QueryResult; column
   )
 }
 
-function ResultsGrid({ results, running, statusBorder, columnTypes }: {
+function ResultsGrid({ results, running, statusBorder, columnTypes, dbType }: {
   results: QueryResult[]
   running: boolean
   statusBorder: 'top' | 'bottom'
   columnTypes?: ColumnInfo[]
+  dbType?: 'postgres' | 'mysql' | 'mongodb'
 }) {
   const [prevResults, setPrevResults] = useState(results)
   const [activeIdx, setActiveIdx] = useState(() => results.length > 0 ? results.length - 1 : 0)
@@ -2060,7 +2195,7 @@ function ResultsGrid({ results, running, statusBorder, columnTypes }: {
       </div>
     )
   } else if (result) {
-    grid = <SingleResultGrid result={result} columnTypes={columnTypes} />
+    grid = <SingleResultGrid result={result} columnTypes={columnTypes} dbType={dbType} />
   } else {
     grid = <div className="flex-1 flex items-center justify-center"><p className="text-xs text-muted-foreground">No results yet</p></div>
   }
@@ -3195,7 +3330,7 @@ function QueryPane({
 }) {
   const dbIpc = useCallback((connId: string) => {
     const conn = connections.find(c => c.id === connId)
-    return conn?.dbType === 'mysql' ? window.electronAPI!.mysql : window.electronAPI!.pg
+    return getIpc(conn?.dbType ?? 'postgres')
   }, [connections])
 
   const editorRef = useRef<SqlEditorHandle>(null)
@@ -3642,8 +3777,9 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
         } else {
           const connId = tab.connectionId ?? connections.find(c => c.status === 'connected')?.id
           if (!connId) return
+          const conn = connections.find(c => c.id === connId)
           const stmt = `SELECT * FROM "${schemaName}"."${tableName}"();`
-          onChange(tab.id, { running: true, results: [], connectionId: connId })
+          onChange(tab.id, { running: true, results: [], connectionId: connId, dbType: conn?.dbType })
           const res = await dbIpc(connId).query(connId, stmt, tab.databaseName ?? undefined)
           const collected: QueryResult[] = []
           if (res.ok) {
@@ -3663,15 +3799,24 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
     const connId = tab.connectionId ?? connections.find(c => c.status === 'connected')?.id
     if (!connId) return
 
-    const statements = splitSqlStatements(sqlToRun)
+    const connForRun = connections.find(c => c.id === connId)
+    const isMongoRun = connForRun?.dbType === 'mongodb'
 
-    onChange(tab.id, { running: true, results: [], connectionId: connId })
+    // For MongoDB, send the whole text as a single JS expression (no SQL splitting)
+    const statements = isMongoRun ? [sqlToRun] : splitSqlStatements(sqlToRun)
+
+    onChange(tab.id, { running: true, results: [], connectionId: connId, dbType: connForRun?.dbType })
 
     const collected: QueryResult[] = []
     for (const stmt of statements) {
       const res = await dbIpc(connId).query(connId, stmt, tab.databaseName ?? undefined)
       if (res.ok) {
-        collected.push({ fields: res.fields ?? [], rows: res.rows ?? [], rowCount: res.rowCount ?? null, ms: res.ms ?? 0, statement: stmt })
+        // MongoDB: derive fields and flatten nested documents if it is a Mongo run
+        const rawRows = res.rows ?? []
+        const { rows, fields } = (isMongoRun && rawRows.length > 0)
+          ? processMongoRows(rawRows)
+          : { rows: rawRows, fields: (res.fields && res.fields.length > 0) ? res.fields : [] }
+        collected.push({ fields, rows, rowCount: res.rowCount ?? null, ms: res.ms ?? 0, statement: stmt })
       } else {
         collected.push({ fields: [], rows: [], rowCount: null, ms: 0, error: res.error, statement: stmt })
         break
@@ -3847,6 +3992,7 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
     const pageSize = tab.pageSize ?? TABLE_PAGE_SIZE
     const totalRows = tab.totalRows
     const totalPages = totalRows !== undefined ? Math.max(1, Math.ceil(totalRows / pageSize)) : undefined
+    const currentRowsCount = tab.results?.[0]?.rows?.length ?? 0
     const from = page * pageSize + 1
     const to = totalRows !== undefined ? Math.min((page + 1) * pageSize, totalRows) : (page + 1) * pageSize
 
@@ -3880,7 +4026,13 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
           </div>
         </div>
 
-        <ResultsGrid results={tab.results} running={tab.running} statusBorder="top" columnTypes={tab.columnTypes} />
+        <ResultsGrid
+          results={tab.results}
+          running={tab.running}
+          statusBorder="top"
+          columnTypes={tab.columnTypes}
+          dbType={getTabDbType(tab, connections)}
+        />
         <div className="flex items-center gap-2 px-3 h-8 border-t border-border bg-card shrink-0">
           <button
             onClick={() => onPageChange(tab, 0)}
@@ -3901,7 +4053,7 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
           </span>
           <button
             onClick={() => onPageChange(tab, page + 1)}
-            disabled={tab.running || (totalPages !== undefined && page >= totalPages - 1)}
+            disabled={tab.running || (totalPages !== undefined ? page >= totalPages - 1 : currentRowsCount < pageSize)}
             className="px-1.5 h-5 rounded text-xs border border-border text-muted-foreground hover:text-foreground hover:bg-accent/20 disabled:opacity-40 transition-colors"
             title="Next page"
           >›</button>
@@ -4961,7 +5113,12 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
         <ResizableHandle className="h-px bg-border" />
         <ResizablePanel defaultSize={50} minSize={20}>
           <div className="flex flex-col h-full">
-            <ResultsGrid results={tab.results} running={tab.running} statusBorder="top" />
+            <ResultsGrid
+              results={tab.results}
+              running={tab.running}
+              statusBorder="top"
+              dbType={getTabDbType(tab, connections)}
+            />
           </div>
         </ResizablePanel>
       </ResizablePanelGroup>
@@ -5051,7 +5208,14 @@ function loadSavedQueries(): SavedQuery[] { return [] }
 async function loadSavedQueriesFromDb(): Promise<SavedQuery[]> {
   try {
     const rows = await window.electronAPI?.db.savedQueries.get()
-    return (rows ?? []).map((r: any) => ({ id: r.id, connectionId: r.connectionId, databaseName: r.databaseName, name: r.name, sql: r.sql }))
+    return (rows ?? []).map((r: any) => ({
+      id: r.id,
+      connectionId: r.connectionId || r.connection_id || '',
+      databaseName: r.databaseName || r.database_name || '',
+      title: r.name || r.title || '',
+      sql: r.sql || '',
+      schemaName: r.schemaName || r.schema_name || ''
+    }))
   } catch { return [] }
 }
 async function persistSavedQueries(qs: SavedQuery[], prev: SavedQuery[]) {
@@ -5065,11 +5229,23 @@ async function persistSavedQueries(qs: SavedQuery[], prev: SavedQuery[]) {
   // Create/update
   for (const q of qs) {
     if (!prevIds.has(q.id)) {
-      await window.electronAPI.db.savedQueries.create({ id: q.id, connectionId: q.connectionId, databaseName: q.databaseName, name: q.name, sql: q.sql, createdAt: Date.now(), updatedAt: Date.now() }).catch(() => {})
+      await window.electronAPI.db.savedQueries.create({
+        id: q.id,
+        connectionId: q.connectionId,
+        databaseName: q.databaseName,
+        name: q.title,
+        sql: q.sql,
+        createdAt: Date.now(),
+        updatedAt: Date.now()
+      }).catch(() => {})
     } else {
       const old = prev.find(p => p.id === q.id)
-      if (old && (old.name !== q.name || old.sql !== q.sql)) {
-        await window.electronAPI.db.savedQueries.update(q.id, { name: q.name, sql: q.sql, databaseName: q.databaseName }).catch(() => {})
+      if (old && (old.title !== q.title || old.sql !== q.sql)) {
+        await window.electronAPI.db.savedQueries.update(q.id, {
+          name: q.title,
+          sql: q.sql,
+          databaseName: q.databaseName
+        }).catch(() => {})
       }
     }
   }
@@ -5077,7 +5253,7 @@ async function persistSavedQueries(qs: SavedQuery[], prev: SavedQuery[]) {
 
 interface PersistedConnection {
   id: string
-  dbType: 'postgres' | 'mysql'
+  dbType: 'postgres' | 'mysql' | 'mongodb'
   label: string
   name: string
   host: string
@@ -5103,6 +5279,14 @@ interface PersistedTab {
   isFunction?: boolean
   functionArguments?: string
   originalSql?: string
+
+  // Results & Paging properties
+  results?: QueryResult[]
+  page?: number
+  pageSize?: number
+  totalRows?: number
+  columnTypes?: ColumnInfo[]
+  dbType?: 'postgres' | 'mysql' | 'mongodb'
 
   // Design properties
   designActiveTab?: 'fields' | 'indexes' | 'fkeys' | 'uniques' | 'triggers'
@@ -5137,8 +5321,8 @@ async function loadPersistedConnectionsFromDb(): Promise<PersistedConnection[]> 
   try {
     const rows = await window.electronAPI?.db.connections.get()
     return (rows ?? []).map((r: any) => ({
-      id: r.id, dbType: r.dbType === 'pg' ? 'postgres' : r.dbType,
-      label: r.name, name: `${r.host}:${r.port}/${r.database}`,
+      id: r.id, dbType: r.dbType === 'pg' ? 'postgres' : r.dbType as 'postgres' | 'mysql' | 'mongodb',
+      label: r.name, name: r.dbType === 'mongodb' ? (r.database ? `MongoDB / ${r.database}` : 'MongoDB') : `${r.host}:${r.port}/${r.database}`,
       host: r.host, port: r.port, database: r.database,
       user: r.username, password: r.password, ssl: r.ssl,
       vpnConfigPath: r.vpnConfigPath, vpnUsername: r.vpnUsername, vpnPassword: r.vpnPassword,
@@ -5156,7 +5340,7 @@ async function savePersistedConnections(conns: DbConnection[], prev: DbConnectio
   }
   // Create/update
   for (const c of conns) {
-    const dbType = c.dbType === 'mysql' ? 'mysql' : 'pg'
+    const dbType = c.dbType === 'mysql' ? 'mysql' : c.dbType === 'mongodb' ? 'mongodb' : 'pg'
     if (!prevIds.has(c.id)) {
       await window.electronAPI.db.connections.create({
         id: c.id, name: c.label || c.name, dbType, host: c.host, port: c.port,
@@ -5174,6 +5358,16 @@ async function savePersistedConnections(conns: DbConnection[], prev: DbConnectio
   }
 }
 
+function getTabDbType(tab: QueryTab, connections: DbConnection[]): 'postgres' | 'mysql' | 'mongodb' {
+  if (tab.dbType) return tab.dbType
+  if (tab.connectionId) {
+    const conn = connections.find(c => c.id === tab.connectionId)
+    if (conn) return conn.dbType
+  }
+  if (tab.sql && tab.sql.trim().startsWith('db.')) return 'mongodb'
+  return 'postgres'
+}
+
 function loadPersistedTabs(): { tabs: QueryTab[]; meta: PersistedTabsMeta } | null {
   try {
     const rawTabs = localStorage.getItem(TABS_STORAGE_KEY)
@@ -5183,9 +5377,14 @@ function loadPersistedTabs(): { tabs: QueryTab[]; meta: PersistedTabsMeta } | nu
     const meta: PersistedTabsMeta = JSON.parse(rawMeta)
     const tabs: QueryTab[] = persisted.map(t => ({
       ...t,
-      results: [],
+      results: t.results ?? [],
       running: false,
       originalSql: t.originalSql ?? t.sql,
+      page: t.page ?? 0,
+      pageSize: t.pageSize ?? TABLE_PAGE_SIZE,
+      totalRows: t.totalRows,
+      columnTypes: t.columnTypes,
+      dbType: t.dbType,
     }))
     return { tabs, meta }
   } catch { return null }
@@ -5205,6 +5404,14 @@ function savePersistedTabs(
       isFunction: t.isFunction,
       functionArguments: t.functionArguments,
       originalSql: t.originalSql,
+
+      // Results & Paging properties
+      results: t.results,
+      page: t.page,
+      pageSize: t.pageSize,
+      totalRows: t.totalRows,
+      columnTypes: t.columnTypes,
+      dbType: t.dbType,
 
       // Design properties
       designActiveTab: t.designActiveTab,
@@ -5234,6 +5441,70 @@ function savePersistedTabs(
 
 // ── Root ──────────────────────────────────────────────────────────────────────
 
+function getNestedValue(obj: any, path: string): any {
+  if (obj === null || obj === undefined) return undefined
+  if (typeof obj === 'object' && path in obj) {
+    return obj[path]
+  }
+  const parts = path.split('.')
+  let current = obj
+  for (const part of parts) {
+    if (current === null || current === undefined) return undefined
+    current = current[part]
+  }
+  return current
+}
+
+function flattenObject(obj: any, prefix = ''): Record<string, any> {
+  const result: Record<string, any> = {}
+  if (obj === null || typeof obj !== 'object') return result
+
+  for (const key in obj) {
+    if (Object.prototype.hasOwnProperty.call(obj, key)) {
+      const value = obj[key]
+      const newKey = prefix ? `${prefix}.${key}` : key
+
+      if (
+        value !== null &&
+        typeof value === 'object' &&
+        !Array.isArray(value) &&
+        !(value instanceof Date) &&
+        value.constructor?.name !== 'ObjectID' &&
+        value.constructor?.name !== 'ObjectId' &&
+        !value._bsontype
+      ) {
+        const flatChild = flattenObject(value, newKey)
+        Object.assign(result, flatChild)
+      } else {
+        result[newKey] = value
+      }
+    }
+  }
+  return result
+}
+
+function processMongoRows(rows: any[]) {
+  const processedRows = rows.map(row => {
+    const flat = flattenObject(row)
+    return { ...row, ...flat }
+  })
+
+  const keys = new Set<string>()
+  if (rows.length > 0) {
+    Object.keys(rows[0]).forEach(k => keys.add(k))
+  }
+  for (const r of processedRows) {
+    for (const k in r) {
+      keys.add(k)
+    }
+  }
+
+  return {
+    rows: processedRows,
+    fields: Array.from(keys)
+  }
+}
+
 function makeTab(n: number, connectionId: string | null, databaseName: string | null = null): QueryTab {
   return { id: generateId(), kind: 'query', title: `Query ${n}`, sql: '', results: [], running: false, connectionId, databaseName, originalSql: '' }
 }
@@ -5245,8 +5516,8 @@ function tablePageSql(schema: string, table: string, page: number) {
   return `SELECT *\nFROM ${schema}.${table}\nLIMIT ${TABLE_PAGE_SIZE} OFFSET ${offset};`
 }
 
-function makeTableTab(connId: string, dbName: string, schema: string, table: string): QueryTab {
-  return { id: generateId(), kind: 'table', title: table, sql: tablePageSql(schema, table, 0), results: [], running: false, connectionId: connId, databaseName: dbName, schemaName: schema, tableName: table, page: 0, pageSize: TABLE_PAGE_SIZE, totalRows: undefined }
+function makeTableTab(connId: string, dbName: string, schema: string, table: string, dbType?: 'postgres' | 'mysql' | 'mongodb'): QueryTab {
+  return { id: generateId(), kind: 'table', title: table, sql: tablePageSql(schema, table, 0), results: [], running: false, connectionId: connId, databaseName: dbName, schemaName: schema, tableName: table, page: 0, pageSize: TABLE_PAGE_SIZE, totalRows: undefined, dbType }
 }
 
 function makeTableDesignTab(connId: string, dbName: string, schema: string, table: string): QueryTab {
@@ -5270,6 +5541,11 @@ const _initialPersistedTabs = loadPersistedTabs()
 const _initialTab = makeTab(1, null)
 
 export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
+  const [isMounted, setIsMounted] = useState(false)
+  useEffect(() => {
+    setIsMounted(true)
+  }, [])
+
   const [connections, setConnections] = useState<DbConnection[]>([])
   const [activeConnId, setActiveConnId] = useState<string | null>(
     _initialPersistedTabs ? _initialPersistedTabs.meta.activeConnId : null
@@ -5317,11 +5593,12 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
   const newQuery = useCallback(() => {
     const dbName = activeConnId ? (activeDbPerConn[activeConnId] ?? null) : null
     const schemaName = activeConnId && dbName ? (activeSchemaPerDb[`${activeConnId}::${dbName}`] ?? undefined) : undefined
-    const tab: QueryTab = { ...makeTab(tabCounter, activeConnId, dbName), schemaName }
+    const conn = connections.find(c => c.id === activeConnId)
+    const tab: QueryTab = { ...makeTab(tabCounter, activeConnId, dbName), schemaName, dbType: conn?.dbType }
     setTabs(prev => [...prev, tab])
     setActiveTabId(tab.id)
     setTabCounter(n => n + 1)
-  }, [tabCounter, activeConnId, activeDbPerConn, activeSchemaPerDb])
+  }, [tabCounter, activeConnId, activeDbPerConn, activeSchemaPerDb, connections])
 
   const handleSaveFunction = useCallback(async (tab: QueryTab) => {
     const connId = tab.connectionId ?? connections.find(c => c.status === 'connected')?.id
@@ -5364,20 +5641,52 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
     })
   }, [])
 
-  // Listen for Ctrl+R from Electron main (before-input-event blocks native keydown)
-  useEffect(() => {
-    if (!isActive) return
-    const cb = () => setRunTrigger(n => n + 1)
-    window.electronAPI?.onRunQuery?.(cb)
-    return () => window.electronAPI?.offRunQuery?.(cb)
-  }, [isActive])
-
+  const tabsRef = useRef(tabs)
+  useEffect(() => { tabsRef.current = tabs }, [tabs])
   const newQueryRef = useRef(newQuery)
   useEffect(() => { newQueryRef.current = newQuery }, [newQuery])
   const closeTabRef = useRef(closeTab)
   useEffect(() => { closeTabRef.current = closeTab }, [closeTab])
   const activeTabIdRef = useRef(activeTabId)
   useEffect(() => { activeTabIdRef.current = activeTabId }, [activeTabId])
+
+  const runTableTabRef = useRef<((tab: QueryTab, newPage?: number) => Promise<void>) | undefined>(undefined)
+
+  // Listen for Ctrl+R from Electron main (before-input-event blocks native keydown)
+  useEffect(() => {
+    if (!isActive) return
+    const cb = () => {
+      const activeTab = tabsRef.current.find(t => t.id === activeTabIdRef.current)
+      if (!activeTab) return
+      if (activeTab.kind === 'table') {
+        runTableTabRef.current?.(activeTab)
+      } else if (activeTab.kind === 'query') {
+        setRunTrigger(n => n + 1)
+      }
+    }
+    window.electronAPI?.onRunQuery?.(cb)
+    return () => window.electronAPI?.offRunQuery?.(cb)
+  }, [isActive])
+
+  // Global Ctrl+R refresh/run shortcut handler for web browser mode
+  useEffect(() => {
+    if (!isActive) return
+    const handler = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && (e.key === 'r' || e.key === 'R')) {
+        e.preventDefault()
+        e.stopPropagation()
+        const activeTab = tabsRef.current.find(t => t.id === activeTabIdRef.current)
+        if (!activeTab) return
+        if (activeTab.kind === 'table') {
+          runTableTabRef.current?.(activeTab)
+        } else if (activeTab.kind === 'query') {
+          setRunTrigger(n => n + 1)
+        }
+      }
+    }
+    document.addEventListener('keydown', handler, true)
+    return () => document.removeEventListener('keydown', handler, true)
+  }, [isActive])
 
   // Listen for close-active-tab and new-query-tab from Electron main process
   useEffect(() => {
@@ -5459,7 +5768,7 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
     setConnections(restored)
     setActiveConnId(prev => prev ?? restored[0].id)
     saved.forEach(async s => {
-      const ipc = (s.dbType ?? 'postgres') === 'mysql' ? window.electronAPI!.mysql : window.electronAPI!.pg
+      const ipc = getIpc(s.dbType ?? 'postgres')
       const res = await ipc.connect({ id: s.id, host: s.host, port: s.port, database: s.database, user: s.user, password: s.password, ssl: s.ssl, vpnConfigPath: s.vpnConfigPath, vpnUsername: s.vpnUsername, vpnPassword: s.vpnPassword })
       if (!res.ok) {
         setConnections(prev => prev.map(c => c.id === s.id ? { ...c, status: 'error', errorMsg: res.error } : c))
@@ -5496,7 +5805,7 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
   // Pick the right IPC channel based on connection type
   const dbIpc = useCallback((connId: string) => {
     const conn = connections.find(c => c.id === connId)
-    return conn?.dbType === 'mysql' ? window.electronAPI!.mysql : window.electronAPI!.pg
+    return getIpc(conn?.dbType ?? 'postgres')
   }, [connections])
 
   // After connecting, load the list of databases
@@ -5513,7 +5822,7 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
   // When a database row is expanded, lazy-load its schemas/tables
   const handleToggleDb = useCallback(async (connId: string, dbName: string) => {
     let needsLoad = false
-    let connDbType = 'postgres'
+    let connDbType: 'postgres' | 'mysql' | 'mongodb' = 'postgres'
     setConnections(prev => {
       const conn = prev.find(c => c.id === connId)
       connDbType = conn?.dbType ?? 'postgres'
@@ -5534,7 +5843,7 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
 
     if (!needsLoad) return
 
-    const ipc = connDbType === 'mysql' ? window.electronAPI!.mysql : window.electronAPI!.pg
+    const ipc = getIpc(connDbType ?? 'postgres')
     const res = await ipc.introspectDb(connId, dbName)
     if (!res.ok) {
       setConnections(prev => prev.map(c => c.id !== connId ? c : {
@@ -5557,7 +5866,7 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
     setConnections(prev => [...prev, newConn])
     setActiveConnId(id)
 
-    const ipc = opts.dbType === 'mysql' ? window.electronAPI!.mysql : window.electronAPI!.pg
+    const ipc = getIpc(opts.dbType)
     const res = await ipc.connect({ id, ...opts })
     if (!res.ok) {
       setConnections(prev => prev.map(c => c.id === id ? { ...c, status: 'error', errorMsg: res.error } : c))
@@ -5650,7 +5959,7 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
     })
     if (!connData) return
     const data = connData as ConnData
-    const ipc = data.dbType === 'mysql' ? window.electronAPI!.mysql : window.electronAPI!.pg
+    const ipc = getIpc(data.dbType)
     const res = await ipc.connect({ id: connId, ...data })
     if (!res.ok) {
       setConnections(prev => prev.map(c => c.id === connId ? { ...c, status: 'error', errorMsg: res.error } : c))
@@ -5661,11 +5970,7 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
 
   const handleRemove = useCallback(async (connId: string) => {
     await dbIpc(connId).disconnect(connId)
-    setConnections(prev => {
-      const next = prev.filter(c => c.id !== connId)
-      savePersistedConnections(next)
-      return next
-    })
+    setConnections(prev => prev.filter(c => c.id !== connId))
     if (activeConnId === connId) setActiveConnId(null)
   }, [activeConnId, dbIpc])
 
@@ -5675,11 +5980,7 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
   }, [dbIpc])
 
   const handleEditSave = useCallback(async (connId: string, data: Omit<DbConnection, 'id' | 'status' | 'databases'>) => {
-    setConnections(prev => {
-      const next = prev.map(c => c.id === connId ? { ...c, ...data } : c)
-      savePersistedConnections(next)
-      return next
-    })
+    setConnections(prev => prev.map(c => c.id === connId ? { ...c, ...data } : c))
   }, [])
 
   const handleSelectConn = useCallback((connId: string) => {
@@ -5722,33 +6023,71 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
   const runTableTab = useCallback(async (tab: QueryTab, newPage?: number) => {
     if (!tab.connectionId || !tab.databaseName || !tab.schemaName || !tab.tableName) return
     const page = newPage ?? tab.page ?? 0
-    const sql = tablePageSql(tab.schemaName, tab.tableName, page)
-    setTabs(prev => prev.map(t => t.id === tab.id ? { ...t, running: true, page, sql } : t))
+    const isMongo = getTabDbType(tab, connections) === 'mongodb'
 
-    const [res, countRes, colRes] = await Promise.all([
-      dbIpc(tab.connectionId).query(tab.connectionId, sql, tab.databaseName),
-      tab.totalRows === undefined
-        ? dbIpc(tab.connectionId).query(tab.connectionId, `SELECT COUNT(*) AS __count FROM ${tab.schemaName}.${tab.tableName};`, tab.databaseName)
-        : Promise.resolve(null),
-      tab.columnTypes === undefined
-        ? dbIpc(tab.connectionId).query(tab.connectionId, `SELECT column_name, udt_name FROM information_schema.columns WHERE table_schema = '${tab.schemaName}' AND table_name = '${tab.tableName}' ORDER BY ordinal_position;`, tab.databaseName)
-        : Promise.resolve(null),
-    ])
+    if (isMongo) {
+      const skip = page * TABLE_PAGE_SIZE
+      const findQuery = `db.${tab.tableName}.find({}).skip(${skip}).limit(${TABLE_PAGE_SIZE})`
+      const countQuery = `db.${tab.tableName}.countDocuments({})`
+      setTabs(prev => prev.map(t => t.id === tab.id ? { ...t, running: true, page, sql: findQuery } : t))
 
-    setTabs(prev => prev.map(t => t.id !== tab.id ? t : {
-      ...t,
-      running: false,
-      results: res.ok
-        ? [{ fields: res.fields ?? [], rows: res.rows ?? [], rowCount: res.rowCount ?? null, ms: res.ms ?? 0 }]
-        : [{ fields: [], rows: [], rowCount: null, ms: 0, error: res.error }],
-      totalRows: countRes?.ok
-        ? Number((countRes.rows?.[0] as any)?.__count ?? t.totalRows)
-        : t.totalRows,
-      columnTypes: colRes?.ok
-        ? (colRes.rows ?? []).map((r: any) => ({ name: r.column_name as string, type: r.udt_name as string }))
-        : t.columnTypes,
-    }))
-  }, [])
+      const [res, countRes] = await Promise.all([
+        dbIpc(tab.connectionId).query(tab.connectionId, findQuery, tab.databaseName),
+        tab.totalRows === undefined
+          ? dbIpc(tab.connectionId).query(tab.connectionId, countQuery, tab.databaseName)
+          : Promise.resolve(null),
+      ])
+
+      // MongoDB returns rows as documents — derive fields and flatten nested documents
+      const rawRows = res.ok ? (res.rows ?? []) : []
+      const { rows, fields } = res.ok && rawRows.length > 0
+        ? processMongoRows(rawRows)
+        : { rows: rawRows, fields: res.fields ?? [] }
+
+      setTabs(prev => prev.map(t => t.id !== tab.id ? t : {
+        ...t,
+        running: false,
+        results: res.ok
+          ? [{ fields, rows, rowCount: res.rowCount ?? rows.length, ms: res.ms ?? 0 }]
+          : [{ fields: [], rows: [], rowCount: null, ms: 0, error: res.error }],
+        totalRows: countRes?.ok
+          ? Number((countRes.rows?.[0] as any)?.result ?? t.totalRows)
+          : t.totalRows,
+        columnTypes: undefined,
+      }))
+    } else {
+      const sql = tablePageSql(tab.schemaName, tab.tableName, page)
+      setTabs(prev => prev.map(t => t.id === tab.id ? { ...t, running: true, page, sql } : t))
+
+      const [res, countRes, colRes] = await Promise.all([
+        dbIpc(tab.connectionId).query(tab.connectionId, sql, tab.databaseName),
+        tab.totalRows === undefined
+          ? dbIpc(tab.connectionId).query(tab.connectionId, `SELECT COUNT(*) AS __count FROM ${tab.schemaName}.${tab.tableName};`, tab.databaseName)
+          : Promise.resolve(null),
+        tab.columnTypes === undefined
+          ? dbIpc(tab.connectionId).query(tab.connectionId, `SELECT column_name, udt_name FROM information_schema.columns WHERE table_schema = '${tab.schemaName}' AND table_name = '${tab.tableName}' ORDER BY ordinal_position;`, tab.databaseName)
+          : Promise.resolve(null),
+      ])
+
+      setTabs(prev => prev.map(t => t.id !== tab.id ? t : {
+        ...t,
+        running: false,
+        results: res.ok
+          ? [{ fields: res.fields ?? [], rows: res.rows ?? [], rowCount: res.rowCount ?? null, ms: res.ms ?? 0 }]
+          : [{ fields: [], rows: [], rowCount: null, ms: 0, error: res.error }],
+        totalRows: countRes?.ok
+          ? Number((countRes.rows?.[0] as any)?.__count ?? t.totalRows)
+          : t.totalRows,
+        columnTypes: colRes?.ok
+          ? (colRes.rows ?? []).map((r: any) => ({ name: r.column_name as string, type: r.udt_name as string }))
+          : t.columnTypes,
+      }))
+    }
+  }, [dbIpc, connections])
+
+  useEffect(() => {
+    runTableTabRef.current = runTableTab
+  }, [runTableTab])
 
   const handlePageChange = useCallback((tab: QueryTab, page: number) => {
     runTableTab(tab, page)
@@ -5760,7 +6099,8 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
       setActiveTabId(existing.id)
       return
     }
-    const newTab = makeTableTab(connId, dbName, schema, table)
+    const conn = connections.find(c => c.id === connId)
+    const newTab = makeTableTab(connId, dbName, schema, table, conn?.dbType)
     setTabs(prev => [...prev, newTab])
     setActiveTabId(newTab.id)
     setTimeout(() => runTableTab(newTab), 0)
@@ -6031,6 +6371,10 @@ WHERE n.nspname = '${esc(schema)}' AND t.typname = '${esc(typeName)}';`
 
   const activeTab = tabs.find(t => t.id === activeTabId) ?? tabs[0]
   const activeConn = connections.find(c => c.id === activeConnId) ?? null
+
+  if (!isMounted) {
+    return <div className="flex flex-col flex-1 min-h-0 bg-background" />
+  }
 
   return (
     <div className="flex flex-col flex-1 min-h-0">

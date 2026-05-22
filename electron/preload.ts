@@ -49,4 +49,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
     introspect:   (id: string) => ipcRenderer.invoke('mysql:introspect', { id }),
     introspectDb: (id: string, database: string) => ipcRenderer.invoke('mysql:introspect-db', { id, database }),
   },
+
+  mongodb: {
+    connect:      (opts: any) => ipcRenderer.invoke('mongodb:connect', opts),
+    disconnect:   (id: string) => ipcRenderer.invoke('mongodb:disconnect', { id }),
+    query:        (id: string, sql: string, database?: string) => ipcRenderer.invoke('mongodb:query', { id, sql, database }),
+    introspect:   (id: string) => ipcRenderer.invoke('mongodb:introspect', { id }),
+    introspectDb: (id: string, database: string) => ipcRenderer.invoke('mongodb:introspect-db', { id, database }),
+  },
+
+  onRunQuery:  (cb: () => void) => ipcRenderer.on('run-query', cb),
+  offRunQuery: (cb: () => void) => ipcRenderer.removeListener('run-query', cb),
 })

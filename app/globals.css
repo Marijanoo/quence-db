@@ -10,19 +10,27 @@
   --card-foreground: oklch(0.97 0 0);
   --popover: oklch(0.34 0.01 282);
   --popover-foreground: oklch(0.97 0 0);
-  --primary: oklch(0.9 0.11 98);
+  --primary: #7487F9;
   --primary-foreground: oklch(0.28 0.01 282);
   --secondary: oklch(0.38 0.01 282);
   --secondary-foreground: oklch(0.97 0 0);
   --muted: oklch(0.36 0.01 282);
   --muted-foreground: oklch(0.85 0 0);
-  --accent: oklch(0.9 0.11 98);
+  --accent: #7487F9;
   --accent-foreground: oklch(0.28 0.01 282);
   --destructive: oklch(0.55 0.22 25);
   --destructive-foreground: oklch(0.97 0 0);
   --border: oklch(0.42 0.01 282);
   --input: oklch(0.36 0.01 282);
-  --ring: oklch(0.9 0.11 98);
+  --ring: #7487F9;
+
+  /* SQL syntax colors */
+  --db-keyword:  oklch(0.72 0.18 258);
+  --db-string:   oklch(0.76 0.15 160);
+  --db-number:   oklch(0.90 0.13 246);
+  --db-type:     oklch(0.90 0.10 100);
+  --db-comment:  oklch(0.55 0.01 282);
+  --db-operator: oklch(0.75 0.08 282);
   --radius: 0.5rem;
 }
 
@@ -37,6 +45,12 @@
   --color-popover-foreground: var(--popover-foreground);
   --color-primary: var(--primary);
   --color-primary-foreground: var(--primary-foreground);
+  --color-db-keyword: var(--db-keyword);
+  --color-db-string: var(--db-string);
+  --color-db-number: var(--db-number);
+  --color-db-type: var(--db-type);
+  --color-db-comment: var(--db-comment);
+  --color-db-operator: var(--db-operator);
   --color-secondary: var(--secondary);
   --color-secondary-foreground: var(--secondary-foreground);
   --color-muted: var(--muted);
@@ -62,7 +76,7 @@
     @apply bg-background text-foreground;
   }
   ::selection {
-    background-color: oklch(0.9 0.11 98 / 0.35);
+    background-color: #7487F940;
     color: inherit;
   }
   body {

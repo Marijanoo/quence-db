@@ -1,6 +1,8 @@
 import { app, BrowserWindow, ipcMain, dialog } from 'electron'
 import { Pool } from 'pg'
 import * as mysql from 'mysql2/promise'
+import { MongoClient, ObjectId } from 'mongodb'
+import * as vm from 'vm'
 import * as path from 'path'
 import * as fs from 'fs'
 import { spawn, ChildProcess } from 'child_process'
@@ -101,6 +103,9 @@ async function createWindow() {
       event.preventDefault()
     } else if ((input.control || input.meta) && input.key === '0') {
       mainWindow!.webContents.setZoomLevel(0)
+      event.preventDefault()
+    } else if ((input.control || input.meta) && input.key.toLowerCase() === 'r') {
+      mainWindow!.webContents.send('run-query')
       event.preventDefault()
     }
   })
@@ -425,8 +430,174 @@ app.on('ready', () => {
     } catch (err) { return { ok: false, error: err instanceof Error ? err.message : String(err) } }
   })
 
+  // ── MongoDB connections ─────────────────────────────────────────────────────
+  const mongoClients = new Map<string, MongoClient>()
+
+  ipcMain.handle('mongodb:connect', async (_e, { id, host }: { id: string; host: string }) => {
+    try {
+      if (mongoClients.has(id)) {
+        await mongoClients.get(id)!.close().catch(() => {})
+        mongoClients.delete(id)
+      }
+      const client = new MongoClient(host, { connectTimeoutMS: 15000 })
+      await client.connect()
+      mongoClients.set(id, client)
+      return { ok: true }
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    }
+  })
+
+  ipcMain.handle('mongodb:disconnect', async (_e, { id }: { id: string }) => {
+    try {
+      const client = mongoClients.get(id)
+      if (client) {
+        await client.close().catch(() => {})
+        mongoClients.delete(id)
+      }
+      return { ok: true }
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    }
+  })
+
+  ipcMain.handle('mongodb:introspect', async (_e, { id }: { id: string }) => {
+    const client = mongoClients.get(id)
+    if (!client) return { ok: false, error: 'Not connected' }
+    try {
+      const res = await client.db().admin().listDatabases()
+      const databases = res.databases.map(d => d.name)
+        .filter(d => !['admin', 'local', 'config'].includes(d))
+      return { ok: true, databases }
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    }
+  })
+
+  ipcMain.handle('mongodb:introspect-db', async (_e, { id, database }: { id: string; database: string }) => {
+    const client = mongoClients.get(id)
+    if (!client) return { ok: false, error: 'Not connected' }
+    try {
+      const db = client.db(database)
+      const list = await db.listCollections().toArray()
+      const tables = list.map(c => ({
+        table_schema: database,
+        table_name: c.name,
+        table_type: c.type === 'view' ? 'VIEW' : 'BASE TABLE'
+      }))
+      return { ok: true, tables, functions: [], enums: [], types: [] }
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    }
+  })
+
+  function getUniqueKeys(arr: any[]): string[] {
+    const keys = new Set<string>()
+    for (const obj of arr) {
+      if (obj && typeof obj === 'object') {
+        for (const k of Object.keys(obj)) {
+          keys.add(k)
+        }
+      }
+    }
+    return Array.from(keys)
+  }
+
+  ipcMain.handle('mongodb:query', async (_e, { id, sql, database }: { id: string; sql: string; database?: string }) => {
+    const client = mongoClients.get(id)
+    if (!client) return { ok: false, error: 'Not connected' }
+    try {
+      const dbName = database || 'test'
+      const dbInstance = client.db(dbName)
+
+      const wrapCursor = (cursor: any) => {
+        const proxyObj = {
+          skip: (n: number) => { cursor.skip(n); return proxyObj },
+          limit: (n: number) => { cursor.limit(n); return proxyObj },
+          sort: (spec: any) => { cursor.sort(spec); return proxyObj },
+          toArray: () => cursor.toArray(),
+          then: (onfulfilled: any, onrejected: any) => {
+            return cursor.toArray().then(onfulfilled, onrejected)
+          }
+        }
+        return proxyObj
+      }
+
+      const dbProxy = new Proxy({
+        collection: (name: string) => {
+          return {
+            find: (filter = {}, options = {}) => wrapCursor(dbInstance.collection(name).find(filter, options)),
+            findOne: (filter = {}, options = {}) => dbInstance.collection(name).findOne(filter, options),
+            insertOne: (doc: any) => dbInstance.collection(name).insertOne(doc),
+            insertMany: (docs: any[]) => dbInstance.collection(name).insertMany(docs),
+            updateOne: (filter = {}, update = {}, options = {}) => dbInstance.collection(name).updateOne(filter, update, options),
+            updateMany: (filter = {}, update = {}, options = {}) => dbInstance.collection(name).updateMany(filter, update, options),
+            deleteOne: (filter = {}, options = {}) => dbInstance.collection(name).deleteOne(filter, options),
+            deleteMany: (filter = {}, options = {}) => dbInstance.collection(name).deleteMany(filter, options),
+            aggregate: (pipeline = [], options = {}) => wrapCursor(dbInstance.collection(name).aggregate(pipeline, options)),
+            countDocuments: (filter = {}, options = {}) => dbInstance.collection(name).countDocuments(filter, options),
+          }
+        }
+      }, {
+        get(target: any, prop: string) {
+          if (prop in target) return target[prop]
+          if (prop === 'then') return undefined
+          return target.collection(prop)
+        }
+      })
+
+      const context = vm.createContext({
+        db: dbProxy,
+        ObjectId: (val: string) => new ObjectId(val),
+        ObjectID: (val: string) => new ObjectId(val),
+        console: { log: () => {} }
+      })
+
+      const start = Date.now()
+      const script = new vm.Script(sql.trim())
+      const rawResult = await script.runInContext(context, { timeout: 15000 })
+      const ms = Date.now() - start
+
+      let rows: any[] = []
+      let fields: string[] = []
+
+      if (rawResult !== undefined && rawResult !== null) {
+        if (Array.isArray(rawResult)) {
+          rows = rawResult
+          fields = getUniqueKeys(rows)
+        } else if (typeof rawResult === 'object') {
+          rows = [rawResult]
+          fields = Object.keys(rawResult)
+        } else {
+          rows = [{ result: rawResult }]
+          fields = ['result']
+        }
+      }
+
+      const cleanRows = JSON.parse(JSON.stringify(rows, (key, value) => {
+        if (value && typeof value === 'object' && value.val !== undefined) {
+          return String(value)
+        }
+        return value
+      }))
+
+      return {
+        ok: true,
+        rows: cleanRows,
+        fields,
+        rowCount: cleanRows.length,
+        ms
+      }
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    }
+  })
+
   app.on('will-quit', () => {
     for (const [id] of vpnProcesses) killVpn(id)
+    for (const [id, client] of mongoClients) {
+      client.close().catch(() => {})
+    }
   })
 })
 
@@ -438,22 +609,32 @@ app.on('window-all-closed', () => {
 if (isProd) {
   const logFile = fs.createWriteStream(path.join(app.getPath('userData'), 'updater.log'), { flags: 'a' })
   const log = {
-    info:  (...a: unknown[]) => { const msg = `[${new Date().toISOString()}] INFO  ${a.join(' ')}\n`; logFile.write(msg) },
-    warn:  (...a: unknown[]) => { const msg = `[${new Date().toISOString()}] WARN  ${a.join(' ')}\n`; logFile.write(msg) },
-    error: (...a: unknown[]) => { const msg = `[${new Date().toISOString()}] ERROR ${a.join(' ')}\n`; logFile.write(msg) },
+    info:  (...a: unknown[]) => { const msg = `[${new Date().toISOString()}] INFO  ${a.join(' ')}\n`; logFile.write(msg); console.log(msg.trimEnd()) },
+    warn:  (...a: unknown[]) => { const msg = `[${new Date().toISOString()}] WARN  ${a.join(' ')}\n`; logFile.write(msg); console.warn(msg.trimEnd()) },
+    error: (...a: unknown[]) => { const msg = `[${new Date().toISOString()}] ERROR ${a.join(' ')}\n`; logFile.write(msg); console.error(msg.trimEnd()) },
   }
   autoUpdater.logger = log
   autoUpdater.autoDownload = true
   autoUpdater.autoInstallOnAppQuit = true
+
+  if (process.platform === 'darwin') {
+    autoUpdater.channel = 'latest'
+  }
+
   autoUpdater.setFeedURL({ provider: 'github', owner: 'Marijanoo', repo: 'quence-db' })
 
-  autoUpdater.on('update-available', (info) => { log.info('Update available:', info.version); mainWindow?.webContents.send('update-available') })
-  autoUpdater.on('download-progress', (info) => { mainWindow?.webContents.send('update-progress', info.percent) })
-  autoUpdater.on('update-downloaded', (info) => { log.info('Downloaded:', info.version); mainWindow?.webContents.send('update-downloaded') })
-  autoUpdater.on('error', (err) => log.error('Error:', err?.message ?? err))
+  autoUpdater.on('checking-for-update', () => { log.info('[updater] Checking for update…') })
+  autoUpdater.on('update-available', (info) => { log.info('[updater] Update available:', info.version); mainWindow?.webContents.send('update-available') })
+  autoUpdater.on('update-not-available', (info) => { log.info('[updater] Already up to date:', info.version) })
+  autoUpdater.on('download-progress', (info) => {
+    log.info(`[updater] Downloading… ${info.percent.toFixed(1)}% (${(info.transferred / 1024 / 1024).toFixed(1)} / ${(info.total / 1024 / 1024).toFixed(1)} MB)`)
+    mainWindow?.webContents.send('update-progress', info.percent)
+  })
+  autoUpdater.on('update-downloaded', (info) => { log.info('[updater] Update downloaded, ready to install:', info.version); mainWindow?.webContents.send('update-downloaded') })
+  autoUpdater.on('error', (err) => { log.error('[updater] Error:', err?.message ?? err) })
 
   process.on('unhandledRejection', () => {})
-  ipcMain.on('install-update', () => autoUpdater.quitAndInstall(true, false))
+  ipcMain.on('install-update', () => { log.info('[updater] install-update requested, calling quitAndInstall'); autoUpdater.quitAndInstall(true, false) })
 
   app.on('browser-window-created', (_, win) => {
     win.webContents.once('did-finish-load', () => {

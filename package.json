@@ -8,7 +8,7 @@
     "start": "next start",
     "lint": "eslint .",
     "build:electron": "tsc -p electron/tsconfig.json",
-    "electron:dev": "concurrently --kill-others \"npm run dev\" \"wait-on tcp:3000 && npm run build:electron && electron .\"",
+    "electron:dev": "concurrently --kill-others \"npm run dev\" \"wait-on tcp:3001 && npm run build:electron && electron . 3001\"",
     "rebuild": "electron-rebuild -f -w better-sqlite3",
     "electron:build": "npm run build && npm run build:electron && electron-builder",
     "build:electron-win": "npm run build && npm run build:electron && electron-builder --win --publish never",
@@ -43,8 +43,20 @@
       "hardenedRuntime": false,
       "gatekeeperAssess": false,
       "target": [
-        { "target": "dmg", "arch": ["arm64", "x64"] },
-        { "target": "zip", "arch": ["arm64", "x64"] }
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
       ]
     },
     "win": {
@@ -95,6 +107,7 @@
     "electron-serve": "^1.1.0",
     "electron-updater": "^6.8.3",
     "lucide-react": "^0.564.0",
+    "mongodb": "^7.2.0",
     "mysql2": "^3.22.3",
     "next": "16.2.6",
     "next-themes": "^0.4.6",
@@ -111,6 +124,7 @@
     "@electron/rebuild": "^4.0.4",
     "@tailwindcss/postcss": "^4.2.0",
     "@types/better-sqlite3": "^7.6.13",
+    "@types/mongodb": "^4.0.6",
     "@types/node": "^22",
     "@types/react": "^19",
     "@types/react-dom": "^19",

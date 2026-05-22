@@ -12,6 +12,12 @@ declare global {
       onUpdateProgress?: (cb: (percent: number) => void) => void
       onUpdateDownloaded: (cb: () => void) => void
       installUpdate?: () => void
+      onRunQuery?: (cb: () => void) => void
+      offRunQuery?: (cb: () => void) => void
+      onCloseActiveTab?: (cb: () => void) => void
+      onNewQueryTab?: (cb: () => void) => void
+      offCloseActiveTab?: (cb: () => void) => void
+      offNewQueryTab?: (cb: () => void) => void
       db: {
         connections: {
           get: () => Promise<any[]>
@@ -36,6 +42,13 @@ declare global {
         selectOvpnFile: () => Promise<string | null>
       }
       mysql: {
+        connect:      (opts: { id: string; host: string; port: number; database: string; user: string; password: string; ssl: boolean; vpnConfigPath?: string; vpnUsername?: string; vpnPassword?: string }) => Promise<{ ok: boolean; error?: string }>
+        disconnect:   (id: string) => Promise<{ ok: boolean; error?: string }>
+        query:        (id: string, sql: string, database?: string) => Promise<{ ok: boolean; rows?: Record<string, unknown>[]; fields?: string[]; rowCount?: number | null; ms?: number; error?: string }>
+        introspect:   (id: string) => Promise<{ ok: boolean; databases?: string[]; error?: string }>
+        introspectDb: (id: string, database: string) => Promise<{ ok: boolean; tables?: any[]; functions?: any[]; enums?: any[]; types?: any[]; error?: string }>
+      }
+      mongodb: {
         connect:      (opts: { id: string; host: string; port: number; database: string; user: string; password: string; ssl: boolean; vpnConfigPath?: string; vpnUsername?: string; vpnPassword?: string }) => Promise<{ ok: boolean; error?: string }>
         disconnect:   (id: string) => Promise<{ ok: boolean; error?: string }>
         query:        (id: string, sql: string, database?: string) => Promise<{ ok: boolean; rows?: Record<string, unknown>[]; fields?: string[]; rowCount?: number | null; ms?: number; error?: string }>
