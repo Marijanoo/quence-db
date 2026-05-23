@@ -116,6 +116,18 @@ async function createWindow() {
   mainWindow.on('closed', () => { saveWindowState(); mainWindow = null })
 }
 
+const gotLock = app.requestSingleInstanceLock()
+if (!gotLock) {
+  app.quit()
+} else {
+  app.on('second-instance', () => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore()
+      mainWindow.focus()
+    }
+  })
+}
+
 app.on('ready', () => {
   createWindow()
 
