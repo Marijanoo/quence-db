@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useState, useCallback, useEffect, useRef } from 'react'
+import React, { useState, useCallback, useEffect, useRef, useImperativeHandle } from 'react'
 import {
   ResizableHandle,
   ResizablePanel,
@@ -13,6 +13,7 @@ import {
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { generateId } from '@/lib/utils'
+import { toast } from 'sonner'
 import { EditorView, keymap, placeholder as cmPlaceholder, Decoration, DecorationSet, ViewPlugin, ViewUpdate } from '@codemirror/view'
 import { EditorState, StateEffect, StateField, RangeSetBuilder } from '@codemirror/state'
 import { sql } from '@codemirror/lang-sql'
@@ -69,7 +70,7 @@ interface SchemaEntry {
   open: boolean
 }
 
-function buildSchemaEntries(tables: any[] = [], functions: any[] = [], enums: any[] = [], types: any[] = []): SchemaEntry[] {
+export function buildSchemaEntries(tables: any[] = [], functions: any[] = [], enums: any[] = [], types: any[] = []): SchemaEntry[] {
   const schemaMap = new Map<string, SchemaEntry>()
 
   function getOrCreate(schema: string): SchemaEntry {
@@ -102,6 +103,12 @@ function buildSchemaEntries(tables: any[] = [], functions: any[] = [], enums: an
   }
   return [...schemaMap.values()]
 }
+
+const POSTGRES_TYPES = [
+  'varchar', 'text', 'integer', 'bigint', 'boolean', 'numeric', 'timestamp',
+  'timestamptz', 'date', 'time', 'json', 'jsonb', 'uuid', 'bytea', 'xml',
+  'double precision', 'real', 'smallint', 'serial', 'bigserial'
+]
 
 interface DesignColumn {
   id: string
@@ -179,7 +186,7 @@ interface ErdRelation {
 
 interface QueryTab {
   id: string
-  kind: 'query' | 'table' | 'design' | 'erd'
+  kind: 'query' | 'table' | 'design' | 'erd' | 'create-table' | 'create-view'
   title: string
   sql: string
   results: QueryResult[]
@@ -309,7 +316,7 @@ function vpnFileName(p: string) {
   return p.split(/[\\/]/).pop() ?? p
 }
 
-function parseConnectionString(str: string, dbType: 'postgres' | 'mysql' | 'mongodb'): Partial<{ host: string; port: string; database: string; user: string; password: string; ssl: boolean }> {
+export function parseConnectionString(str: string, dbType: 'postgres' | 'mysql' | 'mongodb'): Partial<{ host: string; port: string; database: string; user: string; password: string; ssl: boolean }> {
   try {
     const url = new URL(str)
     return {
@@ -854,10 +861,14 @@ function ToolbarBtn({ icon, label, onClick, disabled }: { icon: React.ReactNode;
 function DbToolbar({
   onNewConnection,
   onNewQuery,
+  onNewTable,
+  onNewView,
   activeConn,
 }: {
   onNewConnection: () => void
   onNewQuery: () => void
+  onNewTable: () => void
+  onNewView: () => void
   activeConn: DbConnection | null
 }) {
   return (
@@ -886,15 +897,15 @@ function DbToolbar({
       <ToolbarBtn
         icon={<Table2 className="h-6 w-6 text-primary" />}
         label="Table"
-        onClick={() => {}}
-        disabled
+        onClick={onNewTable}
+        disabled={!activeConn || activeConn.dbType !== 'postgres' || activeConn.status !== 'connected'}
       />
 
       <ToolbarBtn
         icon={<View className="h-6 w-6 text-sky-300" />}
         label="View"
-        onClick={() => {}}
-        disabled
+        onClick={onNewView}
+        disabled={!activeConn || activeConn.dbType !== 'postgres' || activeConn.status !== 'connected'}
       />
 
       <ToolbarBtn
@@ -1017,9 +1028,9 @@ function ConnectionsPanel({
     const query = `REFRESH MATERIALIZED VIEW "${schema.replace(/"/g, '""')}"."${mvName.replace(/"/g, '""')}";`
     const res = await dbIpc(connId).query(connId, query, dbName)
     if (res.ok) {
-      alert(`Materialized view "${schema}.${mvName}" successfully refreshed!`)
+      toast.success(`Materialized view "${schema}.${mvName}" successfully refreshed!`)
     } else {
-      alert(`Failed to refresh materialized view:\n\n${res.error}`)
+      toast.error(`Failed to refresh materialized view:\n\n${res.error}`)
     }
   }
 
@@ -1708,7 +1719,7 @@ function QueryTabBar({
   return (
     <div className="flex items-end border-b border-border bg-card shrink-0 overflow-x-auto">
       {tabs.map(tab => {
-        const isChanged = (tab.isFunction && tab.sql !== tab.originalSql) || (tab.kind === 'design' && isTableDesignChanged(tab)) || (!tab.isFunction && tab.kind === 'query' && tab.originalSql !== undefined && tab.sql !== tab.originalSql && tab.sql.trim() !== '')
+        const isChanged = (tab.isFunction && tab.sql !== tab.originalSql) || (tab.kind === 'design' && isTableDesignChanged(tab)) || (!tab.isFunction && tab.kind === 'query' && tab.originalSql !== undefined && tab.sql !== tab.originalSql && tab.sql.trim() !== '') || (tab.kind === 'create-table' && (tab.columns ?? []).length > 0) || (tab.kind === 'create-view' && tab.sql.trim() !== '')
         return (
           <div
             key={tab.id}
@@ -1727,6 +1738,10 @@ function QueryTabBar({
               <Wrench className="h-3 w-3 shrink-0 text-primary" />
             ) : tab.kind === 'erd' ? (
               <Workflow className="h-3 w-3 shrink-0 text-primary" />
+            ) : tab.kind === 'create-table' ? (
+              <Table2 className="h-3 w-3 shrink-0 text-primary" />
+            ) : tab.kind === 'create-view' ? (
+              <View className="h-3 w-3 shrink-0 text-sky-300" />
             ) : tab.isFunction ? (
               <FunctionSquare className="h-3 w-3 shrink-0 text-purple-300" />
             ) : tab.tableName?.startsWith('type:') ? (
@@ -1803,8 +1818,11 @@ function SingleResultGrid({ result, columnTypes, dbType }: { result: QueryResult
 
     rootFields.forEach(f => addFieldAndChildren(f))
     return fieldsList
-  }, [result.fields, result.rows, expandedColumns, dbType])
+  }, [result.fields, result.rows, expandedColumns])
 
+  // Reset grid UI state on each new query result. Intentionally not using a `key` remount here
+  // (see comment above SingleResultGrid) since that reintroduces the remount lag this component avoids.
+  // eslint-disable-next-line react-hooks/set-state-in-effect
   useEffect(() => { setSelectedCell(null); setEditingCell(null); setRowSearch(''); setRowFilter(''); setExportMenuOpen(false); setSortCol(null); setExpandedColumns(new Set()) }, [result])
 
   const handleSortClick = (col: string) => {
@@ -1873,7 +1891,7 @@ function SingleResultGrid({ result, columnTypes, dbType }: { result: QueryResult
   const handleCopyJson = () => {
     if (result.rows.length === 0) return
     navigator.clipboard.writeText(JSON.stringify(result.rows, null, 2))
-      .then(() => alert('Copied all rows to clipboard as JSON!'))
+      .then(() => toast.success('Copied all rows to clipboard as JSON!'))
     setExportMenuOpen(false)
   }
 
@@ -1891,7 +1909,7 @@ function SingleResultGrid({ result, columnTypes, dbType }: { result: QueryResult
     )
     const mdContent = [headers, separators, ...rows].join('\n')
     navigator.clipboard.writeText(mdContent)
-      .then(() => alert('Copied all rows to clipboard as a Markdown Table!'))
+      .then(() => toast.success('Copied all rows to clipboard as a Markdown Table!'))
     setExportMenuOpen(false)
   }
 
@@ -1931,20 +1949,6 @@ function SingleResultGrid({ result, columnTypes, dbType }: { result: QueryResult
     return () => document.removeEventListener('keydown', handler)
   }, [selectedCell, editingCell, result, visibleFields])
 
-  if (result.error) {
-    return (
-      <div className="flex-1 flex items-center justify-center p-6">
-        <div className="flex items-start gap-3 rounded-lg border border-red-500/30 bg-red-950/60 px-4 py-3 max-w-lg">
-          <X className="h-4 w-4 text-red-300 shrink-0 mt-0.5" />
-          <p className="text-xs text-red-300 whitespace-pre-wrap break-words">{result.error}</p>
-        </div>
-      </div>
-    )
-  }
-  if (result.fields.length === 0) {
-    return <div className="flex-1 flex items-center justify-center"><p className="text-xs text-muted-foreground">Query executed successfully — no rows returned</p></div>
-  }
-
   const needle = rowFilter.toLowerCase()
   const visibleRows = needle
     ? result.rows.filter(row =>
@@ -1972,6 +1976,20 @@ function SingleResultGrid({ result, columnTypes, dbType }: { result: QueryResult
       return sortDir === 'asc' ? aStr.localeCompare(bStr) : bStr.localeCompare(aStr)
     })
   }, [visibleRows, sortCol, sortDir])
+
+  if (result.error) {
+    return (
+      <div className="flex-1 flex items-center justify-center p-6">
+        <div className="flex items-start gap-3 rounded-lg border border-red-500/30 bg-red-950/60 px-4 py-3 max-w-lg">
+          <X className="h-4 w-4 text-red-300 shrink-0 mt-0.5" />
+          <p className="text-xs text-red-300 whitespace-pre-wrap break-words">{result.error}</p>
+        </div>
+      </div>
+    )
+  }
+  if (result.fields.length === 0) {
+    return <div className="flex-1 flex items-center justify-center"><p className="text-xs text-muted-foreground">Query executed successfully — no rows returned</p></div>
+  }
 
   return (
     <div className="flex flex-col flex-1 min-h-0">
@@ -2299,9 +2317,8 @@ function SqlEditor({ value, onChange, onRun, onOpenFind, editorRef }: {
   useEffect(() => { onChangeRef.current = onChange }, [onChange])
   useEffect(() => { onOpenFindRef.current = onOpenFind }, [onOpenFind])
 
-  useEffect(() => {
-    if (!editorRef) return
-    ;(editorRef as React.MutableRefObject<SqlEditorHandle>).current = {
+  useImperativeHandle(editorRef, () => {
+    const handle: SqlEditorHandle = {
       setHighlight: (query, caseSensitive) => {
         viewRef.current?.dispatch({ effects: setSearchHighlight.of({ query, caseSensitive }) })
       },
@@ -2363,7 +2380,7 @@ function SqlEditor({ value, onChange, onRun, onOpenFind, editorRef }: {
         if (matches) {
           view.dispatch({ changes: { from: sel.from, to: sel.to, insert: replacement } })
         }
-        ;(editorRef as React.MutableRefObject<SqlEditorHandle>).current.findNext(query, caseSensitive)
+        handle.findNext(query, caseSensitive)
       },
       replaceAll: (query, replacement, caseSensitive) => {
         const view = viewRef.current
@@ -2384,7 +2401,8 @@ function SqlEditor({ value, onChange, onRun, onOpenFind, editorRef }: {
         })
       },
     }
-  })
+    return handle
+  }, [])
 
   // Create editor once on mount
   useEffect(() => {
@@ -2445,6 +2463,8 @@ function SqlSearchBar({ editorRef, onClose }: {
 
   useEffect(() => { findInputRef.current?.focus() }, [])
 
+  // Synchronizes with the external CodeMirror view (highlight + match count); not derived component state.
+  /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
     if (!find) {
       setMatchCount(0)
@@ -2454,6 +2474,7 @@ function SqlSearchBar({ editorRef, onClose }: {
     editorRef.current?.setHighlight(find, caseSensitive)
     setMatchCount(editorRef.current?.countMatches(find, caseSensitive) ?? 0)
   }, [find, caseSensitive, editorRef])
+  /* eslint-enable react-hooks/set-state-in-effect */
 
   const next = () => editorRef.current?.findNext(find, caseSensitive)
   const prev = () => editorRef.current?.findPrev(find, caseSensitive)
@@ -2499,7 +2520,7 @@ function SqlSearchBar({ editorRef, onClose }: {
   )
 }
 
-function splitSqlStatements(sql: string): string[] {
+export function splitSqlStatements(sql: string): string[] {
   const statements: string[] = []
   let currentStatement = ''
   let i = 0
@@ -2928,6 +2949,35 @@ function generateTableAlterSql(tab: QueryTab): string {
   return ddl.join('\n')
 }
 
+function generateCreateTableSql(schema: string, table: string, columns: DesignColumn[]): string {
+  const fullTable = `"${schema}"."${table}"`
+
+  const colDefs = columns.map(col => {
+    let typeStr = col.type
+    if (col.length) {
+      if (col.decimal && ['numeric', 'decimal'].includes(col.type.toLowerCase())) {
+        typeStr += `(${col.length}, ${col.decimal})`
+      } else {
+        typeStr += `(${col.length})`
+      }
+    }
+    const nullStr = col.nullable ? 'NULL' : 'NOT NULL'
+    const defStr = col.defaultValue ? ` DEFAULT ${col.defaultValue}` : ''
+    return `  "${col.name}" ${typeStr} ${nullStr}${defStr}`
+  })
+
+  const pkCols = columns.filter(c => c.isPrimaryKey).map(c => c.name)
+  if (pkCols.length > 0) {
+    colDefs.push(`  PRIMARY KEY (${pkCols.map(c => `"${c}"`).join(', ')})`)
+  }
+
+  return `CREATE TABLE ${fullTable} (\n${colDefs.join(',\n')}\n);`
+}
+
+function generateCreateViewSql(schema: string, view: string, query: string): string {
+  return `CREATE VIEW "${schema}"."${view}" AS\n${query.trim().replace(/;\s*$/, '')};`
+}
+
 // ── ER Diagram Component ──────────────────────────────────────────────────────
 
 function ErdDiagramView({
@@ -3289,7 +3339,7 @@ function ErdDiagramView({
           <div className="absolute top-20 left-20 bg-card border border-border p-6 rounded-xl flex flex-col gap-2 max-w-sm">
             <span className="text-xs font-semibold text-foreground">Empty Database Diagram</span>
             <span className="text-[11px] text-muted-foreground leading-normal">
-              No tables found in schema 'public'. Add tables or import structures to visualize.
+              No tables found in schema &apos;public&apos;. Add tables or import structures to visualize.
             </span>
           </div>
         )}
@@ -3311,6 +3361,7 @@ function QueryPane({
   onOpenTableDesign,
   onRefreshDb,
   onAfterRun,
+  onClose,
   isSaved,
   isActive,
   runTrigger,
@@ -3324,6 +3375,7 @@ function QueryPane({
   onOpenTableDesign: (connId: string, dbName: string, schema: string, table: string) => void
   onRefreshDb: (connId: string, dbName: string) => void
   onAfterRun?: (tab: QueryTab, ok: boolean) => void
+  onClose: (id: string) => void
   isSaved: boolean
   isActive: boolean
   runTrigger: number
@@ -3501,8 +3553,12 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
       console.error(err)
       onChange(tab.id, { running: false })
     })
+  // Intentionally narrow deps: only reload when the tab identity or load-state changes, not on every connections/onChange identity change.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab.id, tab.kind, tab.columns, tab.running])
 
+  // Close the find bar whenever the active tab changes.
+  // eslint-disable-next-line react-hooks/set-state-in-effect
   useEffect(() => { setShowFind(false) }, [tab.id])
 
   // Load ERD Metadata
@@ -3653,6 +3709,8 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
     }).catch(() => {
       onChange(tab.id, { running: false, erdTables: [] })
     })
+  // Intentionally narrow deps: only reload when the tab identity or load-state changes, not on every connections/onChange identity change.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab.id, tab.kind, tab.erdTables, tab.running])
 
   const executeFunction = useCallback(async () => {
@@ -3696,7 +3754,7 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
     }
 
     onChange(tab.id, { running: false, results: collected })
-  }, [fnRunDialog, paramValues, tab, connections, onChange])
+  }, [fnRunDialog, paramValues, tab, connections, onChange, dbIpc])
 
   const run = useCallback(async () => {
     if (tab.running) return
@@ -3830,7 +3888,7 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
     if (tab.databaseName && (tab.isFunction || tab.tableName?.startsWith('type:'))) {
       onAfterRun?.(tab, !lastError)
     }
-  }, [tab, connections, onChange, onAfterRun])
+  }, [tab, connections, onChange, onAfterRun, dbIpc])
 
   const explainQuery = useCallback(async () => {
     if (tab.running) return
@@ -3858,7 +3916,7 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
     }
 
     onChange(tab.id, { running: false, results: collected })
-  }, [tab, connections, onChange])
+  }, [tab, connections, onChange, dbIpc])
 
   const beautifyQuery = useCallback(() => {
     const original = tab.sql
@@ -3925,7 +3983,7 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
       onChange(tab.id, { running: false, results: collected })
       onAfterRun?.(tab, false)
     }
-  }, [tab, connections, onChange, onAfterRun])
+  }, [tab, connections, onChange, onAfterRun, dbIpc])
 
   const handleSave = useCallback(() => {
     if (tab.kind === 'design') {
@@ -4087,7 +4145,7 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
     }
 
     return (
-      <ErdDiagramView 
+      <ErdDiagramView
         tab={tab}
         erdTables={erdTables}
         erdRelations={erdRelations}
@@ -4095,6 +4153,308 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
         onOpenTable={onOpenTable}
         onOpenTableDesign={onOpenTableDesign}
       />
+    )
+  }
+
+  if (tab.kind === 'create-table') {
+    const columns = tab.columns ?? []
+    const tableName = tab.tableName ?? ''
+    const schemaName = tab.schemaName ?? 'public'
+    const canCreate = !!tableName.trim() && columns.length > 0 && columns.every(c => c.name.trim()) && !tab.running
+
+    const handleAddColumn = () => {
+      const next = [...columns, {
+        id: generateId(),
+        name: `column_${columns.length + 1}`,
+        type: 'varchar',
+        length: '255',
+        decimal: '',
+        nullable: true,
+        isPrimaryKey: false,
+        isForeignKey: false,
+        defaultValue: ''
+      }]
+      onChange(tab.id, { columns: next })
+    }
+
+    const handleDeleteColumn = (colId: string) => {
+      onChange(tab.id, { columns: columns.filter(c => c.id !== colId) })
+    }
+
+    const handleUpdateColumn = (colId: string, patch: Partial<DesignColumn>) => {
+      onChange(tab.id, { columns: columns.map(c => c.id === colId ? { ...c, ...patch } : c) })
+    }
+
+    const handleCreate = async () => {
+      const connId = tab.connectionId ?? connections.find(c => c.status === 'connected')?.id
+      if (!connId || !tab.databaseName || !canCreate) return
+
+      setDesignSaving(true)
+      setDesignError(null)
+
+      const ddl = generateCreateTableSql(schemaName, tableName.trim(), columns)
+      const res = await dbIpc(connId).query(connId, ddl, tab.databaseName)
+
+      if (res.ok) {
+        setDesignSaving(false)
+        toast.success(`Table "${schemaName}.${tableName.trim()}" created successfully!`)
+        onRefreshDb(connId, tab.databaseName)
+        onOpenTableDesign(connId, tab.databaseName, schemaName, tableName.trim())
+        onClose(tab.id)
+      } else {
+        setDesignSaving(false)
+        setDesignError(res.error || 'Failed to create table.')
+      }
+    }
+
+    return (
+      <div className="flex flex-col h-full bg-background select-none relative">
+        <div className="flex items-center justify-between px-4 h-12 border-b border-border bg-muted/20 shrink-0">
+          <div className="flex items-center gap-2">
+            <Table2 className="h-4 w-4 text-primary shrink-0" />
+            <input
+              type="text"
+              value={tableName}
+              onChange={e => onChange(tab.id, { tableName: e.target.value })}
+              placeholder="table_name"
+              className="bg-background border border-border/80 hover:border-border focus:border-primary focus:ring-1 focus:ring-primary rounded px-2 py-1 text-xs font-mono transition-all shadow-sm w-56"
+            />
+            <span className="text-[10px] text-muted-foreground uppercase tracking-wider font-semibold border border-border px-1.5 py-0.5 rounded bg-muted/40 font-sans">
+              New Table &middot; {schemaName}
+            </span>
+          </div>
+          <button
+            onClick={handleCreate}
+            disabled={!canCreate}
+            className={cn(
+              'flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-medium transition-all shadow-sm border border-transparent',
+              canCreate
+                ? 'bg-primary text-primary-foreground hover:bg-primary/95 hover:shadow'
+                : 'bg-muted/30 text-muted-foreground cursor-not-allowed border-border/40'
+            )}
+          >
+            <Save className="h-3.5 w-3.5" />
+            {tab.running ? 'Creating…' : 'Create Table'}
+          </button>
+        </div>
+
+        {designError && (
+          <div className="px-4 py-2 bg-red-950/60 border-b border-red-500/30 text-xs text-red-300 whitespace-pre-wrap break-words shrink-0">
+            {designError}
+          </div>
+        )}
+
+        <div className="flex-1 overflow-y-auto p-4 min-h-0 bg-background">
+          <div className="flex flex-col gap-3 h-full">
+            <div className="flex items-center justify-between shrink-0">
+              <span className="text-xs font-medium text-muted-foreground">Define table columns &amp; types</span>
+              <button
+                onClick={handleAddColumn}
+                className="flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium border border-border bg-card text-foreground hover:bg-accent/30 transition-colors"
+              >
+                <Plus className="h-3 w-3 text-primary" />
+                Add Field
+              </button>
+            </div>
+
+            <div className="border border-border rounded-lg bg-card overflow-hidden flex flex-col flex-1 min-h-0">
+              <div className="overflow-x-auto overflow-y-auto flex-1">
+                <table className="w-full text-left border-collapse text-xs">
+                  <thead>
+                    <tr className="bg-muted/40 border-b border-border text-muted-foreground font-medium">
+                      <th className="p-2.5 w-14 text-center">PK</th>
+                      <th className="p-2.5 w-52">Name</th>
+                      <th className="p-2.5 w-48">Type</th>
+                      <th className="p-2.5 w-24">Length</th>
+                      <th className="p-2.5 w-24">Decimal</th>
+                      <th className="p-2.5 w-16 text-center">Null</th>
+                      <th className="p-2.5 w-52">Default Value</th>
+                      <th className="p-2.5 w-16 text-center">Action</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {columns.length === 0 && (
+                      <tr>
+                        <td colSpan={8} className="p-8 text-center text-muted-foreground">
+                          No columns defined. Click &quot;Add Field&quot; to add columns to this table.
+                        </td>
+                      </tr>
+                    )}
+                    {columns.map(col => (
+                      <tr key={col.id} className="border-b border-border/40 hover:bg-muted/20 transition-colors">
+                        <td className="p-2 text-center">
+                          <div className="flex items-center justify-center h-full">
+                            <button
+                              onClick={() => handleUpdateColumn(col.id, { isPrimaryKey: !col.isPrimaryKey })}
+                              className={cn(
+                                "h-4 w-4 rounded flex items-center justify-center transition-all border shadow-sm",
+                                col.isPrimaryKey
+                                  ? "bg-primary border-primary text-primary-foreground"
+                                  : "border-border/85 bg-background hover:border-border"
+                              )}
+                            >
+                              {col.isPrimaryKey && <Check className="h-3 w-3 stroke-[3.5]" />}
+                            </button>
+                          </div>
+                        </td>
+                        <td className="p-2">
+                          <input
+                            type="text"
+                            value={col.name}
+                            onChange={e => handleUpdateColumn(col.id, { name: e.target.value })}
+                            placeholder="column_name"
+                            className="w-full bg-background border border-border/80 hover:border-border focus:border-primary focus:ring-1 focus:ring-primary rounded px-2 py-1 text-xs font-mono transition-all shadow-sm"
+                          />
+                        </td>
+                        <td className="p-2">
+                          <select
+                            value={col.type}
+                            onChange={e => handleUpdateColumn(col.id, { type: e.target.value })}
+                            className="w-full bg-background border border-border/80 hover:border-border focus:border-primary focus:ring-1 focus:ring-primary rounded px-2 py-1 text-xs font-mono text-foreground transition-all shadow-sm"
+                          >
+                            {POSTGRES_TYPES.map(t => (
+                              <option key={t} value={t}>{t}</option>
+                            ))}
+                            {!POSTGRES_TYPES.includes(col.type) && (
+                              <option value={col.type}>{col.type}</option>
+                            )}
+                          </select>
+                        </td>
+                        <td className="p-2">
+                          <input
+                            type="text"
+                            value={col.length}
+                            onChange={e => handleUpdateColumn(col.id, { length: e.target.value })}
+                            placeholder="length"
+                            className="w-full bg-background border border-border/80 hover:border-border focus:border-primary focus:ring-1 focus:ring-primary rounded px-2 py-1 text-xs font-mono text-center transition-all shadow-sm"
+                          />
+                        </td>
+                        <td className="p-2">
+                          <input
+                            type="text"
+                            value={col.decimal}
+                            onChange={e => handleUpdateColumn(col.id, { decimal: e.target.value })}
+                            placeholder="decimal"
+                            disabled={!['numeric', 'decimal'].includes(col.type.toLowerCase())}
+                            className="w-full bg-background border border-border/80 hover:border-border focus:border-primary focus:ring-1 focus:ring-primary rounded px-2 py-1 text-xs font-mono text-center disabled:opacity-30 transition-all shadow-sm"
+                          />
+                        </td>
+                        <td className="p-2 text-center">
+                          <div className="flex items-center justify-center h-full">
+                            <button
+                              onClick={() => handleUpdateColumn(col.id, { nullable: !col.nullable })}
+                              className={cn(
+                                "h-4 w-4 rounded flex items-center justify-center transition-all border shadow-sm",
+                                col.nullable
+                                  ? "bg-primary border-primary text-primary-foreground"
+                                  : "border-border/85 bg-background hover:border-border"
+                              )}
+                            >
+                              {col.nullable && <Check className="h-3 w-3 stroke-[3.5]" />}
+                            </button>
+                          </div>
+                        </td>
+                        <td className="p-2">
+                          <input
+                            type="text"
+                            value={col.defaultValue}
+                            onChange={e => handleUpdateColumn(col.id, { defaultValue: e.target.value })}
+                            placeholder="NULL or 'value'"
+                            className="w-full bg-background border border-border/80 hover:border-border focus:border-primary focus:ring-1 focus:ring-primary rounded px-2 py-1 text-xs font-mono transition-all shadow-sm"
+                          />
+                        </td>
+                        <td className="p-2 text-center">
+                          <button
+                            onClick={() => handleDeleteColumn(col.id)}
+                            className="p-1 text-muted-foreground hover:text-destructive rounded transition-colors"
+                            title="Delete column"
+                          >
+                            <X className="h-3.5 w-3.5" />
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  if (tab.kind === 'create-view') {
+    const viewName = tab.tableName ?? ''
+    const schemaName = tab.schemaName ?? 'public'
+    const canCreate = !!viewName.trim() && !!tab.sql.trim() && !tab.running
+
+    const handleCreate = async () => {
+      const connId = tab.connectionId ?? connections.find(c => c.status === 'connected')?.id
+      if (!connId || !tab.databaseName || !canCreate) return
+
+      setDesignSaving(true)
+      setDesignError(null)
+
+      const ddl = generateCreateViewSql(schemaName, viewName.trim(), tab.sql)
+      const res = await dbIpc(connId).query(connId, ddl, tab.databaseName)
+
+      if (res.ok) {
+        setDesignSaving(false)
+        toast.success(`View "${schemaName}.${viewName.trim()}" created successfully!`)
+        onRefreshDb(connId, tab.databaseName)
+        onClose(tab.id)
+      } else {
+        setDesignSaving(false)
+        setDesignError(res.error || 'Failed to create view.')
+      }
+    }
+
+    return (
+      <div className="flex flex-col h-full bg-background select-none relative">
+        <div className="flex items-center justify-between px-4 h-12 border-b border-border bg-muted/20 shrink-0">
+          <div className="flex items-center gap-2">
+            <View className="h-4 w-4 text-sky-300 shrink-0" />
+            <input
+              type="text"
+              value={viewName}
+              onChange={e => onChange(tab.id, { tableName: e.target.value })}
+              placeholder="view_name"
+              className="bg-background border border-border/80 hover:border-border focus:border-primary focus:ring-1 focus:ring-primary rounded px-2 py-1 text-xs font-mono transition-all shadow-sm w-56"
+            />
+            <span className="text-[10px] text-muted-foreground uppercase tracking-wider font-semibold border border-border px-1.5 py-0.5 rounded bg-muted/40 font-sans">
+              New View &middot; {schemaName}
+            </span>
+          </div>
+          <button
+            onClick={handleCreate}
+            disabled={!canCreate}
+            className={cn(
+              'flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-medium transition-all shadow-sm border border-transparent',
+              canCreate
+                ? 'bg-primary text-primary-foreground hover:bg-primary/95 hover:shadow'
+                : 'bg-muted/30 text-muted-foreground cursor-not-allowed border-border/40'
+            )}
+          >
+            <Save className="h-3.5 w-3.5" />
+            {tab.running ? 'Creating…' : 'Create View'}
+          </button>
+        </div>
+
+        {designError && (
+          <div className="px-4 py-2 bg-red-950/60 border-b border-red-500/30 text-xs text-red-300 whitespace-pre-wrap break-words shrink-0">
+            {designError}
+          </div>
+        )}
+
+        <div className="flex-1 min-h-0">
+          <SqlEditor
+            value={tab.sql}
+            onChange={v => onChange(tab.id, { sql: v })}
+            onRun={() => {}}
+          />
+        </div>
+      </div>
     )
   }
 
@@ -4106,12 +4466,6 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
     const foreignKeys = tab.foreignKeys ?? []
     const uniques = tab.uniques ?? []
     const triggers = tab.triggers ?? []
-
-    const postgresTypes = [
-      'varchar', 'text', 'integer', 'bigint', 'boolean', 'numeric', 'timestamp',
-      'timestamptz', 'date', 'time', 'json', 'jsonb', 'uuid', 'bytea', 'xml',
-      'double precision', 'real', 'smallint', 'serial', 'bigserial'
-    ]
 
     const handleAddColumn = () => {
       const next = [...columns, {
@@ -4391,10 +4745,10 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
                               onChange={e => handleUpdateColumn(col.id, { type: e.target.value })}
                               className="w-full bg-background border border-border/80 hover:border-border focus:border-primary focus:ring-1 focus:ring-primary rounded px-2 py-1 text-xs font-mono text-foreground transition-all shadow-sm"
                             >
-                              {postgresTypes.map(t => (
+                              {POSTGRES_TYPES.map(t => (
                                 <option key={t} value={t}>{t}</option>
                               ))}
-                              {!postgresTypes.includes(col.type) && (
+                              {!POSTGRES_TYPES.includes(col.type) && (
                                 <option value={col.type}>{col.type}</option>
                               )}
                             </select>
@@ -4456,7 +4810,7 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
                       {columns.length === 0 && (
                         <tr>
                           <td colSpan={8} className="p-8 text-center text-muted-foreground">
-                            No columns defined. Click "Add Field" to add columns to this table.
+                            No columns defined. Click &quot;Add Field&quot; to add columns to this table.
                           </td>
                         </tr>
                       )}
@@ -4547,7 +4901,7 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
                       {indexes.filter(i => !i.isPrimary).length === 0 && (
                         <tr>
                           <td colSpan={4} className="p-8 text-center text-muted-foreground">
-                            No indexes defined. Click "Add Index" to speed up your queries.
+                            No indexes defined. Click &quot;Add Index&quot; to speed up your queries.
                           </td>
                         </tr>
                       )}
@@ -4670,7 +5024,7 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
                       {foreignKeys.length === 0 && (
                         <tr>
                           <td colSpan={8} className="p-8 text-center text-muted-foreground">
-                            No foreign keys defined. Click "Add FK" to link relational tables.
+                            No foreign keys defined. Click &quot;Add FK&quot; to link relational tables.
                           </td>
                         </tr>
                       )}
@@ -4740,7 +5094,7 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
                       {uniques.length === 0 && (
                         <tr>
                           <td colSpan={3} className="p-8 text-center text-muted-foreground">
-                            No unique constraints defined. Click "Add Unique" to prevent duplicate row values.
+                            No unique constraints defined. Click &quot;Add Unique&quot; to prevent duplicate row values.
                           </td>
                         </tr>
                       )}
@@ -4844,7 +5198,7 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
                       {triggers.length === 0 && (
                         <tr>
                           <td colSpan={6} className="p-8 text-center text-muted-foreground">
-                            No triggers defined. Click "Add Trigger" to automate action triggers.
+                            No triggers defined. Click &quot;Add Trigger&quot; to automate action triggers.
                           </td>
                         </tr>
                       )}
@@ -5269,7 +5623,7 @@ interface PersistedConnection {
 
 interface PersistedTab {
   id: string
-  kind: 'query' | 'table' | 'design' | 'erd'
+  kind: 'query' | 'table' | 'design' | 'erd' | 'create-table' | 'create-view'
   title: string
   sql: string
   connectionId: string | null
@@ -5441,7 +5795,7 @@ function savePersistedTabs(
 
 // ── Root ──────────────────────────────────────────────────────────────────────
 
-function getNestedValue(obj: any, path: string): any {
+export function getNestedValue(obj: any, path: string): any {
   if (obj === null || obj === undefined) return undefined
   if (typeof obj === 'object' && path in obj) {
     return obj[path]
@@ -5455,7 +5809,7 @@ function getNestedValue(obj: any, path: string): any {
   return current
 }
 
-function flattenObject(obj: any, prefix = ''): Record<string, any> {
+export function flattenObject(obj: any, prefix = ''): Record<string, any> {
   const result: Record<string, any> = {}
   if (obj === null || typeof obj !== 'object') return result
 
@@ -5483,7 +5837,7 @@ function flattenObject(obj: any, prefix = ''): Record<string, any> {
   return result
 }
 
-function processMongoRows(rows: any[]) {
+export function processMongoRows(rows: any[]) {
   const processedRows = rows.map(row => {
     const flat = flattenObject(row)
     return { ...row, ...flat }
@@ -5536,13 +5890,46 @@ function makeTableDesignTab(connId: string, dbName: string, schema: string, tabl
   }
 }
 
+function makeCreateTableTab(connId: string, dbName: string, schema: string): QueryTab {
+  return {
+    id: generateId(),
+    kind: 'create-table',
+    title: 'New Table',
+    sql: '',
+    results: [],
+    running: false,
+    connectionId: connId,
+    databaseName: dbName,
+    schemaName: schema,
+    tableName: '',
+    columns: [],
+  }
+}
+
+function makeCreateViewTab(connId: string, dbName: string, schema: string): QueryTab {
+  return {
+    id: generateId(),
+    kind: 'create-view',
+    title: 'New View',
+    sql: '',
+    results: [],
+    running: false,
+    connectionId: connId,
+    databaseName: dbName,
+    schemaName: schema,
+    tableName: '',
+  }
+}
+
 // loaded once at module level so all useState initializers share the same snapshot
 const _initialPersistedTabs = loadPersistedTabs()
 const _initialTab = makeTab(1, null)
 
 export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
   const [isMounted, setIsMounted] = useState(false)
+  // Mount-detection flag for hydration-safe rendering; must start false on first render.
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setIsMounted(true)
   }, [])
 
@@ -5600,6 +5987,32 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
     setTabCounter(n => n + 1)
   }, [tabCounter, activeConnId, activeDbPerConn, activeSchemaPerDb, connections])
 
+  const newTable = useCallback(() => {
+    if (!activeConnId) return
+    const dbName = activeDbPerConn[activeConnId]
+    if (!dbName) return
+    const schemaName = activeSchemaPerDb[`${activeConnId}::${dbName}`] ?? 'public'
+    const tab = makeCreateTableTab(activeConnId, dbName, schemaName)
+    setTabs(prev => [...prev, tab])
+    setActiveTabId(tab.id)
+  }, [activeConnId, activeDbPerConn, activeSchemaPerDb])
+
+  const newView = useCallback(() => {
+    if (!activeConnId) return
+    const dbName = activeDbPerConn[activeConnId]
+    if (!dbName) return
+    const schemaName = activeSchemaPerDb[`${activeConnId}::${dbName}`] ?? 'public'
+    const tab = makeCreateViewTab(activeConnId, dbName, schemaName)
+    setTabs(prev => [...prev, tab])
+    setActiveTabId(tab.id)
+  }, [activeConnId, activeDbPerConn, activeSchemaPerDb])
+
+  // Pick the right IPC channel based on connection type
+  const dbIpc = useCallback((connId: string) => {
+    const conn = connections.find(c => c.id === connId)
+    return getIpc(conn?.dbType ?? 'postgres')
+  }, [connections])
+
   const handleSaveFunction = useCallback(async (tab: QueryTab) => {
     const connId = tab.connectionId ?? connections.find(c => c.status === 'connected')?.id
     if (!connId) return false
@@ -5617,7 +6030,19 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
       setTabs(prev => prev.map(t => t.id === tab.id ? { ...t, running: false, results: collected } : t))
       return false
     }
-  }, [connections])
+  }, [connections, dbIpc])
+
+  const removeTab = useCallback((id: string) => {
+    setTabs(prev => {
+      const next = prev.filter(t => t.id !== id)
+      if (next.length === 0) {
+        setActiveTabId('')
+        return []
+      }
+      setActiveTabId(curr => curr === id ? next[next.length - 1].id : curr)
+      return next
+    })
+  }, [])
 
   const closeTab = useCallback((id: string) => {
     setTabs(prev => {
@@ -5626,7 +6051,9 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
         const isFuncChanged = tab.isFunction && tab.sql !== tab.originalSql
         const isDesignChanged = tab.kind === 'design' && isTableDesignChanged(tab)
         const isQueryChanged = !tab.isFunction && tab.kind === 'query' && tab.originalSql !== undefined && tab.sql !== tab.originalSql && tab.sql.trim() !== ''
-        if (isFuncChanged || isDesignChanged || isQueryChanged) {
+        const isCreateTableChanged = tab.kind === 'create-table' && (tab.columns ?? []).length > 0
+        const isCreateViewChanged = tab.kind === 'create-view' && tab.sql.trim() !== ''
+        if (isFuncChanged || isDesignChanged || isQueryChanged || isCreateTableChanged || isCreateViewChanged) {
           setUnsavedCloseTab(tab)
           return prev
         }
@@ -5802,12 +6229,6 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Pick the right IPC channel based on connection type
-  const dbIpc = useCallback((connId: string) => {
-    const conn = connections.find(c => c.id === connId)
-    return getIpc(conn?.dbType ?? 'postgres')
-  }, [connections])
-
   // After connecting, load the list of databases
   const introspect = useCallback(async (connId: string) => {
     const res = await dbIpc(connId).introspect(connId)
@@ -5928,7 +6349,7 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
       await handleRefreshDb(connId, tab.databaseName)
       return true
     } else {
-      alert(`Failed to save table designer changes:\n\n${errMsg}`)
+      toast.error(`Failed to save table designer changes:\n\n${errMsg}`)
       return false
     }
   }, [connections, dbIpc, handleRefreshDb])
@@ -6104,7 +6525,7 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
     setTabs(prev => [...prev, newTab])
     setActiveTabId(newTab.id)
     setTimeout(() => runTableTab(newTab), 0)
-  }, [tabs, runTableTab])
+  }, [tabs, runTableTab, connections])
 
   const handleOpenTableDesign = useCallback((connId: string, dbName: string, schema: string, table: string) => {
     const existing = tabs.find(t => t.kind === 'design' && t.connectionId === connId && t.databaseName === dbName && t.schemaName === schema && t.tableName === table)
@@ -6204,7 +6625,7 @@ WHERE n.nspname = '${escapedSchema}' AND p.proname = '${escapedFn}';`
     }
     setTabs(prev => [...prev, newTab])
     setActiveTabId(tabId)
-  }, [])
+  }, [dbIpc])
 
   const handleOpenType = useCallback(async (connId: string, dbName: string, schema: string, typeName: string, typeKind: string) => {
     const tabTitle = `${schema}.${typeName}`
@@ -6300,7 +6721,7 @@ WHERE n.nspname = '${esc(schema)}' AND t.typname = '${esc(typeName)}';`
     }
     setTabs(prev => [...prev, newTab])
     setActiveTabId(tabId)
-  }, [tabs])
+  }, [tabs, dbIpc])
 
   const commitSaveQuery = useCallback((tab: QueryTab, name: string) => {
     setSavedQueries(prev => {
@@ -6381,6 +6802,8 @@ WHERE n.nspname = '${esc(schema)}' AND t.typname = '${esc(typeName)}';`
       <DbToolbar
         onNewConnection={() => setShowNewConn(true)}
         onNewQuery={newQuery}
+        onNewTable={newTable}
+        onNewView={newView}
         activeConn={activeConn}
       />
 
@@ -6440,6 +6863,7 @@ WHERE n.nspname = '${esc(schema)}' AND t.typname = '${esc(typeName)}';`
                 onOpenTableDesign={handleOpenTableDesign}
                 onRefreshDb={handleRefreshDb}
                 onAfterRun={(t, ok) => { if (ok && t.connectionId && t.databaseName) handleRefreshDb(t.connectionId, t.databaseName) }}
+                onClose={removeTab}
                 isSaved={savedQueries.some(q => q.id === activeTab.id)}
                 isActive={isActive}
                 runTrigger={runTrigger}

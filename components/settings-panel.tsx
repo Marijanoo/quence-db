@@ -183,7 +183,7 @@ function SqlPreview({ s }: { s: Settings }) {
       <span style={{ color: cm }}>{'-- fetch recent orders'}</span>{'\n'}
       <span><span style={{ color: kw }}>SELECT</span>{' '}<span style={{ color: typ }}>o</span><span style={{ color: op }}>.</span>id<span style={{ color: op }}>,</span></span>{'\n'}
       <span>{'       '}<span style={{ color: typ }}>o</span><span style={{ color: op }}>.</span>total<span style={{ color: op }}>,</span></span>{'\n'}
-      <span>{'       '}<span style={{ color: str }}>'active'</span>{' '}<span style={{ color: kw }}>AS</span>{' '}status</span>{'\n'}
+      <span>{'       '}<span style={{ color: str }}>&apos;active&apos;</span>{' '}<span style={{ color: kw }}>AS</span>{' '}status</span>{'\n'}
       <span><span style={{ color: kw }}>FROM</span>{' '}<span style={{ color: typ }}>orders</span>{' '}<span style={{ color: typ }}>o</span></span>{'\n'}
       <span><span style={{ color: kw }}>WHERE</span>{' '}o<span style={{ color: op }}>.</span>id <span style={{ color: op }}>&gt;</span>{' '}<span style={{ color: num }}>1000</span></span>{'\n'}
       <span><span style={{ color: kw }}>LIMIT</span>{' '}<span style={{ color: num }}>50</span><span style={{ color: op }}>;</span></span>
@@ -196,8 +196,10 @@ interface Props { open: boolean; onClose: () => void }
 export function SettingsPanel({ open, onClose }: Props) {
   const [s, setS] = useState<Settings>(DEFAULTS)
 
+  // Reads from localStorage (external system); must run after mount, not during render/SSR.
   useEffect(() => {
     const loaded = load()
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setS(loaded)
     applySettings(loaded)
   }, [])

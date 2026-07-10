@@ -1,6 +1,25 @@
 import Database from 'better-sqlite3'
 import * as path from 'path'
-import { app } from 'electron'
+import { app, safeStorage } from 'electron'
+
+// ── Credential encryption ────────────────────────────────────────────────────
+// Encrypted values are prefixed so legacy plaintext rows (written before this
+// was added) remain readable as-is and get re-encrypted on next save.
+const ENC_PREFIX = 'enc:v1:'
+
+export function encryptIfPossible(plain: string | null | undefined): string | null {
+  if (plain === null || plain === undefined || plain === '') return plain ?? null
+  if (!safeStorage.isEncryptionAvailable()) return plain
+  return ENC_PREFIX + safeStorage.encryptString(plain).toString('base64')
+}
+
+export function decryptIfPossible(stored: string | null | undefined): string | null {
+  if (stored === null || stored === undefined || stored === '') return stored ?? null
+  if (!stored.startsWith(ENC_PREFIX)) return stored
+  if (!safeStorage.isEncryptionAvailable()) return stored
+  const buf = Buffer.from(stored.slice(ENC_PREFIX.length), 'base64')
+  return safeStorage.decryptString(buf)
+}
 
 let _db: Database.Database | null = null
 
@@ -63,9 +82,9 @@ export function dbCreateConnection(c: any): void {
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     c.id, c.name, c.dbType ?? 'pg', c.host ?? '', c.port ?? 5432,
-    c.database ?? '', c.username ?? '', c.password ?? '',
+    c.database ?? '', c.username ?? '', encryptIfPossible(c.password) ?? '',
     c.ssl ? 1 : 0,
-    c.vpnConfigPath ?? null, c.vpnUsername ?? null, c.vpnPassword ?? null,
+    c.vpnConfigPath ?? null, c.vpnUsername ?? null, encryptIfPossible(c.vpnPassword),
     c.createdAt ?? Date.now(), c.updatedAt ?? Date.now()
   )
 }
@@ -81,7 +100,10 @@ export function dbUpdateConnection(id: string, data: any): void {
   for (const [k, col] of Object.entries(fields)) {
     if (data[k] !== undefined) {
       sets.push(`${col} = ?`)
-      vals.push(k === 'ssl' ? (data[k] ? 1 : 0) : data[k])
+      let val = data[k]
+      if (k === 'ssl') val = val ? 1 : 0
+      else if (k === 'password' || k === 'vpnPassword') val = encryptIfPossible(val)
+      vals.push(val)
     }
   }
   if (!sets.length) return
@@ -135,10 +157,10 @@ function toConnection(r: any) {
   return {
     id: r.id, name: r.name, dbType: r.db_type,
     host: r.host, port: r.port, database: r.database,
-    username: r.username, password: r.password, ssl: !!r.ssl,
+    username: r.username, password: decryptIfPossible(r.password) ?? '', ssl: !!r.ssl,
     vpnConfigPath: r.vpn_config_path ?? undefined,
     vpnUsername: r.vpn_username ?? undefined,
-    vpnPassword: r.vpn_password ?? undefined,
+    vpnPassword: decryptIfPossible(r.vpn_password) ?? undefined,
     createdAt: Number(r.created_at), updatedAt: Number(r.updated_at),
   }
 }
