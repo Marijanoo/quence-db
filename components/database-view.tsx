@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useState, useCallback, useEffect, useRef, useImperativeHandle } from 'react'
+import React, { useState, useCallback, useEffect, useRef, useImperativeHandle, useMemo } from 'react'
 import {
   ResizableHandle,
   ResizablePanel,
@@ -15,12 +15,13 @@ import { cn } from '@/lib/utils'
 import { generateId } from '@/lib/utils'
 import { toast } from 'sonner'
 import { EditorView, keymap, placeholder as cmPlaceholder, Decoration, DecorationSet, ViewPlugin, ViewUpdate } from '@codemirror/view'
-import { EditorState, StateEffect, StateField, RangeSetBuilder } from '@codemirror/state'
-import { sql } from '@codemirror/lang-sql'
+import { EditorState, StateEffect, StateField, RangeSetBuilder, Compartment } from '@codemirror/state'
+import { sql, PostgreSQL, SQLNamespace } from '@codemirror/lang-sql'
 import { defaultKeymap, history, historyKeymap } from '@codemirror/commands'
 import { syntaxHighlighting } from '@codemirror/language'
 import { classHighlighter } from '@lezer/highlight'
 import { SearchCursor } from '@codemirror/search'
+import { autocompletion, closeBrackets, completionKeymap, closeBracketsKeymap } from '@codemirror/autocomplete'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -67,15 +68,16 @@ interface SchemaEntry {
   functions: { name: string; arguments: string }[]
   enums: { name: string; values: string[] }[]
   types: { name: string; definition: string }[]
+  columns: Record<string, ColumnInfo[]>
   open: boolean
 }
 
-export function buildSchemaEntries(tables: any[] = [], functions: any[] = [], enums: any[] = [], types: any[] = []): SchemaEntry[] {
+export function buildSchemaEntries(tables: any[] = [], functions: any[] = [], enums: any[] = [], types: any[] = [], columns: any[] = []): SchemaEntry[] {
   const schemaMap = new Map<string, SchemaEntry>()
 
   function getOrCreate(schema: string): SchemaEntry {
     if (!schemaMap.has(schema)) {
-      schemaMap.set(schema, { name: schema, tables: [], views: [], materializedViews: [], functions: [], enums: [], types: [], open: true })
+      schemaMap.set(schema, { name: schema, tables: [], views: [], materializedViews: [], functions: [], enums: [], types: [], columns: {}, open: true })
     }
     return schemaMap.get(schema)!
   }
@@ -101,7 +103,25 @@ export function buildSchemaEntries(tables: any[] = [], functions: any[] = [], en
     const entry = getOrCreate(t.schema)
     entry.types.push({ name: t.name, definition: t.definition })
   }
+  for (const c of columns) {
+    const entry = getOrCreate(c.table_schema)
+    if (!entry.columns[c.table_name]) entry.columns[c.table_name] = []
+    entry.columns[c.table_name].push({ name: c.column_name, type: c.data_type })
+  }
   return [...schemaMap.values()]
+}
+
+// Builds a CodeMirror SQL `schema` namespace (schema → table → columns) for autocomplete.
+export function buildSqlNamespace(schemas: SchemaEntry[]): SQLNamespace {
+  const namespace: Record<string, SQLNamespace> = {}
+  for (const schema of schemas) {
+    const tablesNs: Record<string, readonly string[]> = {}
+    for (const t of [...schema.tables, ...schema.views, ...schema.materializedViews]) {
+      tablesNs[t.name] = (schema.columns[t.name] ?? []).map(c => c.name)
+    }
+    namespace[schema.name] = tablesNs
+  }
+  return namespace
 }
 
 const POSTGRES_TYPES = [
@@ -2301,15 +2321,18 @@ interface SqlEditorHandle {
   countMatches: (query: string, caseSensitive: boolean) => number
 }
 
-function SqlEditor({ value, onChange, onRun, onOpenFind, editorRef }: {
+function SqlEditor({ value, onChange, onRun, onOpenFind, editorRef, schema, defaultTable }: {
   value: string
   onChange: (v: string) => void
   onRun: () => void
   onOpenFind?: () => void
   editorRef?: React.RefObject<SqlEditorHandle | null>
+  schema?: SQLNamespace
+  defaultTable?: string
 }) {
   const containerRef = useRef<HTMLDivElement>(null)
   const viewRef = useRef<EditorView | null>(null)
+  const sqlCompartmentRef = useRef(new Compartment())
   const onRunRef = useRef(onRun)
   const onChangeRef = useRef(onChange)
   const onOpenFindRef = useRef(onOpenFind)
@@ -2411,14 +2434,18 @@ function SqlEditor({ value, onChange, onRun, onOpenFind, editorRef }: {
       doc: value,
       extensions: [
         history(),
+        closeBrackets(),
         keymap.of([
           { key: 'Ctrl-Enter', run: () => { onRunRef.current(); return true } },
           { key: 'Mod-Enter', run: () => { onRunRef.current(); return true } },
           { key: 'Ctrl-f', run: () => { onOpenFindRef.current?.(); return true } },
+          ...closeBracketsKeymap,
+          ...completionKeymap,
           ...defaultKeymap,
           ...historyKeymap,
         ]),
-        sql(),
+        sqlCompartmentRef.current.of(sql({ dialect: PostgreSQL, schema, defaultTable, upperCaseKeywords: true })),
+        autocompletion({ activateOnTyping: true }),
         syntaxHighlighting(classHighlighter),
         searchHighlightField,
         searchHighlightTheme,
@@ -2435,6 +2462,17 @@ function SqlEditor({ value, onChange, onRun, onOpenFind, editorRef }: {
     return () => { view.destroy(); viewRef.current = null }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  // Reconfigure SQL schema/dialect live when connection/database/table selection changes
+  useEffect(() => {
+    const view = viewRef.current
+    if (!view) return
+    view.dispatch({
+      effects: sqlCompartmentRef.current.reconfigure(
+        sql({ dialect: PostgreSQL, schema, defaultTable, upperCaseKeywords: true })
+      ),
+    })
+  }, [schema, defaultTable])
 
   // Sync external value changes (e.g. tab switch) without re-creating editor
   useEffect(() => {
@@ -4038,6 +4076,10 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
   const availableDbs = boundConn?.databases ?? []
   const boundDb = boundConn?.databases.find(d => d.name === tab.databaseName)
   const availableSchemas = boundDb?.schemas ?? []
+  const sqlNamespace = useMemo(
+    () => boundConn?.dbType === 'postgres' ? buildSqlNamespace(availableSchemas) : undefined,
+    [availableSchemas, boundConn?.dbType]
+  )
   const isFunctionChanged = tab.isFunction && tab.sql !== tab.originalSql
   const isQueryChanged = !tab.isFunction && tab.kind === 'query' && tab.originalSql !== undefined && tab.sql !== tab.originalSql && tab.sql.trim() !== ''
   const canRun = !tab.running && !!boundConn && !!tab.databaseName && (!tab.isFunction || !isFunctionChanged)
@@ -5461,6 +5503,7 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
               onRun={run}
               onOpenFind={() => setShowFind(true)}
               editorRef={editorRef}
+              schema={sqlNamespace}
             />
           </div>
         </ResizablePanel>
@@ -6219,7 +6262,7 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
           }))
           continue
         }
-        const schemas = buildSchemaEntries(schemaRes.tables, schemaRes.functions, schemaRes.enums, schemaRes.types)
+        const schemas = buildSchemaEntries(schemaRes.tables, schemaRes.functions, schemaRes.enums, schemaRes.types, schemaRes.columns)
         setConnections(prev => prev.map(c => c.id !== s.id ? c : {
           ...c, databases: c.databases.map(d => d.name === dbName ? { ...d, loading: false, schemas } : d),
         }))
@@ -6274,7 +6317,7 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
       return
     }
 
-    const schemas = buildSchemaEntries(res.tables, res.functions, res.enums, res.types)
+    const schemas = buildSchemaEntries(res.tables, res.functions, res.enums, res.types, res.columns)
     setConnections(prev => prev.map(c => c.id !== connId ? c : {
       ...c,
       databases: c.databases.map(d => d.name === dbName ? { ...d, loading: false, schemas } : d),
@@ -6317,7 +6360,7 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
       return
     }
 
-    const schemas = buildSchemaEntries(res.tables, res.functions, res.enums, res.types)
+    const schemas = buildSchemaEntries(res.tables, res.functions, res.enums, res.types, res.columns)
     setConnections(prev => prev.map(c => c.id !== connId ? c : {
       ...c,
       databases: c.databases.map(d => d.name === dbName ? { ...d, open: true, loading: false, schemas } : d),

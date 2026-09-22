@@ -38,7 +38,7 @@ declare global {
         disconnect:     (id: string) => Promise<{ ok: boolean; error?: string }>
         query:          (id: string, sql: string, database?: string) => Promise<{ ok: boolean; rows?: Record<string, unknown>[]; fields?: string[]; rowCount?: number | null; ms?: number; error?: string }>
         introspect:     (id: string) => Promise<{ ok: boolean; databases?: string[]; error?: string }>
-        introspectDb:   (id: string, database: string) => Promise<{ ok: boolean; tables?: any[]; functions?: any[]; enums?: any[]; types?: any[]; error?: string }>
+        introspectDb:   (id: string, database: string) => Promise<{ ok: boolean; tables?: any[]; functions?: any[]; enums?: any[]; types?: any[]; columns?: any[]; error?: string }>
         selectOvpnFile: () => Promise<string | null>
       }
       mysql: {

@@ -300,7 +300,7 @@ app.on('ready', () => {
     const opts = (basePool as any).options as { host: string; port: number; user: string; password: string; ssl: any }
     const dbPool = new Pool({ host: opts.host, port: opts.port, user: opts.user, password: opts.password, database, ssl: opts.ssl, connectionTimeoutMillis: 15000 })
     try {
-      const [tablesRes, funcsRes, enumsRes, typesRes] = await Promise.all([
+      const [tablesRes, funcsRes, enumsRes, typesRes, columnsRes] = await Promise.all([
         dbPool.query(`
           SELECT n.nspname AS table_schema, c.relname AS table_name,
             CASE WHEN c.relkind = 'r' THEN 'BASE TABLE' WHEN c.relkind = 'v' THEN 'VIEW' WHEN c.relkind = 'm' THEN 'MATERIALIZED VIEW' ELSE 'OTHER' END AS table_type
@@ -327,8 +327,16 @@ app.on('ready', () => {
           WHERE t.typtype IN ('c','d','r') AND n.nspname NOT IN ('pg_catalog','information_schema')
           ORDER BY schema, name
         `),
+        dbPool.query(`
+          SELECT n.nspname AS table_schema, c.relname AS table_name, a.attname AS column_name, format_type(a.atttypid, a.atttypmod) AS data_type
+          FROM pg_attribute a
+          JOIN pg_class c ON c.oid = a.attrelid
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE a.attnum > 0 AND NOT a.attisdropped AND c.relkind IN ('r','v','m') AND n.nspname NOT IN ('pg_catalog','information_schema')
+          ORDER BY table_schema, table_name, a.attnum
+        `),
       ])
-      return { ok: true, tables: tablesRes.rows, functions: funcsRes.rows, enums: enumsRes.rows, types: typesRes.rows }
+      return { ok: true, tables: tablesRes.rows, functions: funcsRes.rows, enums: enumsRes.rows, types: typesRes.rows, columns: columnsRes.rows }
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) }
     } finally {
