@@ -10,8 +10,16 @@ import {
   Database, Table2, FunctionSquare, ChevronRight, ChevronDown,
   Plus, Play, PlugZap, FileCode2, RefreshCw, X, FileText, Loader2, View, Pencil, Save, FileCode, Search, Plug,
   Circle, Wrench, Check, Workflow, Key, Minus, Download, Sparkles, Braces, Clock, AlignLeft, AlignCenter, AlignRight, Shield, Tag, Shapes, AlertTriangle,
+  GitCompareArrows, DatabaseZap, Link2,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { StructureSyncView, initialSyncState, type StructureSyncConfig, type StructureSyncState } from '@/components/structure-sync'
+import { DataSyncView, initialDataSyncState, type DataSyncConfig, type DataSyncState } from '@/components/data-sync'
+import { quenceTheme } from '@/components/sql-highlight'
+import { sqlEditorLanguage, type FunctionInfo } from '@/lib/sql-completion'
+import { FOREIGN_KEYS_SQL, parseForeignKeys, type FkRef } from '@/lib/fk-lookup'
+import { FkLookupPopover, type FkLookupTarget } from '@/components/fk-lookup'
+import { TableActionsBar, type TableChange } from '@/components/table-actions'
 import { generateId } from '@/lib/utils'
 import { toast } from 'sonner'
 import { EditorView, keymap, placeholder as cmPlaceholder, Decoration, DecorationSet, ViewPlugin, ViewUpdate } from '@codemirror/view'
@@ -54,9 +62,12 @@ interface DbDatabase {
   name: string
   open: boolean
   loading: boolean
+  loaded?: boolean
   error?: string
   schemas: SchemaEntry[]
 }
+
+const SCHEMA_PRELOAD_CONCURRENCY = 3
 
 interface ColumnInfo { name: string; type: string }
 
@@ -206,7 +217,7 @@ interface ErdRelation {
 
 interface QueryTab {
   id: string
-  kind: 'query' | 'table' | 'design' | 'erd' | 'create-table' | 'create-view'
+  kind: 'query' | 'table' | 'design' | 'erd' | 'create-table' | 'create-view' | 'structure-sync' | 'data-sync'
   title: string
   sql: string
   results: QueryResult[]
@@ -240,6 +251,103 @@ interface QueryTab {
   // ERD Properties
   erdTables?: ErdTable[]
   erdRelations?: ErdRelation[]
+
+  // Table tab editing — keyed by cellEditKey(rowIndex, col); rowIndex indexes results[0].rows
+  primaryKeys?: string[]
+  pendingEdits?: Record<string, CellEdit>
+  savingEdits?: boolean
+  editError?: { rowIndex: number; message: string }
+  tableSort?: TableSort
+
+  sync?: StructureSyncState
+  dataSync?: DataSyncState
+
+  // Table tab: single-column foreign keys of the table, for the row-picker popup
+  foreignKeyRefs?: FkRef[]
+}
+
+interface CellEdit { rowIndex: number; col: string; value: string }
+
+function cellEditKey(rowIndex: number, col: string) {
+  return `${rowIndex}\u0000${col}`
+}
+
+export function cellEditText(raw: unknown): string {
+  if (raw === null || raw === undefined) return ''
+  if (raw instanceof Date) return raw.toISOString()
+  if (typeof raw === 'object') return JSON.stringify(raw)
+  return String(raw)
+}
+
+function hasPendingTableEdits(tab: QueryTab) {
+  return tab.kind === 'table' && Object.keys(tab.pendingEdits ?? {}).length > 0
+}
+
+interface ParamQuery { sql: string; params: unknown[] }
+
+// One plan per edited row. `update` returns the saved row on Postgres (RETURNING *);
+// MySQL has no RETURNING, so `reselect` re-reads it by its (possibly edited) key.
+export interface RowSavePlan { rowIndex: number; update: ParamQuery; reselect?: ParamQuery }
+
+function quoteIdent(dbType: 'postgres' | 'mysql') {
+  return dbType === 'mysql'
+    ? (s: string) => '`' + s.replace(/`/g, '``') + '`'
+    : (s: string) => '"' + s.replace(/"/g, '""') + '"'
+}
+
+export interface TableSort { column: string; dir: 'asc' | 'desc' }
+
+// Sorts the whole table server-side. Primary key columns are appended as a tiebreaker (and are
+// the default order) so LIMIT/OFFSET pages are stable; NULLs sort last in both directions.
+export function buildTableOrderBy(dbType: 'postgres' | 'mysql', sort: TableSort | undefined, primaryKeys: string[]): string {
+  const q = quoteIdent(dbType)
+  const keys: TableSort[] = [
+    ...(sort ? [sort] : []),
+    ...primaryKeys.filter(pk => pk !== sort?.column).map(pk => ({ column: pk, dir: 'asc' as const })),
+  ]
+  if (keys.length === 0) return ''
+  const terms = keys.map(({ column, dir }) => dbType === 'mysql'
+    ? `${q(column)} IS NULL, ${q(column)} ${dir.toUpperCase()}`
+    : `${q(column)} ${dir.toUpperCase()} NULLS LAST`)
+  return `ORDER BY ${terms.join(', ')}`
+}
+
+export function buildMongoSort(sort: TableSort | undefined): Record<string, 1 | -1> {
+  if (!sort) return { _id: 1 }
+  return { [sort.column]: sort.dir === 'asc' ? 1 : -1, ...(sort.column !== '_id' ? { _id: 1 as const } : {}) }
+}
+
+export function buildRowSavePlans(
+  dbType: 'postgres' | 'mysql',
+  schema: string,
+  table: string,
+  primaryKeys: string[],
+  rows: Record<string, unknown>[],
+  edits: CellEdit[],
+): RowSavePlan[] {
+  const q = quoteIdent(dbType)
+  const target = `${q(schema)}.${q(table)}`
+  const byRow = new Map<number, CellEdit[]>()
+  for (const e of edits) byRow.set(e.rowIndex, [...(byRow.get(e.rowIndex) ?? []), e])
+
+  return [...byRow.entries()].sort(([a], [b]) => a - b).map(([rowIndex, rowEdits]) => {
+    const row = rows[rowIndex]
+    const params: unknown[] = []
+    const placeholder = (v: unknown) => { params.push(v); return dbType === 'mysql' ? '?' : `$${params.length}` }
+    const sets = rowEdits.map(e => `${q(e.col)} = ${placeholder(e.value)}`)
+    const where = primaryKeys.map(pk => `${q(pk)} = ${placeholder(row[pk])}`)
+    const updateSql = `UPDATE ${target} SET ${sets.join(', ')} WHERE ${where.join(' AND ')}`
+
+    if (dbType === 'postgres') return { rowIndex, update: { sql: `${updateSql} RETURNING *`, params } }
+    return {
+      rowIndex,
+      update: { sql: updateSql, params },
+      reselect: {
+        sql: `SELECT * FROM ${target} WHERE ${primaryKeys.map(pk => `${q(pk)} = ?`).join(' AND ')}`,
+        params: primaryKeys.map(pk => rowEdits.find(e => e.col === pk)?.value ?? row[pk]),
+      },
+    }
+  })
 }
 
 interface SavedQuery {
@@ -883,12 +991,16 @@ function DbToolbar({
   onNewQuery,
   onNewTable,
   onNewView,
+  onStructureSync,
+  onDataSync,
   activeConn,
 }: {
   onNewConnection: () => void
   onNewQuery: () => void
   onNewTable: () => void
   onNewView: () => void
+  onStructureSync: () => void
+  onDataSync: () => void
   activeConn: DbConnection | null
 }) {
   return (
@@ -935,6 +1047,20 @@ function DbToolbar({
         disabled
       />
 
+      <div className="w-px bg-border my-3 mx-0.5" />
+
+      <ToolbarBtn
+        icon={<GitCompareArrows className="h-6 w-6 text-primary" />}
+        label="Structure Sync"
+        onClick={onStructureSync}
+      />
+
+      <ToolbarBtn
+        icon={<DatabaseZap className="h-6 w-6 text-primary" />}
+        label="Data Sync"
+        onClick={onDataSync}
+      />
+
       <div className="flex-1" />
 
       {activeConn && (
@@ -961,6 +1087,7 @@ function ConnectionsPanel({
   onOpenErd,
   onDisconnect,
   onReconnect,
+  onCancelConnect,
   onRemove,
   onEdit,
   onSelectDb,
@@ -991,6 +1118,7 @@ function ConnectionsPanel({
   onOpenErd: (connId: string, dbName: string) => void
   onDisconnect: (connId: string) => void
   onReconnect: (connId: string) => void
+  onCancelConnect: (connId: string) => void
   onRemove: (connId: string) => void
   onEdit: (connId: string) => void
   onSelectDb: (connId: string, dbName: string) => void
@@ -1191,7 +1319,23 @@ function ConnectionsPanel({
                   ? <span className="shrink-0 text-[9px] font-semibold px-1 rounded bg-emerald-500/20 text-emerald-400 leading-4">Mongo</span>
                   : <span className="shrink-0 text-[9px] font-semibold px-1 rounded bg-blue-500/20 text-blue-400 leading-4">PgSQL</span>
                 }
-                {conn.status === 'connecting' && <Loader2 className="h-3 w-3 animate-spin shrink-0" />}
+                {conn.status === 'connecting' && (
+                  <>
+                    <Loader2 className="h-3 w-3 animate-spin shrink-0" />
+                    <button
+                      onClick={e => { e.stopPropagation(); onCancelConnect(conn.id) }}
+                      title="Cancel connecting"
+                      className="shrink-0 px-1 rounded text-[10px] leading-4 border border-border text-muted-foreground hover:text-foreground hover:bg-accent/30"
+                    >
+                      Cancel
+                    </button>
+                  </>
+                )}
+                {conn.status === 'connected' && conn.databases.some(d => d.loading) && (
+                  <span title="Loading tables in the background" className="shrink-0">
+                    <Loader2 className="h-2.5 w-2.5 animate-spin text-muted-foreground/50" />
+                  </span>
+                )}
                 {/* Action buttons — visible on hover */}
                 <span className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
                   {conn.status === 'connected' && (
@@ -1234,6 +1378,7 @@ function ConnectionsPanel({
                   <div
                     role="button" tabIndex={0}
                     onClick={() => { onSelectDb(conn.id, db.name); setActiveItemKey(dbKey) }}
+                    onDoubleClick={() => onToggleDb(conn.id, db.name)}
                     onKeyDown={e => e.key === 'Enter' && (onSelectDb(conn.id, db.name), setActiveItemKey(dbKey))}
                     className={cn(
                       'group w-full flex items-center gap-1.5 py-0.5 text-xs rounded transition-colors cursor-pointer select-none',
@@ -1243,6 +1388,7 @@ function ConnectionsPanel({
                   >
                     <span
                       onClick={e => { e.stopPropagation(); onToggleDb(conn.id, db.name) }}
+                      onDoubleClick={e => e.stopPropagation()}
                       className="shrink-0 flex items-center justify-center rounded hover:bg-accent/40 transition-colors p-0.5 -m-0.5"
                     >
                       {db.open ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
@@ -1739,7 +1885,7 @@ function QueryTabBar({
   return (
     <div className="flex items-end border-b border-border bg-card shrink-0 overflow-x-auto">
       {tabs.map(tab => {
-        const isChanged = (tab.isFunction && tab.sql !== tab.originalSql) || (tab.kind === 'design' && isTableDesignChanged(tab)) || (!tab.isFunction && tab.kind === 'query' && tab.originalSql !== undefined && tab.sql !== tab.originalSql && tab.sql.trim() !== '') || (tab.kind === 'create-table' && (tab.columns ?? []).length > 0) || (tab.kind === 'create-view' && tab.sql.trim() !== '')
+        const isChanged = (tab.isFunction && tab.sql !== tab.originalSql) || (tab.kind === 'design' && isTableDesignChanged(tab)) || (!tab.isFunction && tab.kind === 'query' && tab.originalSql !== undefined && tab.sql !== tab.originalSql && tab.sql.trim() !== '') || (tab.kind === 'create-table' && (tab.columns ?? []).length > 0) || (tab.kind === 'create-view' && tab.sql.trim() !== '') || hasPendingTableEdits(tab)
         return (
           <div
             key={tab.id}
@@ -1762,6 +1908,10 @@ function QueryTabBar({
               <Table2 className="h-3 w-3 shrink-0 text-primary" />
             ) : tab.kind === 'create-view' ? (
               <View className="h-3 w-3 shrink-0 text-sky-300" />
+            ) : tab.kind === 'structure-sync' ? (
+              <GitCompareArrows className="h-3 w-3 shrink-0 text-primary" />
+            ) : tab.kind === 'data-sync' ? (
+              <DatabaseZap className="h-3 w-3 shrink-0 text-primary" />
             ) : tab.isFunction ? (
               <FunctionSquare className="h-3 w-3 shrink-0 text-purple-300" />
             ) : tab.tableName?.startsWith('type:') ? (
@@ -1788,9 +1938,95 @@ function QueryTabBar({
 
 // ── Results grid (standalone to avoid inline-component remount lag) ────────────
 
-function SingleResultGrid({ result, columnTypes, dbType }: { result: QueryResult; columnTypes?: ColumnInfo[]; dbType?: 'postgres' | 'mysql' | 'mongodb' }) {
+const CELL_EDIT_DEBOUNCE_MS = 250
+const DEFAULT_COL_WIDTH = 160
+const MIN_COL_WIDTH = 40
+
+interface TableGridProps {
+  editable?: boolean
+  pendingEdits?: Record<string, CellEdit>
+  onCellEdit?: (rowIndex: number, col: string, value: string | undefined) => void
+  errorRowIndex?: number
+  // When set, header clicks sort the whole table on the server instead of the rows on screen
+  serverSort?: { sort?: TableSort; onSort: (column: string) => void }
+  // Foreign keys of the table: their cells get a row-picker popup over the referenced table
+  foreignKeys?: FkRef[]
+  fkTarget?: FkLookupTarget
+  onOpenReferencedTable?: (fk: FkRef) => void
+}
+
+function SingleResultGrid({ result, columnTypes, dbType, editable = false, pendingEdits, onCellEdit, errorRowIndex, serverSort, foreignKeys, fkTarget, onOpenReferencedTable }: { result: QueryResult; columnTypes?: ColumnInfo[]; dbType?: 'postgres' | 'mysql' | 'mongodb' } & TableGridProps) {
   const [selectedCell, setSelectedCell] = useState<{ ri: number; col: string } | null>(null)
   const [editingCell, setEditingCell] = useState<{ ri: number; col: string } | null>(null)
+  const [colWidths, setColWidths] = useState<Record<string, number>>({})
+  const [fkPopup, setFkPopup] = useState<{ rowIndex: number; col: string; fk: FkRef; anchor: DOMRect } | null>(null)
+  const fkByColumn = useMemo(() => new Map((fkTarget ? foreignKeys ?? [] : []).map(fk => [fk.column, fk])), [foreignKeys, fkTarget])
+  const justResizedRef = useRef(false)
+  // Pending value of the cell when editing started, so Escape can restore it
+  const editStartRef = useRef<string | undefined>(undefined)
+  const commitTimerRef = useRef<{ timer: ReturnType<typeof setTimeout>; commit: () => void } | null>(null)
+
+  const cancelPendingCommit = () => {
+    if (commitTimerRef.current) clearTimeout(commitTimerRef.current.timer)
+    commitTimerRef.current = null
+  }
+  const flushPendingCommit = () => {
+    const pendingCommit = commitTimerRef.current
+    cancelPendingCommit()
+    pendingCommit?.commit()
+  }
+  const scheduleCommit = (commit: () => void) => {
+    cancelPendingCommit()
+    commitTimerRef.current = { timer: setTimeout(flushPendingCommit, CELL_EDIT_DEBOUNCE_MS), commit }
+  }
+  useEffect(() => cancelPendingCommit, [])
+
+  // Chromium keeps one undo stack per page, so native Ctrl+Z in a cell would undo edits made in
+  // other inputs (e.g. the row filter). The cell editor keeps its own history instead.
+  const cellHistoryRef = useRef<{ past: string[]; future: string[]; current: string } | null>(null)
+
+  const recordCellHistory = (value: string) => {
+    const h = cellHistoryRef.current
+    if (!h || h.current === value) return
+    h.past.push(h.current)
+    h.current = value
+    h.future = []
+  }
+
+  const stepCellHistory = (input: HTMLInputElement, redo: boolean): string | undefined => {
+    const h = cellHistoryRef.current
+    if (!h) return undefined
+    const value = (redo ? h.future : h.past).pop()
+    if (value === undefined) return undefined
+    ;(redo ? h.past : h.future).push(h.current)
+    h.current = value
+    input.value = value
+    input.setSelectionRange(value.length, value.length)
+    return value
+  }
+  const rowIndexOf = useMemo(() => new Map(result.rows.map((r, i) => [r, i])), [result.rows])
+
+  const startColumnResize = (e: React.MouseEvent, col: string) => {
+    e.preventDefault()
+    e.stopPropagation()
+    const startX = e.clientX
+    const startWidth = colWidths[col] ?? DEFAULT_COL_WIDTH
+    justResizedRef.current = true
+    const onMove = (ev: MouseEvent) => {
+      const width = Math.max(MIN_COL_WIDTH, startWidth + ev.clientX - startX)
+      setColWidths(prev => ({ ...prev, [col]: width }))
+    }
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove)
+      document.removeEventListener('mouseup', onUp)
+      document.body.style.cursor = ''
+      // The mouseup can land on the header and fire a click that would otherwise toggle sorting
+      setTimeout(() => { justResizedRef.current = false }, 0)
+    }
+    document.body.style.cursor = 'col-resize'
+    document.addEventListener('mousemove', onMove)
+    document.addEventListener('mouseup', onUp)
+  }
   const [rowSearch, setRowSearch] = useState('')
   const [rowFilter, setRowFilter] = useState('')
   const [exportMenuOpen, setExportMenuOpen] = useState(false)
@@ -1842,8 +2078,10 @@ function SingleResultGrid({ result, columnTypes, dbType }: { result: QueryResult
 
   // Reset grid UI state on each new query result. Intentionally not using a `key` remount here
   // (see comment above SingleResultGrid) since that reintroduces the remount lag this component avoids.
+  // Keyed on `fields` (a fresh array per query) rather than `result`, so saving edited rows in
+  // place keeps the user's sort, filter and selection.
   // eslint-disable-next-line react-hooks/set-state-in-effect
-  useEffect(() => { setSelectedCell(null); setEditingCell(null); setRowSearch(''); setRowFilter(''); setExportMenuOpen(false); setSortCol(null); setExpandedColumns(new Set()) }, [result])
+  useEffect(() => { setSelectedCell(null); setEditingCell(null); setRowSearch(''); setRowFilter(''); setExportMenuOpen(false); setSortCol(null); setExpandedColumns(new Set()) }, [result.fields])
 
   const handleSortClick = (col: string) => {
     if (sortCol === col) {
@@ -1939,15 +2177,6 @@ function SingleResultGrid({ result, columnTypes, dbType }: { result: QueryResult
   }, [rowSearch])
 
   useEffect(() => {
-    if (!editingCell) return
-    const handler = (e: MouseEvent) => {
-      if (gridRef.current && !gridRef.current.contains(e.target as Node)) setEditingCell(null)
-    }
-    document.addEventListener('mousedown', handler)
-    return () => document.removeEventListener('mousedown', handler)
-  }, [editingCell])
-
-  useEffect(() => {
     if (!selectedCell || editingCell) return
     const fields = visibleFields
     const rowCount = result.rows.length
@@ -1981,7 +2210,7 @@ function SingleResultGrid({ result, columnTypes, dbType }: { result: QueryResult
     : result.rows
 
   const sortedRows = React.useMemo(() => {
-    if (!sortCol) return visibleRows
+    if (!sortCol || serverSort) return visibleRows
     return [...visibleRows].sort((a, b) => {
       const aVal = a[sortCol]
       const bVal = b[sortCol]
@@ -1995,7 +2224,7 @@ function SingleResultGrid({ result, columnTypes, dbType }: { result: QueryResult
       const bStr = typeof bVal === 'object' ? JSON.stringify(bVal) : String(bVal)
       return sortDir === 'asc' ? aStr.localeCompare(bStr) : bStr.localeCompare(aStr)
     })
-  }, [visibleRows, sortCol, sortDir])
+  }, [visibleRows, sortCol, sortDir, serverSort])
 
   if (result.error) {
     return (
@@ -2075,21 +2304,40 @@ function SingleResultGrid({ result, columnTypes, dbType }: { result: QueryResult
             <tr className="bg-card border-b border-border sticky top-0 z-10">
               {visibleFields.map(col => {
                 const colType = columnTypes?.find(c => c.name === col)?.type
-                const isSorted = sortCol === col
+                const activeSortDir = serverSort
+                  ? (serverSort.sort?.column === col ? serverSort.sort.dir : undefined)
+                  : (sortCol === col ? sortDir : undefined)
+                const width = colWidths[col] ?? DEFAULT_COL_WIDTH
                 return (
                   <th
                     key={col}
-                    onClick={() => handleSortClick(col)}
-                    className="text-left px-3 py-1 font-medium text-muted-foreground border-r border-border whitespace-nowrap cursor-pointer select-none hover:bg-accent/10 transition-colors"
-                    style={{ width: '180px', minWidth: '180px', maxWidth: '180px' }}
+                    onClick={() => {
+                      if (justResizedRef.current) return
+                      if (serverSort) serverSort.onSort(col)
+                      else handleSortClick(col)
+                    }}
+                    title={serverSort ? 'Sort the whole table by this column' : 'Sort these results'}
+                    className="relative text-left px-2 py-0.5 font-medium text-muted-foreground border-r border-border whitespace-nowrap cursor-pointer select-none hover:bg-accent/10 transition-colors overflow-hidden"
+                    style={{ width, minWidth: width, maxWidth: width }}
                   >
-                    <div className="flex items-center gap-1">
-                      <span>{col}</span>
-                      {isSorted && (
-                        <span className="text-primary text-[10px]">{sortDir === 'asc' ? '▲' : '▼'}</span>
+                    <div className="flex items-center gap-1 min-w-0">
+                      <span className="truncate">{col}</span>
+                      {activeSortDir && (
+                        <span className="text-primary text-[10px] shrink-0">{activeSortDir === 'asc' ? '▲' : '▼'}</span>
                       )}
                     </div>
-                    {colType && <div className="text-[10px] font-normal text-muted-foreground/50 leading-tight">{colType}</div>}
+                    {colType && <div className="text-[10px] font-normal text-muted-foreground/50 leading-tight truncate">{colType}</div>}
+                    {fkByColumn.has(col) && (
+                      <div className="text-[10px] font-normal text-primary/70 leading-tight truncate" title={`Foreign key to ${fkByColumn.get(col)!.refTable}.${fkByColumn.get(col)!.refColumn}. Right-click a cell to pick a row.`}>
+                        → {fkByColumn.get(col)!.refTable}.{fkByColumn.get(col)!.refColumn}
+                      </div>
+                    )}
+                    <div
+                      onMouseDown={e => startColumnResize(e, col)}
+                      onClick={e => e.stopPropagation()}
+                      className="absolute top-0 right-0 h-full w-1.5 cursor-col-resize hover:bg-primary/40 active:bg-primary/60"
+                      title="Drag to resize"
+                    />
                   </th>
                 )
               })}
@@ -2101,7 +2349,11 @@ function SingleResultGrid({ result, columnTypes, dbType }: { result: QueryResult
                 {visibleFields.map(col => {
                   const isSelected = selectedCell?.ri === ri && selectedCell?.col === col
                   const isEditing = editingCell?.ri === ri && editingCell?.col === col
+                  const rowIndex = rowIndexOf.get(row) ?? -1
+                  const pending = pendingEdits?.[cellEditKey(rowIndex, col)]
+                  const isFailedEdit = !!pending && errorRowIndex === rowIndex
                   const raw = getNestedValue(row, col)
+                  const width = colWidths[col] ?? DEFAULT_COL_WIDTH
                   let display = ''
                   let isDoc = false
                   if (raw === null || raw === undefined) {
@@ -2144,14 +2396,67 @@ function SingleResultGrid({ result, columnTypes, dbType }: { result: QueryResult
                             return next
                           })
                         } else {
+                          editStartRef.current = pending?.value
                           setEditingCell({ ri, col })
                         }
                       }}
-                      className={cn('border-r border-border/50 font-mono whitespace-nowrap max-w-xs', isEditing ? 'p-0' : 'px-3 py-1.5 truncate', isDoc ? 'cursor-pointer' : 'cursor-default', isSelected && !isEditing ? 'ring-1 ring-inset ring-primary bg-primary/5' : '')}
-                      style={{ width: '180px', minWidth: '180px', maxWidth: '180px' }}
+                      onContextMenu={e => {
+                        const fk = fkByColumn.get(col)
+                        if (!fk || isEditing || rowIndex < 0) return
+                        e.preventDefault()
+                        setSelectedCell({ ri, col })
+                        setFkPopup({ rowIndex, col, fk, anchor: e.currentTarget.getBoundingClientRect() })
+                      }}
+                      className={cn(
+                        'border-r border-border/50 font-mono whitespace-nowrap',
+                        isEditing ? 'p-0' : 'px-2 py-0.5 truncate',
+                        fkByColumn.has(col) && 'relative group/fk',
+                        isDoc ? 'cursor-pointer' : 'cursor-default',
+                        pending && !isEditing && !isFailedEdit ? 'bg-amber-500/20 ring-1 ring-inset ring-amber-500/60' : '',
+                        isFailedEdit && !isEditing ? 'bg-red-500/20 ring-1 ring-inset ring-red-500/70' : '',
+                        isSelected && !isEditing && !pending ? 'ring-1 ring-inset ring-primary bg-primary/5' : '',
+                      )}
+                      style={{ width, minWidth: width, maxWidth: width }}
                     >
                       {isEditing ? (
-                        <input autoFocus readOnly defaultValue={typeof raw === 'object' ? JSON.stringify(raw) : (display ?? '')} onKeyDown={e => e.key === 'Escape' && setEditingCell(null)} className="w-full h-full px-3 py-1.5 bg-primary/10 text-foreground text-xs font-mono outline-none border-none ring-1 ring-inset ring-primary select-all" />
+                        <input
+                          autoFocus
+                          readOnly={!editable}
+                          defaultValue={pending ? pending.value : cellEditText(raw)}
+                          onFocus={e => {
+                            cellHistoryRef.current = { past: [], future: [], current: e.currentTarget.value }
+                            e.currentTarget.select()
+                          }}
+                          onChange={e => {
+                            const text = e.currentTarget.value
+                            recordCellHistory(text)
+                            if (!editable || rowIndex < 0) return
+                            scheduleCommit(() => onCellEdit?.(rowIndex, col, text === cellEditText(raw) ? undefined : text))
+                          }}
+                          onKeyDown={e => {
+                            const key = e.key.toLowerCase()
+                            if ((e.ctrlKey || e.metaKey) && (key === 'z' || key === 'y')) {
+                              e.preventDefault()
+                              const text = stepCellHistory(e.currentTarget, key === 'y' || e.shiftKey)
+                              if (text !== undefined && editable && rowIndex >= 0) {
+                                scheduleCommit(() => onCellEdit?.(rowIndex, col, text === cellEditText(raw) ? undefined : text))
+                              }
+                            } else if (e.key === 'Escape') {
+                              cancelPendingCommit()
+                              if (editable && rowIndex >= 0) onCellEdit?.(rowIndex, col, editStartRef.current)
+                              e.currentTarget.blur()
+                            } else if (e.key === 'Enter') {
+                              e.currentTarget.blur()
+                            } else if ((e.ctrlKey || e.metaKey) && (e.key === 's' || e.key === 'S')) {
+                              // Leave edit mode; the Ctrl+S listener on document still receives this event and saves
+                              e.currentTarget.blur()
+                            }
+                          }}
+                          onBlur={() => { flushPendingCommit(); setEditingCell(null) }}
+                          className={cn('w-full h-full px-2 py-0.5 text-foreground text-xs font-mono outline-none border-none ring-1 ring-inset', editable ? 'bg-background ring-amber-500' : 'bg-primary/10 ring-primary')}
+                        />
+                      ) : pending ? (
+                        <span className={isFailedEdit ? 'text-red-400' : 'text-amber-400'}>{pending.value}</span>
                       ) : raw === null || raw === undefined ? (
                         <span className="text-muted-foreground/50 italic">null</span>
                       ) : isDoc ? (
@@ -2159,6 +2464,24 @@ function SingleResultGrid({ result, columnTypes, dbType }: { result: QueryResult
                       ) : typeof raw === 'object' ? (
                         <span className="text-muted-foreground/80">{display}</span>
                       ) : display}
+                      {!isEditing && rowIndex >= 0 && fkByColumn.has(col) && (
+                        <button
+                          onClick={e => {
+                            e.stopPropagation()
+                            setSelectedCell({ ri, col })
+                            const cell = e.currentTarget.closest('td') as HTMLElement
+                            setFkPopup({ rowIndex, col, fk: fkByColumn.get(col)!, anchor: cell.getBoundingClientRect() })
+                          }}
+                          onDoubleClick={e => e.stopPropagation()}
+                          title={`Pick a row from ${fkByColumn.get(col)!.refTable} (or right-click the cell)`}
+                          className={cn(
+                            'absolute right-0.5 top-1/2 -translate-y-1/2 p-0.5 rounded bg-card border border-border text-primary hover:bg-primary/20 transition-opacity',
+                            fkPopup?.rowIndex === rowIndex && fkPopup.col === col ? 'opacity-100' : 'opacity-0 group-hover/fk:opacity-100',
+                          )}
+                        >
+                          <Link2 className="h-3 w-3" />
+                        </button>
+                      )}
                     </td>
                   )
                 })}
@@ -2167,17 +2490,39 @@ function SingleResultGrid({ result, columnTypes, dbType }: { result: QueryResult
           </tbody>
         </table>
       </div>
+      {fkPopup && fkTarget && (() => {
+        const row = result.rows[fkPopup.rowIndex]
+        const original = cellEditText(getNestedValue(row, fkPopup.col))
+        const pendingValue = pendingEdits?.[cellEditKey(fkPopup.rowIndex, fkPopup.col)]?.value
+        const rawValue = getNestedValue(row, fkPopup.col)
+        return (
+          <FkLookupPopover
+            key={`${fkPopup.rowIndex}:${fkPopup.col}`}
+            anchor={fkPopup.anchor}
+            fk={fkPopup.fk}
+            target={fkTarget}
+            currentValue={pendingValue ?? (rawValue === null || rawValue === undefined ? null : original)}
+            editable={editable}
+            onPick={value => {
+              onCellEdit?.(fkPopup.rowIndex, fkPopup.col, value === original ? undefined : value)
+              setFkPopup(null)
+            }}
+            onGoTo={() => { onOpenReferencedTable?.(fkPopup.fk); setFkPopup(null) }}
+            onClose={() => setFkPopup(null)}
+          />
+        )
+      })()}
     </div>
   )
 }
 
-function ResultsGrid({ results, running, statusBorder, columnTypes, dbType }: {
+function ResultsGrid({ results, running, statusBorder, columnTypes, dbType, editable, pendingEdits, onCellEdit, errorRowIndex, serverSort, foreignKeys, fkTarget, onOpenReferencedTable }: {
   results: QueryResult[]
   running: boolean
   statusBorder: 'top' | 'bottom'
   columnTypes?: ColumnInfo[]
   dbType?: 'postgres' | 'mysql' | 'mongodb'
-}) {
+} & TableGridProps) {
   const [prevResults, setPrevResults] = useState(results)
   const [activeIdx, setActiveIdx] = useState(() => results.length > 0 ? results.length - 1 : 0)
 
@@ -2233,7 +2578,7 @@ function ResultsGrid({ results, running, statusBorder, columnTypes, dbType }: {
       </div>
     )
   } else if (result) {
-    grid = <SingleResultGrid result={result} columnTypes={columnTypes} dbType={dbType} />
+    grid = <SingleResultGrid result={result} columnTypes={columnTypes} dbType={dbType} editable={editable} pendingEdits={pendingEdits} onCellEdit={onCellEdit} errorRowIndex={errorRowIndex} serverSort={serverSort} foreignKeys={foreignKeys} fkTarget={fkTarget} onOpenReferencedTable={onOpenReferencedTable} />
   } else {
     grid = <div className="flex-1 flex items-center justify-center"><p className="text-xs text-muted-foreground">No results yet</p></div>
   }
@@ -2285,31 +2630,6 @@ const searchHighlightTheme = EditorView.theme({
   '.cm-search-match': { background: 'oklch(0.9 0.11 98 / 0.25)', borderRadius: '2px' },
 })
 
-const quenceTheme = EditorView.theme({
-  '&': {
-    height: '100%',
-    fontSize: '13px',
-    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
-    background: 'var(--background)',
-    color: 'var(--foreground)',
-  },
-  '.cm-content': { padding: '12px', caretColor: 'var(--primary)' },
-  '.cm-focused': { outline: 'none' },
-  '.cm-scroller': { overflow: 'auto' },
-  '.cm-line': { lineHeight: '1.6' },
-  '.cm-cursor': { borderLeftColor: 'var(--primary)' },
-  '.cm-selectionBackground, ::selection': { background: 'color-mix(in oklch, var(--primary) 20%, transparent)' },
-  '.cm-activeLine': { background: 'oklch(1 0 0 / 0.03)' },
-  '.tok-keyword':                        { color: 'var(--db-keyword)', fontWeight: '600' },
-  '.tok-string, .tok-string2':           { color: 'var(--db-string)' },
-  '.tok-number':                         { color: 'var(--db-number)' },
-  '.tok-bool':                           { color: 'var(--db-number)' },
-  '.tok-operator':                       { color: 'var(--db-operator)' },
-  '.tok-comment, .tok-lineComment, .tok-blockComment': { color: 'var(--db-comment)', fontStyle: 'italic' },
-  '.tok-typeName, .tok-className':       { color: 'var(--db-type)' },
-  '.tok-variableName, .tok-propertyName':{ color: 'var(--foreground)' },
-}, { dark: true })
-
 interface SqlEditorHandle {
   getSelection: () => string
   setHighlight: (query: string, caseSensitive: boolean) => void
@@ -2321,7 +2641,7 @@ interface SqlEditorHandle {
   countMatches: (query: string, caseSensitive: boolean) => number
 }
 
-function SqlEditor({ value, onChange, onRun, onOpenFind, editorRef, schema, defaultTable }: {
+function SqlEditor({ value, onChange, onRun, onOpenFind, editorRef, schema, defaultTable, defaultSchema, dialect = 'postgres', functions }: {
   value: string
   onChange: (v: string) => void
   onRun: () => void
@@ -2329,6 +2649,9 @@ function SqlEditor({ value, onChange, onRun, onOpenFind, editorRef, schema, defa
   editorRef?: React.RefObject<SqlEditorHandle | null>
   schema?: SQLNamespace
   defaultTable?: string
+  defaultSchema?: string
+  dialect?: 'postgres' | 'mysql'
+  functions?: FunctionInfo[]
 }) {
   const containerRef = useRef<HTMLDivElement>(null)
   const viewRef = useRef<EditorView | null>(null)
@@ -2444,7 +2767,7 @@ function SqlEditor({ value, onChange, onRun, onOpenFind, editorRef, schema, defa
           ...defaultKeymap,
           ...historyKeymap,
         ]),
-        sqlCompartmentRef.current.of(sql({ dialect: PostgreSQL, schema, defaultTable, upperCaseKeywords: true })),
+        sqlCompartmentRef.current.of(sqlEditorLanguage({ dialect, schema, defaultSchema, defaultTable, functions })),
         autocompletion({ activateOnTyping: true }),
         syntaxHighlighting(classHighlighter),
         searchHighlightField,
@@ -2469,10 +2792,10 @@ function SqlEditor({ value, onChange, onRun, onOpenFind, editorRef, schema, defa
     if (!view) return
     view.dispatch({
       effects: sqlCompartmentRef.current.reconfigure(
-        sql({ dialect: PostgreSQL, schema, defaultTable, upperCaseKeywords: true })
+        sqlEditorLanguage({ dialect, schema, defaultSchema, defaultTable, functions })
       ),
     })
-  }, [schema, defaultTable])
+  }, [schema, defaultTable, defaultSchema, dialect, functions])
 
   // Sync external value changes (e.g. tab switch) without re-creating editor
   useEffect(() => {
@@ -3403,11 +3726,21 @@ function QueryPane({
   isSaved,
   isActive,
   runTrigger,
+  onSaveTableEdits,
+  onTableSort,
+  onUpdateSync,
+  onUpdateDataSync,
+  onTableChanged,
 }: {
   tab: QueryTab
   connections: DbConnection[]
   onChange: (id: string, patch: Partial<QueryTab>) => void
   onSave: (tab: QueryTab) => void
+  onSaveTableEdits: (tab: QueryTab) => Promise<boolean>
+  onTableSort: (tab: QueryTab, column: string) => void
+  onUpdateSync: (tabId: string, fn: (s: StructureSyncState) => StructureSyncState) => void
+  onUpdateDataSync: (tabId: string, fn: (s: DataSyncState) => DataSyncState) => void
+  onTableChanged: (connId: string, dbName: string, schema: string, table: string, change: TableChange) => void
   onPageChange: (tab: QueryTab, page: number) => void
   onOpenTable: (connId: string, dbName: string, schema: string, table: string) => void
   onOpenTableDesign: (connId: string, dbName: string, schema: string, table: string) => void
@@ -3920,7 +4253,7 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
     }
 
     const lastError = collected.find(r => r.error)?.error
-    onChange(tab.id, { running: false, results: collected, ...(!lastError && !tab.isFunction ? { originalSql: sqlToRun } : {}) })
+    onChange(tab.id, { running: false, results: collected })
     const totalMs = collected.reduce((s, r) => s + r.ms, 0)
     setQueryHistory(prev => [{ sql: sqlToRun, ts: Date.now(), ms: totalMs, error: lastError }, ...prev].slice(0, 50))
     if (tab.databaseName && (tab.isFunction || tab.tableName?.startsWith('type:'))) {
@@ -4023,8 +4356,34 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
     }
   }, [tab, connections, onChange, onAfterRun, dbIpc])
 
+  // Mirrors tab.pendingEdits but is updated synchronously, so Ctrl+S pressed while a cell
+  // input is focused sees the edit its blur just committed (before React re-renders).
+  const pendingEditsRef = useRef(tab.pendingEdits)
+  useEffect(() => { pendingEditsRef.current = tab.pendingEdits }, [tab.pendingEdits])
+
+  const handleCellEdit = useCallback((rowIndex: number, col: string, value: string | undefined) => {
+    const next = { ...pendingEditsRef.current }
+    const key = cellEditKey(rowIndex, col)
+    if (value === undefined) delete next[key]
+    else next[key] = { rowIndex, col, value }
+    pendingEditsRef.current = next
+    onChange(tab.id, { pendingEdits: next })
+  }, [tab.id, onChange])
+
+  const saveTableEdits = useCallback(() => {
+    if (tab.savingEdits || Object.keys(pendingEditsRef.current ?? {}).length === 0) return
+    onSaveTableEdits({ ...tab, pendingEdits: pendingEditsRef.current })
+  }, [tab, onSaveTableEdits])
+
+  const discardTableEdits = useCallback(() => {
+    pendingEditsRef.current = undefined
+    onChange(tab.id, { pendingEdits: undefined, editError: undefined })
+  }, [tab.id, onChange])
+
   const handleSave = useCallback(() => {
-    if (tab.kind === 'design') {
+    if (tab.kind === 'table') {
+      saveTableEdits()
+    } else if (tab.kind === 'design') {
       const ddl = generateTableAlterSql(tab)
       if (ddl.trim() === '') return
       setDdlPreviewSql(ddl)
@@ -4033,7 +4392,7 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
     } else {
       onSave(tab)
     }
-  }, [tab, onSave, saveFunction])
+  }, [tab, onSave, saveFunction, saveTableEdits])
 
   const runRef = useRef(run)
   useEffect(() => { runRef.current = run }, [run])
@@ -4076,16 +4435,70 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
   const availableDbs = boundConn?.databases ?? []
   const boundDb = boundConn?.databases.find(d => d.name === tab.databaseName)
   const availableSchemas = boundDb?.schemas ?? []
-  const sqlNamespace = useMemo(
-    () => boundConn?.dbType === 'postgres' ? buildSqlNamespace(availableSchemas) : undefined,
-    [availableSchemas, boundConn?.dbType]
+  const editorDialect: 'postgres' | 'mysql' = boundConn?.dbType === 'mysql' ? 'mysql' : 'postgres'
+  // Memoized on the underlying state so the editor only reconfigures when the schemas really change
+  const completionSchemas = useMemo(() => {
+    const conn = connections.find(c => c.id === tab.connectionId && c.status === 'connected' && c.dbType !== 'mongodb')
+    return conn?.databases.find(d => d.name === tab.databaseName)?.schemas
+  }, [connections, tab.connectionId, tab.databaseName])
+  const sqlNamespace = useMemo(() => completionSchemas ? buildSqlNamespace(completionSchemas) : undefined, [completionSchemas])
+  const tabDbType = getTabDbType(tab, connections)
+  useEffect(() => {
+    if (tab.kind !== 'table' || tab.foreignKeyRefs !== undefined || tabDbType === 'mongodb') return
+    if (!tab.connectionId || !tab.databaseName || !tab.schemaName || !tab.tableName) return
+    if (!connections.some(c => c.id === tab.connectionId && c.status === 'connected')) return
+    let cancelled = false
+    const connId = tab.connectionId
+    dbIpc(connId).query(connId, FOREIGN_KEYS_SQL[tabDbType], tab.databaseName, [tab.schemaName, tab.tableName])
+      .then(r => { if (!cancelled && r.ok) onChange(tab.id, { foreignKeyRefs: parseForeignKeys(r.rows ?? []) }) })
+      .catch(() => { /* the FK picker is optional */ })
+    return () => { cancelled = true }
+  }, [tab.kind, tab.id, tab.foreignKeyRefs, tab.connectionId, tab.databaseName, tab.schemaName, tab.tableName, tabDbType, connections, dbIpc, onChange])
+  // Stable identity: the FK popup refetches when its target changes
+  const fkTarget = useMemo<FkLookupTarget | undefined>(
+    () => tab.kind === 'table' && tab.connectionId && tab.databaseName && tabDbType !== 'mongodb'
+      ? { dbType: tabDbType, connectionId: tab.connectionId, database: tab.databaseName }
+      : undefined,
+    [tab.kind, tab.connectionId, tab.databaseName, tabDbType],
   )
+  const editorFunctions = useMemo(
+    () => (completionSchemas ?? []).flatMap(s => s.functions.map(f => ({ schema: s.name, name: f.name, arguments: f.arguments }))),
+    [completionSchemas]
+  )
+  // Tables of this schema are suggested without a prefix; MySQL lists a database's tables under the database name
+  const editorDefaultSchema = editorDialect === 'mysql' ? (tab.databaseName ?? undefined) : (tab.schemaName ?? 'public')
   const isFunctionChanged = tab.isFunction && tab.sql !== tab.originalSql
   const isQueryChanged = !tab.isFunction && tab.kind === 'query' && tab.originalSql !== undefined && tab.sql !== tab.originalSql && tab.sql.trim() !== ''
   const canRun = !tab.running && !!boundConn && !!tab.databaseName && (!tab.isFunction || !isFunctionChanged)
   const canSave = tab.isFunction
     ? (isFunctionChanged && !!boundConn && !!tab.databaseName)
     : (!!tab.connectionId && !!tab.databaseName && !!tab.schemaName && !!tab.sql.trim())
+
+  if (tab.kind === 'structure-sync') {
+    return (
+      <StructureSyncView
+        state={tab.sync ?? initialSyncState()}
+        update={fn => onUpdateSync(tab.id, fn)}
+        connections={connections.map(c => ({
+          id: c.id, label: c.label || c.name, dbType: c.dbType, status: c.status, databases: c.databases.map(d => d.name),
+        }))}
+        onDeployed={(connId, database) => onRefreshDb(connId, database)}
+      />
+    )
+  }
+
+  if (tab.kind === 'data-sync') {
+    return (
+      <DataSyncView
+        state={tab.dataSync ?? initialDataSyncState()}
+        update={fn => onUpdateDataSync(tab.id, fn)}
+        connections={connections.map(c => ({
+          id: c.id, label: c.label || c.name, dbType: c.dbType, status: c.status, databases: c.databases.map(d => d.name),
+        }))}
+        onDeployed={(connId, database) => onRefreshDb(connId, database)}
+      />
+    )
+  }
 
   if (tab.kind === 'table') {
     const page = tab.page ?? 0
@@ -4095,6 +4508,17 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
     const currentRowsCount = tab.results?.[0]?.rows?.length ?? 0
     const from = page * pageSize + 1
     const to = totalRows !== undefined ? Math.min((page + 1) * pageSize, totalRows) : (page + 1) * pageSize
+    const tableDbType = getTabDbType(tab, connections)
+    const editCount = Object.keys(tab.pendingEdits ?? {}).length
+    const hasEdits = editCount > 0
+    const readOnlyReason = tableDbType === 'mongodb'
+      ? 'Editing is not supported for MongoDB collections'
+      : tab.primaryKeys !== undefined && tab.primaryKeys.length === 0
+        ? 'Read-only: table has no primary key'
+        : null
+    const editable = readOnlyReason === null && (tab.primaryKeys?.length ?? 0) > 0
+    const navBlockedTitle = hasEdits ? 'Save or discard your changes first' : undefined
+    const busy = tab.running || !!tab.savingEdits
 
     return (
       <div className="flex flex-col h-full">
@@ -4109,8 +4533,8 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
           <div className="flex items-center gap-1.5">
             <button
               onClick={() => onPageChange(tab, tab.page ?? 0)}
-              disabled={tab.running}
-              title="Refresh table data"
+              disabled={busy || hasEdits}
+              title={navBlockedTitle ?? 'Refresh table data'}
               className="flex items-center gap-1 px-2 h-6 rounded text-xs border border-border text-muted-foreground hover:text-foreground hover:bg-accent/40 transition-all font-medium disabled:opacity-40"
             >
               <RefreshCw className={cn("h-3 w-3", tab.running && "animate-spin")} />
@@ -4126,25 +4550,80 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
           </div>
         </div>
 
-        <ResultsGrid
-          results={tab.results}
-          running={tab.running}
-          statusBorder="top"
-          columnTypes={tab.columnTypes}
-          dbType={getTabDbType(tab, connections)}
-        />
+        {tab.editError ? (
+          <div className="flex items-center gap-2 px-3 min-h-7 py-1 border-b border-red-500/30 bg-red-500/10 shrink-0">
+            <AlertTriangle className="h-3.5 w-3.5 text-red-400 shrink-0" />
+            <span className="text-xs text-red-400 font-medium shrink-0">Save stopped at the highlighted row:</span>
+            <span className="text-xs text-red-300 truncate" title={tab.editError.message}>{tab.editError.message}</span>
+          </div>
+        ) : hasEdits && (
+          <div className="flex items-center gap-2 px-3 h-7 border-b border-amber-500/30 bg-amber-500/10 shrink-0">
+            <span className="text-xs text-amber-400 font-medium">
+              {editCount} unsaved change{editCount === 1 ? '' : 's'}
+            </span>
+            <span className="text-xs text-muted-foreground/70">Ctrl+S to save · Esc while editing reverts the cell</span>
+          </div>
+        )}
+
+        <div className="flex-1 min-h-0">
+          <ResultsGrid
+            results={tab.results}
+            running={tab.running}
+            statusBorder="top"
+            columnTypes={tab.columnTypes}
+            dbType={tableDbType}
+            editable={editable}
+            pendingEdits={tab.pendingEdits}
+            onCellEdit={handleCellEdit}
+            errorRowIndex={tab.editError?.rowIndex}
+            foreignKeys={tab.foreignKeyRefs}
+            fkTarget={fkTarget}
+            onOpenReferencedTable={fk => onOpenTable(tab.connectionId!, tableDbType === 'mysql' ? fk.refSchema : tab.databaseName!, fk.refSchema, fk.refTable)}
+            serverSort={{
+              sort: tab.tableSort,
+              onSort: column => {
+                if (busy) return
+                // Re-sorting reloads the rows, which would drop pending edits
+                if (hasEdits) { toast.error('Save or discard your changes before sorting'); return }
+                onTableSort(tab, column)
+              },
+            }}
+          />
+        </div>
         <div className="flex items-center gap-2 px-3 h-8 border-t border-border bg-card shrink-0">
           <button
+            onClick={discardTableEdits}
+            disabled={busy || !hasEdits}
+            className="flex items-center gap-1 px-2 h-5 rounded border border-border text-xs text-muted-foreground hover:text-foreground hover:bg-accent/20 disabled:opacity-40 transition-colors"
+            title="Discard all changes"
+          >
+            <X className="h-3 w-3" />
+            Discard
+          </button>
+          <button
+            onClick={saveTableEdits}
+            disabled={busy || !hasEdits}
+            className="flex items-center gap-1 px-2 h-5 rounded bg-primary text-primary-foreground text-xs font-medium hover:bg-primary/90 disabled:opacity-40 transition-colors"
+            title="Save all changes (Ctrl+S)"
+          >
+            {tab.savingEdits ? <Loader2 className="h-3 w-3 animate-spin" /> : <Save className="h-3 w-3" />}
+            {tab.savingEdits ? 'Saving…' : `Save${hasEdits ? ` (${editCount})` : ''}`}
+          </button>
+          {readOnlyReason && (
+            <span className="text-[11px] text-muted-foreground/60">{readOnlyReason}</span>
+          )}
+          <div className="w-px h-4 bg-border mx-1" />
+          <button
             onClick={() => onPageChange(tab, 0)}
-            disabled={tab.running || page === 0}
+            disabled={tab.running || hasEdits || page === 0}
             className="px-1.5 h-5 rounded text-xs border border-border text-muted-foreground hover:text-foreground hover:bg-accent/20 disabled:opacity-40 transition-colors"
-            title="First page"
+            title={navBlockedTitle ?? 'First page'}
           >«</button>
           <button
             onClick={() => onPageChange(tab, page - 1)}
-            disabled={tab.running || page === 0}
+            disabled={tab.running || hasEdits || page === 0}
             className="px-1.5 h-5 rounded text-xs border border-border text-muted-foreground hover:text-foreground hover:bg-accent/20 disabled:opacity-40 transition-colors"
-            title="Previous page"
+            title={navBlockedTitle ?? 'Previous page'}
           >‹</button>
           <span className="text-xs text-muted-foreground tabular-nums">
             {totalRows !== undefined
@@ -4153,16 +4632,16 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
           </span>
           <button
             onClick={() => onPageChange(tab, page + 1)}
-            disabled={tab.running || (totalPages !== undefined ? page >= totalPages - 1 : currentRowsCount < pageSize)}
+            disabled={tab.running || hasEdits || (totalPages !== undefined ? page >= totalPages - 1 : currentRowsCount < pageSize)}
             className="px-1.5 h-5 rounded text-xs border border-border text-muted-foreground hover:text-foreground hover:bg-accent/20 disabled:opacity-40 transition-colors"
-            title="Next page"
+            title={navBlockedTitle ?? 'Next page'}
           >›</button>
           {totalPages !== undefined && (
             <button
               onClick={() => onPageChange(tab, totalPages - 1)}
-              disabled={tab.running || page >= totalPages - 1}
+              disabled={tab.running || hasEdits || page >= totalPages - 1}
               className="px-1.5 h-5 rounded text-xs border border-border text-muted-foreground hover:text-foreground hover:bg-accent/20 disabled:opacity-40 transition-colors"
-              title="Last page"
+              title={navBlockedTitle ?? 'Last page'}
             >»</button>
           )}
           {totalPages !== undefined && (
@@ -4681,6 +5160,16 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
           </div>
 
           <div className="flex items-center gap-2">
+            {tab.connectionId && tab.databaseName && tab.schemaName && tab.tableName && (
+              <TableActionsBar
+                target={{
+                  dbType: getTabDbType(tab, connections) === 'mysql' ? 'mysql' : 'postgres',
+                  connectionId: tab.connectionId, database: tab.databaseName, schema: tab.schemaName, table: tab.tableName,
+                }}
+                onOpenData={() => onOpenTable(tab.connectionId!, tab.databaseName!, tab.schemaName!, tab.tableName!)}
+                onChanged={change => onTableChanged(tab.connectionId!, tab.databaseName!, tab.schemaName!, tab.tableName!, change)}
+              />
+            )}
             <button
               onClick={handleSave}
               disabled={!isChanged || tab.running}
@@ -5504,6 +5993,9 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
               onOpenFind={() => setShowFind(true)}
               editorRef={editorRef}
               schema={sqlNamespace}
+              defaultSchema={editorDefaultSchema}
+              dialect={editorDialect}
+              functions={editorFunctions}
             />
           </div>
         </ResizablePanel>
@@ -5666,7 +6158,7 @@ interface PersistedConnection {
 
 interface PersistedTab {
   id: string
-  kind: 'query' | 'table' | 'design' | 'erd' | 'create-table' | 'create-view'
+  kind: 'query' | 'table' | 'design' | 'erd' | 'create-table' | 'create-view' | 'structure-sync' | 'data-sync'
   title: string
   sql: string
   connectionId: string | null
@@ -5701,6 +6193,10 @@ interface PersistedTab {
   // ERD properties
   erdTables?: ErdTable[]
   erdRelations?: ErdRelation[]
+
+  // Structure/data sync: only the source/target/options are kept; results are recomputed
+  syncConfig?: StructureSyncConfig
+  dataSyncConfig?: DataSyncConfig
 }
 
 interface PersistedTabsMeta {
@@ -5724,7 +6220,14 @@ async function loadPersistedConnectionsFromDb(): Promise<PersistedConnection[]> 
       user: r.username, password: r.password, ssl: r.ssl,
       vpnConfigPath: r.vpnConfigPath, vpnUsername: r.vpnUsername, vpnPassword: r.vpnPassword,
     }))
-  } catch { return [] }
+  } catch (err) {
+    toast.error(`Could not load saved connections: ${err instanceof Error ? err.message : String(err)}`)
+    return []
+  }
+}
+
+function reportConnectionSaveError(err: unknown) {
+  toast.error(`Could not save connection: ${err instanceof Error ? err.message : String(err)}`, { id: 'connection-save-error' })
 }
 
 async function savePersistedConnections(conns: DbConnection[], prev: DbConnection[]) {
@@ -5733,7 +6236,7 @@ async function savePersistedConnections(conns: DbConnection[], prev: DbConnectio
   const nextIds = new Set(conns.map(c => c.id))
   // Delete removed
   for (const id of prevIds) {
-    if (!nextIds.has(id)) await window.electronAPI.db.connections.delete(id).catch(() => {})
+    if (!nextIds.has(id)) await window.electronAPI.db.connections.delete(id).catch(reportConnectionSaveError)
   }
   // Create/update
   for (const c of conns) {
@@ -5744,13 +6247,13 @@ async function savePersistedConnections(conns: DbConnection[], prev: DbConnectio
         database: c.database, username: c.user, password: c.password, ssl: c.ssl,
         vpnConfigPath: c.vpnConfigPath ?? null, vpnUsername: c.vpnUsername ?? null, vpnPassword: c.vpnPassword ?? null,
         createdAt: Date.now(), updatedAt: Date.now(),
-      }).catch(() => {})
+      }).catch(reportConnectionSaveError)
     } else {
       await window.electronAPI.db.connections.update(c.id, {
         name: c.label || c.name, dbType, host: c.host, port: c.port,
         database: c.database, username: c.user, password: c.password, ssl: c.ssl,
         vpnConfigPath: c.vpnConfigPath ?? null, vpnUsername: c.vpnUsername ?? null, vpnPassword: c.vpnPassword ?? null,
-      }).catch(() => {})
+      }).catch(reportConnectionSaveError)
     }
   }
 }
@@ -5782,6 +6285,8 @@ function loadPersistedTabs(): { tabs: QueryTab[]; meta: PersistedTabsMeta } | nu
       totalRows: t.totalRows,
       columnTypes: t.columnTypes,
       dbType: t.dbType,
+      sync: t.kind === 'structure-sync' ? initialSyncState(t.syncConfig) : undefined,
+      dataSync: t.kind === 'data-sync' ? initialDataSyncState(t.dataSyncConfig) : undefined,
     }))
     return { tabs, meta }
   } catch { return null }
@@ -5826,6 +6331,9 @@ function savePersistedTabs(
       // ERD properties
       erdTables: t.erdTables,
       erdRelations: t.erdRelations,
+
+      syncConfig: t.sync?.config,
+      dataSyncConfig: t.dataSync?.config,
     }))
     localStorage.setItem(TABS_STORAGE_KEY, JSON.stringify(data))
     const meta: PersistedTabsMeta = {
@@ -5908,9 +6416,9 @@ function makeTab(n: number, connectionId: string | null, databaseName: string | 
 
 const TABLE_PAGE_SIZE = 200
 
-function tablePageSql(schema: string, table: string, page: number) {
+function tablePageSql(schema: string, table: string, page: number, orderBy = '') {
   const offset = page * TABLE_PAGE_SIZE
-  return `SELECT *\nFROM ${schema}.${table}\nLIMIT ${TABLE_PAGE_SIZE} OFFSET ${offset};`
+  return `SELECT *\nFROM ${schema}.${table}\n${orderBy ? `${orderBy}\n` : ''}LIMIT ${TABLE_PAGE_SIZE} OFFSET ${offset};`
 }
 
 function makeTableTab(connId: string, dbName: string, schema: string, table: string, dbType?: 'postgres' | 'mysql' | 'mongodb'): QueryTab {
@@ -6050,6 +6558,43 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
     setActiveTabId(tab.id)
   }, [activeConnId, activeDbPerConn, activeSchemaPerDb])
 
+  const newStructureSync = useCallback(() => {
+    // Pre-fill the source with the PostgreSQL database/schema selected in the sidebar
+    const conn = connections.find(c => c.id === activeConnId && c.dbType === 'postgres')
+    const database = conn ? (activeDbPerConn[conn.id] ?? null) : null
+    const schema = conn && database ? (activeSchemaPerDb[`${conn.id}::${database}`] ?? null) : null
+    const sync = initialSyncState()
+    sync.config.source = { connectionId: conn?.id ?? null, database, schema }
+    const tab: QueryTab = {
+      id: generateId(), kind: 'structure-sync', title: 'Structure Sync', sql: '', results: [], running: false,
+      connectionId: null, databaseName: null, sync,
+    }
+    setTabs(prev => [...prev, tab])
+    setActiveTabId(tab.id)
+  }, [connections, activeConnId, activeDbPerConn, activeSchemaPerDb])
+
+  const updateSync = useCallback((tabId: string, fn: (s: StructureSyncState) => StructureSyncState) => {
+    setTabs(prev => prev.map(t => t.id === tabId ? { ...t, sync: fn(t.sync ?? initialSyncState()) } : t))
+  }, [])
+
+  const newDataSync = useCallback(() => {
+    const conn = connections.find(c => c.id === activeConnId && c.dbType === 'postgres')
+    const database = conn ? (activeDbPerConn[conn.id] ?? null) : null
+    const schema = conn && database ? (activeSchemaPerDb[`${conn.id}::${database}`] ?? null) : null
+    const dataSync = initialDataSyncState()
+    dataSync.config.source = { connectionId: conn?.id ?? null, database, schema }
+    const tab: QueryTab = {
+      id: generateId(), kind: 'data-sync', title: 'Data Sync', sql: '', results: [], running: false,
+      connectionId: null, databaseName: null, dataSync,
+    }
+    setTabs(prev => [...prev, tab])
+    setActiveTabId(tab.id)
+  }, [connections, activeConnId, activeDbPerConn, activeSchemaPerDb])
+
+  const updateDataSync = useCallback((tabId: string, fn: (s: DataSyncState) => DataSyncState) => {
+    setTabs(prev => prev.map(t => t.id === tabId ? { ...t, dataSync: fn(t.dataSync ?? initialDataSyncState()) } : t))
+  }, [])
+
   // Pick the right IPC channel based on connection type
   const dbIpc = useCallback((connId: string) => {
     const conn = connections.find(c => c.id === connId)
@@ -6096,7 +6641,7 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
         const isQueryChanged = !tab.isFunction && tab.kind === 'query' && tab.originalSql !== undefined && tab.sql !== tab.originalSql && tab.sql.trim() !== ''
         const isCreateTableChanged = tab.kind === 'create-table' && (tab.columns ?? []).length > 0
         const isCreateViewChanged = tab.kind === 'create-view' && tab.sql.trim() !== ''
-        if (isFuncChanged || isDesignChanged || isQueryChanged || isCreateTableChanged || isCreateViewChanged) {
+        if (isFuncChanged || isDesignChanged || isQueryChanged || isCreateTableChanged || isCreateViewChanged || hasPendingTableEdits(tab)) {
           setUnsavedCloseTab(tab)
           return prev
         }
@@ -6229,100 +6774,102 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
     savePersistedTabs(tabs, activeTabId, tabCounter, activeConnId, activeDbPerConn, activeSchemaPerDb, openConns, openGroups, openDbsSnapshot)
   }, [tabs, activeTabId, tabCounter, activeConnId, activeDbPerConn, activeSchemaPerDb, openConns, openGroups, connections])
 
+  const connectionsRef = useRef(connections)
+  useEffect(() => { connectionsRef.current = connections }, [connections])
+
+  // Per-connection attempt counter: results from a superseded, cancelled or disconnected
+  // attempt are dropped instead of overwriting newer state.
+  const connectAttemptRef = useRef(new Map<string, number>())
+  const beginAttempt = useCallback((connId: string) => {
+    const n = (connectAttemptRef.current.get(connId) ?? 0) + 1
+    connectAttemptRef.current.set(connId, n)
+    return () => connectAttemptRef.current.get(connId) === n
+  }, [])
+
+  const patchDb = useCallback((connId: string, dbName: string, patch: Partial<DbDatabase>) => {
+    setConnections(prev => prev.map(c => c.id !== connId ? c : {
+      ...c,
+      databases: c.databases.map(d => d.name === dbName ? { ...d, ...patch } : d),
+    }))
+  }, [])
+
+  const loadDbSchemas = useCallback(async (connId: string, dbType: DbConnection['dbType'], dbName: string, isCurrent: () => boolean) => {
+    patchDb(connId, dbName, { loading: true, error: undefined })
+    const res = await getIpc(dbType).introspectDb(connId, dbName).catch(err => ({ ok: false as const, error: String(err) }))
+    if (!isCurrent()) return
+    if (!res.ok) {
+      patchDb(connId, dbName, { loading: false, error: res.error })
+      return
+    }
+    const schemas = buildSchemaEntries(res.tables, res.functions, res.enums, res.types, res.columns)
+    patchDb(connId, dbName, { loading: false, loaded: true, schemas })
+  }, [patchDb])
+
+  // Lists the databases, then loads every database's schemas in the background so expanding
+  // one (or searching the sidebar) doesn't wait on the server.
+  const loadDatabases = useCallback(async (connId: string, dbType: DbConnection['dbType'], defaultDb: string, reopenDbs: string[], isCurrent: () => boolean) => {
+    const res = await getIpc(dbType).introspect(connId).catch(err => ({ ok: false as const, error: String(err), databases: undefined }))
+    if (!isCurrent()) return { ok: false }
+    if (!res.ok) {
+      setConnections(prev => prev.map(c => c.id === connId ? { ...c, status: 'error', errorMsg: res.error } : c))
+      return { ok: false, error: res.error }
+    }
+    const names = res.databases ?? []
+    const databases: DbDatabase[] = names.map(name => ({ name, open: reopenDbs.includes(name), loading: false, schemas: [] }))
+    setConnections(prev => prev.map(c => c.id === connId ? { ...c, status: 'connected', errorMsg: undefined, databases } : c))
+
+    const queue = [...new Set([...reopenDbs, defaultDb, ...names])].filter(n => names.includes(n))
+    const worker = async () => {
+      for (let dbName = queue.shift(); dbName !== undefined && isCurrent(); dbName = queue.shift()) {
+        await loadDbSchemas(connId, dbType, dbName, isCurrent)
+      }
+    }
+    void Promise.all(Array.from({ length: SCHEMA_PRELOAD_CONCURRENCY }, worker))
+    return { ok: true }
+  }, [loadDbSchemas])
+
+  type ConnData = Pick<DbConnection, 'dbType' | 'host' | 'port' | 'database' | 'user' | 'password' | 'ssl' | 'vpnConfigPath' | 'vpnUsername' | 'vpnPassword'>
+
+  const connectAndLoad = useCallback(async (connId: string, data: ConnData, reopenDbs: string[] = []): Promise<{ ok: boolean; cancelled?: boolean; error?: string }> => {
+    const isCurrent = beginAttempt(connId)
+    setConnections(prev => prev.map(c => c.id === connId ? { ...c, status: 'connecting', errorMsg: undefined, databases: [] } : c))
+    const res = await getIpc(data.dbType).connect({ id: connId, ...data }).catch(err => ({ ok: false, cancelled: false, error: String(err) }))
+    if (!isCurrent() || res.cancelled) return { ok: false, cancelled: true }
+    if (!res.ok) {
+      setConnections(prev => prev.map(c => c.id === connId ? { ...c, status: 'error', errorMsg: res.error } : c))
+      return { ok: false, error: res.error }
+    }
+    return loadDatabases(connId, data.dbType, data.database, reopenDbs, isCurrent)
+  }, [beginAttempt, loadDatabases])
+
   // On mount: restore saved connections and reconnect each one
   useEffect(() => {
     loadPersistedConnectionsFromDb().then(saved => {
-    if (!saved.length) return
-    const restored: DbConnection[] = saved.map(s => ({ ...s, dbType: s.dbType ?? 'postgres', label: s.label ?? '', status: 'connecting' as const, databases: [] }))
-    prevConnectionsRef.current = restored
-    setConnections(restored)
-    setActiveConnId(prev => prev ?? restored[0].id)
-    saved.forEach(async s => {
-      const ipc = getIpc(s.dbType ?? 'postgres')
-      const res = await ipc.connect({ id: s.id, host: s.host, port: s.port, database: s.database, user: s.user, password: s.password, ssl: s.ssl, vpnConfigPath: s.vpnConfigPath, vpnUsername: s.vpnUsername, vpnPassword: s.vpnPassword })
-      if (!res.ok) {
-        setConnections(prev => prev.map(c => c.id === s.id ? { ...c, status: 'error', errorMsg: res.error } : c))
-        return
-      }
-      const dbRes = await ipc.introspect(s.id)
-      if (!dbRes.ok) {
-        setConnections(prev => prev.map(c => c.id === s.id ? { ...c, status: 'error', errorMsg: dbRes.error } : c))
-        return
-      }
-      const wasOpenDbs: string[] = openDbs[s.id] ?? []
-      const databases: DbDatabase[] = (dbRes.databases ?? []).map(name => ({
-        name, open: wasOpenDbs.includes(name), loading: wasOpenDbs.includes(name), schemas: [],
-      }))
-      setConnections(prev => prev.map(c => c.id === s.id ? { ...c, status: 'connected', databases } : c))
-      for (const dbName of wasOpenDbs) {
-        const schemaRes = await ipc.introspectDb(s.id, dbName)
-        if (!schemaRes.ok) {
-          setConnections(prev => prev.map(c => c.id !== s.id ? c : {
-            ...c, databases: c.databases.map(d => d.name === dbName ? { ...d, loading: false, error: schemaRes.error } : d),
-          }))
-          continue
-        }
-        const schemas = buildSchemaEntries(schemaRes.tables, schemaRes.functions, schemaRes.enums, schemaRes.types, schemaRes.columns)
-        setConnections(prev => prev.map(c => c.id !== s.id ? c : {
-          ...c, databases: c.databases.map(d => d.name === dbName ? { ...d, loading: false, schemas } : d),
-        }))
-      }
+      if (!saved.length) return
+      const restored: DbConnection[] = saved.map(s => ({ ...s, dbType: s.dbType ?? 'postgres', label: s.label ?? '', status: 'connecting' as const, databases: [] }))
+      prevConnectionsRef.current = restored
+      setConnections(restored)
+      setActiveConnId(prev => prev ?? restored[0].id)
+      // In dev, StrictMode runs this effect twice; the second connectAndLoad supersedes the first
+      for (const s of restored) void connectAndLoad(s.id, s, openDbs[s.id] ?? [])
     })
-    }) // end .then
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // After connecting, load the list of databases
-  const introspect = useCallback(async (connId: string) => {
-    const res = await dbIpc(connId).introspect(connId)
-    if (!res.ok) {
-      setConnections(prev => prev.map(c => c.id === connId ? { ...c, status: 'error', errorMsg: res.error } : c))
-      return
-    }
-    const databases: DbDatabase[] = (res.databases ?? []).map(name => ({ name, open: false, loading: false, schemas: [] }))
-    setConnections(prev => prev.map(c => c.id === connId ? { ...c, status: 'connected', databases } : c))
-  }, [dbIpc])
-
-  // When a database row is expanded, lazy-load its schemas/tables
-  const handleToggleDb = useCallback(async (connId: string, dbName: string) => {
-    let needsLoad = false
-    let connDbType: 'postgres' | 'mysql' | 'mongodb' = 'postgres'
-    setConnections(prev => {
-      const conn = prev.find(c => c.id === connId)
-      connDbType = conn?.dbType ?? 'postgres'
-      const db = conn?.databases.find(d => d.name === dbName)
-      if (!db) return prev
-      if (db.schemas.length > 0 || db.open) {
-        return prev.map(c => c.id !== connId ? c : {
-          ...c,
-          databases: c.databases.map(d => d.name === dbName ? { ...d, open: !d.open } : d),
-        })
-      }
-      needsLoad = true
-      return prev.map(c => c.id !== connId ? c : {
-        ...c,
-        databases: c.databases.map(d => d.name === dbName ? { ...d, open: true, loading: true } : d),
-      })
-    })
-
-    if (!needsLoad) return
-
-    const ipc = getIpc(connDbType ?? 'postgres')
-    const res = await ipc.introspectDb(connId, dbName)
-    if (!res.ok) {
-      setConnections(prev => prev.map(c => c.id !== connId ? c : {
-        ...c,
-        databases: c.databases.map(d => d.name === dbName ? { ...d, loading: false, error: res.error } : d),
-      }))
-      return
-    }
-
-    const schemas = buildSchemaEntries(res.tables, res.functions, res.enums, res.types, res.columns)
+  const handleToggleDb = useCallback((connId: string, dbName: string) => {
+    const conn = connectionsRef.current.find(c => c.id === connId)
+    const db = conn?.databases.find(d => d.name === dbName)
+    if (!conn || !db) return
     setConnections(prev => prev.map(c => c.id !== connId ? c : {
       ...c,
-      databases: c.databases.map(d => d.name === dbName ? { ...d, loading: false, schemas } : d),
+      databases: c.databases.map(d => d.name === dbName ? { ...d, open: !d.open } : d),
     }))
-  }, [])
+    // Normally already loaded (or loading) in the background; only failed loads are retried here
+    if (!db.open && !db.loaded && !db.loading) {
+      const attempt = connectAttemptRef.current.get(connId)
+      void loadDbSchemas(connId, conn.dbType, dbName, () => connectAttemptRef.current.get(connId) === attempt)
+    }
+  }, [loadDbSchemas])
 
   const handleConnect = useCallback(async (opts: Omit<DbConnection, 'id' | 'status' | 'databases'>) => {
     const id = generateId()
@@ -6330,20 +6877,26 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
     setConnections(prev => [...prev, newConn])
     setActiveConnId(id)
 
-    const ipc = getIpc(opts.dbType)
-    const res = await ipc.connect({ id, ...opts })
-    if (!res.ok) {
-      setConnections(prev => prev.map(c => c.id === id ? { ...c, status: 'error', errorMsg: res.error } : c))
-      throw new Error(res.error)
-    }
-    await introspect(id)
+    const res = await connectAndLoad(id, opts)
+    if (res.cancelled) return
+    if (!res.ok) throw new Error(res.error)
     setTabs(prev => prev.map(t => t.connectionId ? t : { ...t, connectionId: id }))
-  }, [introspect])
+  }, [connectAndLoad])
 
   const handleRefresh = useCallback(async (connId: string) => {
+    const conn = connectionsRef.current.find(c => c.id === connId)
+    if (!conn) return
+    const reopenDbs = conn.databases.filter(d => d.open).map(d => d.name)
+    const isCurrent = beginAttempt(connId)
     setConnections(prev => prev.map(c => c.id === connId ? { ...c, status: 'connecting', databases: [] } : c))
-    await introspect(connId)
-  }, [introspect])
+    await loadDatabases(connId, conn.dbType, conn.database, reopenDbs, isCurrent)
+  }, [beginAttempt, loadDatabases])
+
+  const handleCancelConnect = useCallback((connId: string) => {
+    beginAttempt(connId)
+    window.electronAPI?.cancelConnect(connId)
+    setConnections(prev => prev.map(c => c.id === connId ? { ...c, status: 'disconnected', errorMsg: undefined, databases: [] } : c))
+  }, [beginAttempt])
 
   const handleRefreshDb = useCallback(async (connId: string, dbName: string) => {
     setConnections(prev => prev.map(c => c.id !== connId ? c : {
@@ -6363,7 +6916,7 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
     const schemas = buildSchemaEntries(res.tables, res.functions, res.enums, res.types, res.columns)
     setConnections(prev => prev.map(c => c.id !== connId ? c : {
       ...c,
-      databases: c.databases.map(d => d.name === dbName ? { ...d, open: true, loading: false, schemas } : d),
+      databases: c.databases.map(d => d.name === dbName ? { ...d, open: true, loading: false, loaded: true, error: undefined, schemas } : d),
     }))
   }, [dbIpc])
 
@@ -6408,40 +6961,25 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
   }, [])
 
   const handleDisconnect = useCallback(async (connId: string) => {
+    beginAttempt(connId)
+    window.electronAPI?.cancelConnect(connId)
     await dbIpc(connId).disconnect(connId)
     setConnections(prev => prev.map(c => c.id === connId ? { ...c, status: 'disconnected', databases: [] } : c))
-  }, [dbIpc])
+  }, [dbIpc, beginAttempt])
 
   const handleReconnect = useCallback(async (connId: string) => {
-    type ConnData = Pick<DbConnection, 'dbType' | 'host' | 'port' | 'database' | 'user' | 'password' | 'ssl' | 'vpnConfigPath' | 'vpnUsername' | 'vpnPassword'>
-    let connData: ConnData | null = null
-    setConnections(prev => {
-      const conn = prev.find(c => c.id === connId)
-      if (!conn) return prev
-      connData = { dbType: conn.dbType, host: conn.host, port: conn.port, database: conn.database, user: conn.user, password: conn.password, ssl: conn.ssl, vpnConfigPath: conn.vpnConfigPath, vpnUsername: conn.vpnUsername, vpnPassword: conn.vpnPassword }
-      return prev.map(c => c.id === connId ? { ...c, status: 'connecting', databases: [] } : c)
-    })
-    if (!connData) return
-    const data = connData as ConnData
-    const ipc = getIpc(data.dbType)
-    const res = await ipc.connect({ id: connId, ...data })
-    if (!res.ok) {
-      setConnections(prev => prev.map(c => c.id === connId ? { ...c, status: 'error', errorMsg: res.error } : c))
-      return
-    }
-    await introspect(connId)
-  }, [introspect])
+    const conn = connectionsRef.current.find(c => c.id === connId)
+    if (!conn) return
+    await connectAndLoad(connId, conn)
+  }, [connectAndLoad])
 
   const handleRemove = useCallback(async (connId: string) => {
-    await dbIpc(connId).disconnect(connId)
+    await handleDisconnect(connId)
     setConnections(prev => prev.filter(c => c.id !== connId))
     if (activeConnId === connId) setActiveConnId(null)
-  }, [activeConnId, dbIpc])
+  }, [activeConnId, handleDisconnect])
 
-  const handleDisconnectAndEdit = useCallback(async (connId: string) => {
-    await dbIpc(connId).disconnect(connId)
-    setConnections(prev => prev.map(c => c.id === connId ? { ...c, status: 'disconnected', databases: [] } : c))
-  }, [dbIpc])
+  const handleDisconnectAndEdit = handleDisconnect
 
   const handleEditSave = useCallback(async (connId: string, data: Omit<DbConnection, 'id' | 'status' | 'databases'>) => {
     setConnections(prev => prev.map(c => c.id === connId ? { ...c, ...data } : c))
@@ -6491,7 +7029,7 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
 
     if (isMongo) {
       const skip = page * TABLE_PAGE_SIZE
-      const findQuery = `db.${tab.tableName}.find({}).skip(${skip}).limit(${TABLE_PAGE_SIZE})`
+      const findQuery = `db.${tab.tableName}.find({}).sort(${JSON.stringify(buildMongoSort(tab.tableSort))}).skip(${skip}).limit(${TABLE_PAGE_SIZE})`
       const countQuery = `db.${tab.tableName}.countDocuments({})`
       setTabs(prev => prev.map(t => t.id === tab.id ? { ...t, running: true, page, sql: findQuery } : t))
 
@@ -6520,10 +7058,23 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
         columnTypes: undefined,
       }))
     } else {
-      const sql = tablePageSql(tab.schemaName, tab.tableName, page)
-      setTabs(prev => prev.map(t => t.id === tab.id ? { ...t, running: true, page, sql } : t))
+      // Pending edits are keyed by row position, so they can't survive a reload
+      setTabs(prev => prev.map(t => t.id === tab.id ? { ...t, running: true, page, pendingEdits: undefined, editError: undefined } : t))
 
-      const [res, countRes, colRes] = await Promise.all([
+      const isMysql = getTabDbType(tab, connections) === 'mysql'
+      const pkSql = isMysql
+        ? `SELECT COLUMN_NAME AS column_name FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND CONSTRAINT_NAME = 'PRIMARY' ORDER BY ORDINAL_POSITION`
+        : `SELECT a.attname AS column_name FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) WHERE i.indisprimary AND i.indrelid = (quote_ident($1) || '.' || quote_ident($2))::regclass`
+
+      // The primary key is needed before the page query: it orders pages deterministically
+      let primaryKeys = tab.primaryKeys
+      if (primaryKeys === undefined) {
+        const pkRes = await dbIpc(tab.connectionId).query(tab.connectionId, pkSql, tab.databaseName, [tab.schemaName, tab.tableName])
+        if (pkRes.ok) primaryKeys = (pkRes.rows ?? []).map((r: any) => r.column_name as string)
+      }
+      const sql = tablePageSql(tab.schemaName, tab.tableName, page, buildTableOrderBy(isMysql ? 'mysql' : 'postgres', tab.tableSort, primaryKeys ?? []))
+
+      const [res, countRes, colRes, fkRes] = await Promise.all([
         dbIpc(tab.connectionId).query(tab.connectionId, sql, tab.databaseName),
         tab.totalRows === undefined
           ? dbIpc(tab.connectionId).query(tab.connectionId, `SELECT COUNT(*) AS __count FROM ${tab.schemaName}.${tab.tableName};`, tab.databaseName)
@@ -6531,11 +7082,15 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
         tab.columnTypes === undefined
           ? dbIpc(tab.connectionId).query(tab.connectionId, `SELECT column_name, udt_name FROM information_schema.columns WHERE table_schema = '${tab.schemaName}' AND table_name = '${tab.tableName}' ORDER BY ordinal_position;`, tab.databaseName)
           : Promise.resolve(null),
+        tab.foreignKeyRefs === undefined
+          ? dbIpc(tab.connectionId).query(tab.connectionId, FOREIGN_KEYS_SQL[isMysql ? 'mysql' : 'postgres'], tab.databaseName, [tab.schemaName, tab.tableName])
+          : Promise.resolve(null),
       ])
 
       setTabs(prev => prev.map(t => t.id !== tab.id ? t : {
         ...t,
         running: false,
+        sql,
         results: res.ok
           ? [{ fields: res.fields ?? [], rows: res.rows ?? [], rowCount: res.rowCount ?? null, ms: res.ms ?? 0 }]
           : [{ fields: [], rows: [], rowCount: null, ms: 0, error: res.error }],
@@ -6545,9 +7100,81 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
         columnTypes: colRes?.ok
           ? (colRes.rows ?? []).map((r: any) => ({ name: r.column_name as string, type: r.udt_name as string }))
           : t.columnTypes,
+        primaryKeys: primaryKeys ?? t.primaryKeys,
+        foreignKeyRefs: fkRes?.ok ? parseForeignKeys(fkRes.rows ?? []) : t.foreignKeyRefs,
       }))
     }
   }, [dbIpc, connections])
+
+  const handleTableSort = useCallback((tab: QueryTab, column: string) => {
+    const current = tab.tableSort
+    // Same cycle as the local grid sort: ascending → descending → unsorted
+    const tableSort: TableSort | undefined = current?.column !== column
+      ? { column, dir: 'asc' }
+      : current.dir === 'asc' ? { column, dir: 'desc' } : undefined
+    setTabs(prev => prev.map(t => t.id === tab.id ? { ...t, tableSort } : t))
+    runTableTab({ ...tab, tableSort }, 0)
+  }, [runTableTab])
+
+  const handleSaveTableEdits = useCallback(async (tab: QueryTab): Promise<boolean> => {
+    const edits = Object.values(tab.pendingEdits ?? {})
+    if (edits.length === 0) return true
+    const dbType = getTabDbType(tab, connections)
+    const primaryKeys = tab.primaryKeys ?? []
+    if (!tab.connectionId || !tab.schemaName || !tab.tableName || dbType === 'mongodb' || primaryKeys.length === 0) {
+      toast.error('This table cannot be edited')
+      return false
+    }
+
+    const connId = tab.connectionId
+    const database = tab.databaseName ?? undefined
+    const plans = buildRowSavePlans(dbType, tab.schemaName, tab.tableName, primaryKeys, tab.results[0]?.rows ?? [], edits)
+    const api = getIpc(dbType)
+    setTabs(prev => prev.map(t => t.id === tab.id ? { ...t, savingEdits: true, editError: undefined } : t))
+
+    // Rows are saved in order; the first failure stops the rest so they stay pending.
+    const savedRows = new Map<number, Record<string, unknown>>()
+    let failure: { rowIndex: number; message: string } | undefined
+    for (const plan of plans) {
+      let res = await api.query(connId, plan.update.sql, database, plan.update.params)
+      if (res.ok && plan.reselect) res = await api.query(connId, plan.reselect.sql, database, plan.reselect.params)
+      if (!res.ok) {
+        failure = { rowIndex: plan.rowIndex, message: res.error ?? 'Unknown error' }
+        break
+      }
+      if (res.rows?.length !== 1) {
+        failure = { rowIndex: plan.rowIndex, message: 'Row not found. It may have been changed or deleted; refresh the table and try again.' }
+        break
+      }
+      savedRows.set(plan.rowIndex, res.rows[0])
+    }
+
+    const savedEditKeys = new Set(edits.filter(e => savedRows.has(e.rowIndex)).map(e => cellEditKey(e.rowIndex, e.col)))
+    setTabs(prev => prev.map(t => {
+      if (t.id !== tab.id) return t
+      const current = t.results[0]
+      // Only drop edits that were actually saved; a cell retyped during the save stays pending
+      const remaining = Object.fromEntries(Object.entries(t.pendingEdits ?? {}).filter(([key, e]) =>
+        !(savedEditKeys.has(key) && tab.pendingEdits?.[key]?.value === e.value)))
+      return {
+        ...t,
+        savingEdits: false,
+        editError: failure,
+        results: current ? [{ ...current, rows: current.rows.map((r, i) => savedRows.get(i) ?? r) }, ...t.results.slice(1)] : t.results,
+        pendingEdits: Object.keys(remaining).length > 0 ? remaining : undefined,
+      }
+    }))
+
+    const savedCount = savedRows.size
+    if (failure) {
+      toast.error(savedCount > 0
+        ? `Saved ${savedCount} of ${plans.length} rows, then a row failed: ${failure.message}`
+        : `Save failed: ${failure.message}`)
+      return false
+    }
+    toast.success(`Saved ${savedCount} row${savedCount === 1 ? '' : 's'}`)
+    return true
+  }, [connections])
 
   useEffect(() => {
     runTableTabRef.current = runTableTab
@@ -6569,6 +7196,33 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
     setActiveTabId(newTab.id)
     setTimeout(() => runTableTab(newTab), 0)
   }, [tabs, runTableTab, connections])
+
+  // Keeps open tabs in step with a table action run from the designer
+  const handleTableChanged = useCallback((connId: string, dbName: string, schema: string, table: string, change: TableChange) => {
+    const isTableTab = (t: QueryTab) => (t.kind === 'table' || t.kind === 'design')
+      && t.connectionId === connId && t.databaseName === dbName && t.schemaName === schema && t.tableName === table
+
+    if (change.kind === 'renamed') {
+      const name = change.newName
+      setTabs(prev => prev.map(t => !isTableTab(t) ? t : {
+        ...t,
+        tableName: name,
+        title: t.kind === 'design' ? `${name} [Design]` : name,
+        sql: t.kind === 'table' ? tablePageSql(schema, name, t.page ?? 0) : t.sql,
+      }))
+    } else if (change.kind === 'dropped') {
+      setTabs(prev => {
+        const next = prev.filter(t => !isTableTab(t))
+        setActiveTabId(curr => next.some(t => t.id === curr) ? curr : (next[next.length - 1]?.id ?? ''))
+        return next
+      })
+    } else if (change.kind === 'data') {
+      for (const t of tabsRef.current.filter(t => isTableTab(t) && t.kind === 'table')) void runTableTab({ ...t, totalRows: undefined })
+    } else if (change.kind === 'created') {
+      toast.success(`Created ${change.name}`, { action: { label: 'Open', onClick: () => handleOpenTable(connId, dbName, schema, change.name) } })
+    }
+    if (change.kind === 'renamed' || change.kind === 'dropped' || change.kind === 'created') handleRefreshDb(connId, dbName)
+  }, [runTableTab, handleOpenTable, handleRefreshDb])
 
   const handleOpenTableDesign = useCallback((connId: string, dbName: string, schema: string, table: string) => {
     const existing = tabs.find(t => t.kind === 'design' && t.connectionId === connId && t.databaseName === dbName && t.schemaName === schema && t.tableName === table)
@@ -6774,7 +7428,7 @@ WHERE n.nspname = '${esc(schema)}' AND t.typname = '${esc(typeName)}';`
       }
       return [...prev, { id: tab.id, title: name, sql: tab.sql, connectionId: tab.connectionId!, databaseName: tab.databaseName!, schemaName: tab.schemaName! }]
     })
-    setTabs(ts => ts.map(t => t.id === tab.id ? { ...t, title: name } : t))
+    setTabs(ts => ts.map(t => t.id === tab.id ? { ...t, title: name, originalSql: tab.sql } : t))
   }, [])
 
   const savedQueriesRef = useRef(savedQueries)
@@ -6789,6 +7443,7 @@ WHERE n.nspname = '${esc(schema)}' AND t.typname = '${esc(typeName)}';`
     const existing = savedQueriesRef.current.find(q => q.id === tab.id)
     if (existing) {
       setSavedQueries(prev => prev.map(q => q.id === tab.id ? { ...q, sql: tab.sql, schemaName: tab.schemaName! } : q))
+      setTabs(ts => ts.map(t => t.id === tab.id ? { ...t, originalSql: tab.sql } : t))
     } else {
       // New save — open name dialog
       setSaveNameDialog(tab)
@@ -6847,6 +7502,8 @@ WHERE n.nspname = '${esc(schema)}' AND t.typname = '${esc(typeName)}';`
         onNewQuery={newQuery}
         onNewTable={newTable}
         onNewView={newView}
+        onStructureSync={newStructureSync}
+        onDataSync={newDataSync}
         activeConn={activeConn}
       />
 
@@ -6864,6 +7521,7 @@ WHERE n.nspname = '${esc(schema)}' AND t.typname = '${esc(typeName)}';`
             onOpenErd={handleOpenErd}
             onDisconnect={handleDisconnect}
             onReconnect={handleReconnect}
+            onCancelConnect={handleCancelConnect}
             onRemove={handleRemove}
             onEdit={id => setEditConnId(id)}
             onSelectDb={handleSelectDb}
@@ -6896,21 +7554,28 @@ WHERE n.nspname = '${esc(schema)}' AND t.typname = '${esc(typeName)}';`
               onClose={closeTab}
             />
             {activeTab && (
-              <QueryPane
-                tab={activeTab}
-                connections={connections}
-                onChange={updateTab}
-                onSave={handleSaveQuery}
-                onPageChange={handlePageChange}
-                onOpenTable={handleOpenTable}
-                onOpenTableDesign={handleOpenTableDesign}
-                onRefreshDb={handleRefreshDb}
-                onAfterRun={(t, ok) => { if (ok && t.connectionId && t.databaseName) handleRefreshDb(t.connectionId, t.databaseName) }}
-                onClose={removeTab}
-                isSaved={savedQueries.some(q => q.id === activeTab.id)}
-                isActive={isActive}
-                runTrigger={runTrigger}
-              />
+              <div className="flex-1 min-h-0">
+                <QueryPane
+                  tab={activeTab}
+                  connections={connections}
+                  onChange={updateTab}
+                  onSave={handleSaveQuery}
+                  onPageChange={handlePageChange}
+                  onOpenTable={handleOpenTable}
+                  onOpenTableDesign={handleOpenTableDesign}
+                  onRefreshDb={handleRefreshDb}
+                  onAfterRun={(t, ok) => { if (ok && t.connectionId && t.databaseName) handleRefreshDb(t.connectionId, t.databaseName) }}
+                  onClose={removeTab}
+                  isSaved={savedQueries.some(q => q.id === activeTab.id)}
+                  isActive={isActive}
+                  runTrigger={runTrigger}
+                  onSaveTableEdits={handleSaveTableEdits}
+                  onTableSort={handleTableSort}
+                  onUpdateSync={updateSync}
+                  onUpdateDataSync={updateDataSync}
+                  onTableChanged={handleTableChanged}
+                />
+              </div>
             )}
           </div>
         </ResizablePanel>
@@ -7023,6 +7688,8 @@ WHERE n.nspname = '${esc(schema)}' AND t.typname = '${esc(typeName)}';`
                     success = await handleSaveDesign(tab)
                   } else if (tab.isFunction) {
                     success = await handleSaveFunction(tab)
+                  } else if (tab.kind === 'table') {
+                    success = await handleSaveTableEdits(tab)
                   } else {
                     handleSaveQuery(tab)
                     success = true

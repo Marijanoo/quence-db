@@ -12,6 +12,7 @@ declare global {
       onUpdateProgress?: (cb: (percent: number) => void) => void
       onUpdateDownloaded: (cb: () => void) => void
       installUpdate?: () => void
+      cancelConnect: (id: string) => Promise<{ ok: boolean }>
       onRunQuery?: (cb: () => void) => void
       offRunQuery?: (cb: () => void) => void
       onCloseActiveTab?: (cb: () => void) => void
@@ -34,26 +35,36 @@ declare global {
         }
       }
       pg: {
-        connect:        (opts: { id: string; host: string; port: number; database: string; user: string; password: string; ssl: boolean; vpnConfigPath?: string; vpnUsername?: string; vpnPassword?: string }) => Promise<{ ok: boolean; error?: string }>
+        connect:        (opts: { id: string; host: string; port: number; database: string; user: string; password: string; ssl: boolean; vpnConfigPath?: string; vpnUsername?: string; vpnPassword?: string }) => Promise<{ ok: boolean; cancelled?: boolean; error?: string }>
         disconnect:     (id: string) => Promise<{ ok: boolean; error?: string }>
-        query:          (id: string, sql: string, database?: string) => Promise<{ ok: boolean; rows?: Record<string, unknown>[]; fields?: string[]; rowCount?: number | null; ms?: number; error?: string }>
+        query:          (id: string, sql: string, database?: string, params?: unknown[], opts?: { searchPath?: string; settings?: Record<string, string> }) => Promise<{ ok: boolean; rows?: Record<string, unknown>[]; fields?: string[]; rowCount?: number | null; ms?: number; error?: string }>
+        sessionOpen:    (id: string, database?: string, settings?: Record<string, string>, readOnly?: boolean) => Promise<{ ok: boolean; sessionId?: string; error?: string }>
+        sessionQuery:   (sessionId: string, sql: string, params?: unknown[]) => Promise<{ ok: boolean; rows?: Record<string, unknown>[]; rowCount?: number | null; error?: string }>
+        sessionClose:   (sessionId: string, commit: boolean) => Promise<{ ok: boolean; error?: string }>
+        sessionCancel:  (sessionId: string) => Promise<{ ok: boolean; error?: string }>
+        executeScript:  (id: string, sql: string, database?: string) => Promise<{ ok: boolean; error?: string; position?: number }>
         introspect:     (id: string) => Promise<{ ok: boolean; databases?: string[]; error?: string }>
         introspectDb:   (id: string, database: string) => Promise<{ ok: boolean; tables?: any[]; functions?: any[]; enums?: any[]; types?: any[]; columns?: any[]; error?: string }>
         selectOvpnFile: () => Promise<string | null>
       }
       mysql: {
-        connect:      (opts: { id: string; host: string; port: number; database: string; user: string; password: string; ssl: boolean; vpnConfigPath?: string; vpnUsername?: string; vpnPassword?: string }) => Promise<{ ok: boolean; error?: string }>
+        connect:      (opts: { id: string; host: string; port: number; database: string; user: string; password: string; ssl: boolean; vpnConfigPath?: string; vpnUsername?: string; vpnPassword?: string }) => Promise<{ ok: boolean; cancelled?: boolean; error?: string }>
         disconnect:   (id: string) => Promise<{ ok: boolean; error?: string }>
-        query:        (id: string, sql: string, database?: string) => Promise<{ ok: boolean; rows?: Record<string, unknown>[]; fields?: string[]; rowCount?: number | null; ms?: number; error?: string }>
+        query:        (id: string, sql: string, database?: string, params?: unknown[]) => Promise<{ ok: boolean; rows?: Record<string, unknown>[]; fields?: string[]; rowCount?: number | null; ms?: number; error?: string }>
+        sessionOpen:  (id: string, database?: string) => Promise<{ ok: boolean; sessionId?: string; error?: string }>
+        sessionQuery: (sessionId: string, sql: string, params?: unknown[]) => Promise<{ ok: boolean; rows?: Record<string, unknown>[]; rowCount?: number | null; error?: string }>
+        sessionClose: (sessionId: string, commit: boolean) => Promise<{ ok: boolean; error?: string }>
+        sessionCancel: (sessionId: string) => Promise<{ ok: boolean; error?: string }>
         introspect:   (id: string) => Promise<{ ok: boolean; databases?: string[]; error?: string }>
-        introspectDb: (id: string, database: string) => Promise<{ ok: boolean; tables?: any[]; functions?: any[]; enums?: any[]; types?: any[]; error?: string }>
+        introspectDb: (id: string, database: string) => Promise<{ ok: boolean; tables?: any[]; functions?: any[]; enums?: any[]; types?: any[]; columns?: any[]; error?: string }>
       }
       mongodb: {
-        connect:      (opts: { id: string; host: string; port: number; database: string; user: string; password: string; ssl: boolean; vpnConfigPath?: string; vpnUsername?: string; vpnPassword?: string }) => Promise<{ ok: boolean; error?: string }>
+        connect:      (opts: { id: string; host: string; port: number; database: string; user: string; password: string; ssl: boolean; vpnConfigPath?: string; vpnUsername?: string; vpnPassword?: string }) => Promise<{ ok: boolean; cancelled?: boolean; error?: string }>
         disconnect:   (id: string) => Promise<{ ok: boolean; error?: string }>
-        query:        (id: string, sql: string, database?: string) => Promise<{ ok: boolean; rows?: Record<string, unknown>[]; fields?: string[]; rowCount?: number | null; ms?: number; error?: string }>
+        // params is accepted for signature parity with pg/mysql but ignored
+        query:        (id: string, sql: string, database?: string, params?: unknown[]) => Promise<{ ok: boolean; rows?: Record<string, unknown>[]; fields?: string[]; rowCount?: number | null; ms?: number; error?: string }>
         introspect:   (id: string) => Promise<{ ok: boolean; databases?: string[]; error?: string }>
-        introspectDb: (id: string, database: string) => Promise<{ ok: boolean; tables?: any[]; functions?: any[]; enums?: any[]; types?: any[]; error?: string }>
+        introspectDb: (id: string, database: string) => Promise<{ ok: boolean; tables?: any[]; functions?: any[]; enums?: any[]; types?: any[]; columns?: any[]; error?: string }>
       }
     }
   }

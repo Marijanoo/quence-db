@@ -1,5 +1,6 @@
 import { app, BrowserWindow, ipcMain, dialog } from 'electron'
-import { Pool } from 'pg'
+import { Pool, PoolClient } from 'pg'
+import { randomUUID } from 'crypto'
 import * as mysql from 'mysql2/promise'
 import { MongoClient, ObjectId } from 'mongodb'
 import * as vm from 'vm'
@@ -175,7 +176,8 @@ app.on('ready', () => {
 
   function spawnVpn(id: string, configPath: string, username?: string, password?: string): Promise<void> {
     return new Promise((resolve, reject) => {
-      const safeId = id.replace(/[^a-zA-Z0-9]/g, '')
+      // Unique per spawn, so a superseded attempt's cleanup can't delete a newer attempt's files
+      const safeId = `${id.replace(/[^a-zA-Z0-9]/g, '')}-${Date.now()}`
       const tmpDir = os.tmpdir()
       const tmpConfig = path.join(tmpDir, `ovpn-${safeId}.ovpn`)
       fs.writeFileSync(tmpConfig, fs.readFileSync(configPath, 'utf-8'))
@@ -220,10 +222,12 @@ app.on('ready', () => {
       proc.stdout?.on('data', onData)
       proc.stderr?.on('data', onData)
       proc.on('error', (err) => {
-        if (!settled) { settled = true; clearTimeout(timeout); cleanup(); vpnProcesses.delete(id); reject(err) }
+        if (vpnProcesses.get(id) === proc) vpnProcesses.delete(id)
+        if (!settled) { settled = true; clearTimeout(timeout); cleanup(); reject(err) }
       })
       proc.on('exit', (code) => {
-        cleanup(); vpnProcesses.delete(id)
+        cleanup()
+        if (vpnProcesses.get(id) === proc) vpnProcesses.delete(id)
         if (!settled) { settled = true; clearTimeout(timeout); reject(new Error(`OpenVPN exited (code ${code}).\n\n${outputLog}`)) }
       })
     })
@@ -236,52 +240,239 @@ app.on('ready', () => {
     vpnProcesses.delete(id)
   }
 
+  // ── Connect attempts ────────────────────────────────────────────────────────
+  // Each connect is an attempt that a newer connect for the same id, or an explicit cancel,
+  // aborts immediately instead of leaving the renderer waiting on a stale handshake.
+  const CANCELLED = 'Connection cancelled'
+  const connectAttempts = new Map<string, () => void>()
+
+  function beginConnectAttempt(id: string) {
+    connectAttempts.get(id)?.()
+    let reject!: (err: Error) => void
+    const cancelled = new Promise<never>((_, rej) => { reject = rej })
+    cancelled.catch(() => {})
+    let isCancelled = false
+    const cancel = () => { isCancelled = true; reject(new Error(CANCELLED)) }
+    connectAttempts.set(id, cancel)
+    return {
+      race: <T>(p: Promise<T>) => Promise.race([p, cancelled]),
+      get cancelled() { return isCancelled },
+      finish: () => { if (connectAttempts.get(id) === cancel) connectAttempts.delete(id) },
+    }
+  }
+
+  function connectFailure(attempt: { cancelled: boolean }, id: string, err: unknown) {
+    // A cancelled attempt must not kill the VPN: it may already belong to the newer attempt
+    if (attempt.cancelled) return { ok: false, cancelled: true, error: CANCELLED }
+    killVpn(id)
+    return { ok: false, error: err instanceof Error ? err.message : String(err) }
+  }
+
+  ipcMain.handle('db:cancel-connect', (_e, { id }: { id: string }) => {
+    connectAttempts.get(id)?.()
+    connectAttempts.delete(id)
+    killVpn(id)
+    return { ok: true }
+  })
+
+  function withTimeout<T>(p: Promise<T>, ms: number, message: string): Promise<T> {
+    let timer: ReturnType<typeof setTimeout>
+    return Promise.race([
+      p,
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(message)), ms) }),
+    ]).finally(() => clearTimeout(timer))
+  }
+
+  // pg emits 'error' when an idle pooled client drops (VPN down, server restart). Without a
+  // listener that is an uncaught exception in the main process.
+  function newPgPool(config: ConstructorParameters<typeof Pool>[0]) {
+    const pool = new Pool(config)
+    pool.on('error', err => console.warn('[pg] idle client error:', err.message))
+    return pool
+  }
+
+  function endPgPoolsFor(id: string) {
+    // Not awaited: end() waits for checked-out clients, which a long-running query can hold
+    pgPools.get(id)?.end().catch(() => {})
+    pgPools.delete(id)
+    for (const [key, pool] of dbQueryPools) {
+      if (key.startsWith(`${id}::`)) { pool.end().catch(() => {}); dbQueryPools.delete(key) }
+    }
+  }
+
   ipcMain.handle('pg:connect', async (_e, { id, host, port, database, user, password, ssl, vpnConfigPath, vpnUsername, vpnPassword }: {
     id: string; host: string; port: number; database: string; user: string; password: string; ssl: boolean; vpnConfigPath?: string; vpnUsername?: string; vpnPassword?: string
   }) => {
+    const attempt = beginConnectAttempt(id)
+    let pool: Pool | undefined
     try {
-      if (pgPools.has(id)) { await pgPools.get(id)!.end(); pgPools.delete(id) }
+      endPgPoolsFor(id)
       killVpn(id)
-      if (vpnConfigPath) await spawnVpn(id, vpnConfigPath, vpnUsername, vpnPassword)
-      const pool = new Pool({ host, port, database, user, password, ssl: ssl ? { rejectUnauthorized: false } : false, connectionTimeoutMillis: 30000 })
-      const client = await Promise.race([
-        pool.connect(),
-        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Connection timed out after 30s')), 30000)),
-      ])
+      if (vpnConfigPath) await attempt.race(spawnVpn(id, vpnConfigPath, vpnUsername, vpnPassword))
+      pool = newPgPool({ host, port, database, user, password, ssl: ssl ? { rejectUnauthorized: false } : false, connectionTimeoutMillis: 30000 })
+      const client = await attempt.race(withTimeout(pool.connect(), 30000, 'Connection timed out after 30s'))
       client.release()
       pgPools.set(id, pool)
       return { ok: true }
     } catch (err) {
-      killVpn(id)
-      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+      pool?.end().catch(() => {})
+      return connectFailure(attempt, id, err)
+    } finally {
+      attempt.finish()
     }
   })
 
   ipcMain.handle('pg:disconnect', async (_e, { id }: { id: string }) => {
-    try { await pgPools.get(id)?.end(); pgPools.delete(id); killVpn(id); return { ok: true } }
-    catch (err) { return { ok: false, error: err instanceof Error ? err.message : String(err) } }
+    endPgPoolsFor(id)
+    killVpn(id)
+    return { ok: true }
   })
 
   const dbQueryPools = new Map<string, Pool>()
 
-  ipcMain.handle('pg:query', async (_e, { id, sql, database }: { id: string; sql: string; database?: string }) => {
+  function pgPoolFor(id: string, database?: string): Pool | undefined {
     const basePool = pgPools.get(id)
-    if (!basePool) return { ok: false, error: 'Not connected' }
+    if (!basePool || !database) return basePool
+    const key = `${id}::${database}`
+    if (!dbQueryPools.has(key)) {
+      const opts = (basePool as any).options as { host: string; port: number; user: string; password: string; ssl: any }
+      dbQueryPools.set(key, newPgPool({ host: opts.host, port: opts.port, user: opts.user, password: opts.password, database, ssl: opts.ssl, connectionTimeoutMillis: 15000 }))
+    }
+    return dbQueryPools.get(key)!
+  }
+
+  // Applies session settings in a single round trip (set_config accepts any GUC by name)
+  async function applySettings(client: PoolClient, settings: Record<string, string>, local: boolean) {
+    const entries = Object.entries(settings)
+    if (entries.length === 0) return
+    const calls = entries.map((_, i) => `set_config($${i * 2 + 1}, $${i * 2 + 2}, ${local})`).join(', ')
+    await client.query(`SELECT ${calls}`, entries.flat())
+  }
+
+  ipcMain.handle('pg:query', async (_e, { id, sql, database, params, searchPath, settings }: {
+    id: string; sql: string; database?: string; params?: unknown[]; searchPath?: string; settings?: Record<string, string>
+  }) => {
+    const pool = pgPoolFor(id, database)
+    if (!pool) return { ok: false, error: 'Not connected' }
     try {
-      let pool = basePool
-      if (database) {
-        const key = `${id}::${database}`
-        if (!dbQueryPools.has(key)) {
-          const opts = (basePool as any).options as { host: string; port: number; user: string; password: string; ssl: any }
-          dbQueryPools.set(key, new Pool({ host: opts.host, port: opts.port, user: opts.user, password: opts.password, database, ssl: opts.ssl, connectionTimeoutMillis: 15000 }))
-        }
-        pool = dbQueryPools.get(key)!
-      }
       const start = Date.now()
-      const result = await pool.query(sql)
+      let result
+      const sessionSettings = { ...settings, ...(searchPath ? { search_path: searchPath } : {}) }
+      if (Object.keys(sessionSettings).length > 0) {
+        // Settings such as search_path (pg_get_*def() omits schema names found on it) or
+        // TimeZone/DateStyle (deterministic text output) need a dedicated client
+        const client = await pool.connect()
+        try {
+          await applySettings(client, sessionSettings, false)
+          result = await client.query(sql, params)
+        } finally {
+          await client.query('RESET ALL').catch(() => {})
+          client.release()
+        }
+      } else {
+        result = await pool.query(sql, params)
+      }
       return { ok: true, rows: result.rows, fields: result.fields.map(f => f.name), rowCount: result.rowCount, ms: Date.now() - start }
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    }
+  })
+
+  // ── Transaction sessions ──────────────────────────────────────────────────
+  // A session is one dedicated client inside an open transaction that the renderer drives with
+  // many queries (e.g. a batched data sync), then commits or rolls back. Idle sessions are rolled
+  // back automatically so an abandoned renderer can't hold locks forever.
+  const SESSION_IDLE_MS = 15 * 60 * 1000
+  const sessions = new Map<string, { client: PoolClient; pool: Pool; timer: ReturnType<typeof setTimeout> }>()
+
+  async function closeSession(sessionId: string, commit: boolean) {
+    const session = sessions.get(sessionId)
+    if (!session) throw new Error('Transaction session not found (it may have timed out and been rolled back)')
+    sessions.delete(sessionId)
+    clearTimeout(session.timer)
+    try {
+      await session.client.query(commit ? 'COMMIT' : 'ROLLBACK')
+    } catch (err) {
+      await session.client.query('ROLLBACK').catch(() => {})
+      throw err
+    } finally {
+      await session.client.query('RESET ALL').catch(() => {})
+      session.client.release()
+    }
+  }
+
+  function touchSession(sessionId: string) {
+    const session = sessions.get(sessionId)
+    if (!session) return undefined
+    clearTimeout(session.timer)
+    session.timer = setTimeout(() => { closeSession(sessionId, false).catch(() => {}) }, SESSION_IDLE_MS)
+    return session
+  }
+
+  ipcMain.handle('pg:session-open', async (_e, { id, database, settings, readOnly }: { id: string; database?: string; settings?: Record<string, string>; readOnly?: boolean }) => {
+    const pool = pgPoolFor(id, database)
+    if (!pool) return { ok: false, error: 'Not connected' }
+    let client: PoolClient | undefined
+    try {
+      client = await pool.connect()
+      // Read-only sessions see one consistent snapshot for their whole lifetime
+      await client.query(readOnly ? 'BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY' : 'BEGIN')
+      await applySettings(client, settings ?? {}, true)
+      const sessionId = randomUUID()
+      sessions.set(sessionId, { client, pool, timer: setTimeout(() => {}, 0) })
+      touchSession(sessionId)
+      return { ok: true, sessionId }
+    } catch (err) {
+      if (client) { await client.query('ROLLBACK').catch(() => {}); client.release() }
+      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    }
+  })
+
+  ipcMain.handle('pg:session-query', async (_e, { sessionId, sql, params }: { sessionId: string; sql: string; params?: unknown[] }) => {
+    const session = touchSession(sessionId)
+    if (!session) return { ok: false, error: 'Transaction session not found (it may have timed out and been rolled back)' }
+    try {
+      const result = await session.client.query(sql, params)
+      return { ok: true, rows: result.rows, rowCount: result.rowCount }
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    }
+  })
+
+  ipcMain.handle('pg:session-close', async (_e, { sessionId, commit }: { sessionId: string; commit: boolean }) => {
+    try { await closeSession(sessionId, commit); return { ok: true } }
+    catch (err) { return { ok: false, error: err instanceof Error ? err.message : String(err) } }
+  })
+
+  // Interrupts the statement a session is running (from a separate connection); the session's
+  // query then fails and the caller rolls back
+  ipcMain.handle('pg:session-cancel', async (_e, { sessionId }: { sessionId: string }) => {
+    const session = sessions.get(sessionId)
+    if (!session) return { ok: false, error: 'Transaction session not found' }
+    try {
+      await session.pool.query('SELECT pg_cancel_backend($1)', [(session.client as unknown as { processID: number }).processID])
+      return { ok: true }
+    } catch (err) { return { ok: false, error: err instanceof Error ? err.message : String(err) } }
+  })
+
+  // Runs a multi-statement script as one simple query on a dedicated client. The script manages its
+  // own transactions (BEGIN/COMMIT blocks); without any, the server runs it as a single implicit
+  // transaction. On error the open transaction, if any, is rolled back.
+  ipcMain.handle('pg:execute-script', async (_e, { id, sql, database }: { id: string; sql: string; database?: string }) => {
+    const pool = pgPoolFor(id, database)
+    if (!pool) return { ok: false, error: 'Not connected' }
+    let client
+    try { client = await pool.connect() }
+    catch (err) { return { ok: false, error: err instanceof Error ? err.message : String(err) } }
+    try {
+      await client.query(sql)
+      return { ok: true }
+    } catch (err: any) {
+      await client.query('ROLLBACK').catch(() => {})
+      return { ok: false, error: err?.message ?? String(err), position: err?.position ? Number(err.position) : undefined }
+    } finally {
+      await client.query('RESET ALL').catch(() => {})
+      client.release()
     }
   })
 
@@ -298,7 +489,7 @@ app.on('ready', () => {
     const basePool = pgPools.get(id)
     if (!basePool) return { ok: false, error: 'Not connected' }
     const opts = (basePool as any).options as { host: string; port: number; user: string; password: string; ssl: any }
-    const dbPool = new Pool({ host: opts.host, port: opts.port, user: opts.user, password: opts.password, database, ssl: opts.ssl, connectionTimeoutMillis: 15000 })
+    const dbPool = newPgPool({ host: opts.host, port: opts.port, user: opts.user, password: opts.password, database, ssl: opts.ssl, connectionTimeoutMillis: 15000 })
     try {
       const [tablesRes, funcsRes, enumsRes, typesRes, columnsRes] = await Promise.all([
         dbPool.query(`
@@ -350,34 +541,111 @@ app.on('ready', () => {
   ipcMain.handle('mysql:connect', async (_e, { id, host, port, database, user, password, ssl, vpnConfigPath, vpnUsername, vpnPassword }: {
     id: string; host: string; port: number; database: string; user: string; password: string; ssl: boolean; vpnConfigPath?: string; vpnUsername?: string; vpnPassword?: string
   }) => {
+    const attempt = beginConnectAttempt(id)
+    let pool: mysql.Pool | undefined
     try {
-      if (mysqlPools.has(id)) { await mysqlPools.get(id)!.end(); mysqlPools.delete(id) }
+      mysqlPools.get(id)?.end().catch(() => {})
+      mysqlPools.delete(id)
       killVpn(id)
-      if (vpnConfigPath) await spawnVpn(id, vpnConfigPath, vpnUsername, vpnPassword)
-      const pool = mysql.createPool({
+      if (vpnConfigPath) await attempt.race(spawnVpn(id, vpnConfigPath, vpnUsername, vpnPassword))
+      pool = mysql.createPool({
         host, port, database: database || undefined, user, password,
         ssl: ssl ? { rejectUnauthorized: false } : undefined,
         connectTimeout: 10000, waitForConnections: true, connectionLimit: 5,
       })
-      const conn = await Promise.race([
-        pool.getConnection(),
-        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Connection timed out after 10s')), 10000)),
-      ])
+      const conn = await attempt.race(withTimeout(pool.getConnection(), 10000, 'Connection timed out after 10s'))
       conn.release()
       mysqlPools.set(id, pool)
       return { ok: true }
     } catch (err) {
-      killVpn(id)
-      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+      pool?.end().catch(() => {})
+      return connectFailure(attempt, id, err)
+    } finally {
+      attempt.finish()
     }
   })
 
   ipcMain.handle('mysql:disconnect', async (_e, { id }: { id: string }) => {
-    try { await mysqlPools.get(id)?.end(); mysqlPools.delete(id); killVpn(id); return { ok: true } }
+    mysqlPools.get(id)?.end().catch(() => {})
+    mysqlPools.delete(id)
+    killVpn(id)
+    return { ok: true }
+  })
+
+  // Same idea as the PostgreSQL transaction sessions. Note that MySQL implicitly commits DDL
+  // (TRUNCATE, DROP, RENAME, CREATE), so only DML inside a session can really be rolled back.
+  const mysqlSessions = new Map<string, { conn: mysql.PoolConnection; pool: mysql.Pool; timer: ReturnType<typeof setTimeout> }>()
+
+  async function closeMysqlSession(sessionId: string, commit: boolean) {
+    const session = mysqlSessions.get(sessionId)
+    if (!session) throw new Error('Transaction session not found (it may have timed out and been rolled back)')
+    mysqlSessions.delete(sessionId)
+    clearTimeout(session.timer)
+    try {
+      if (commit) await session.conn.commit()
+      else await session.conn.rollback()
+    } catch (err) {
+      await session.conn.rollback().catch(() => {})
+      throw err
+    } finally {
+      session.conn.release()
+    }
+  }
+
+  function touchMysqlSession(sessionId: string) {
+    const session = mysqlSessions.get(sessionId)
+    if (!session) return undefined
+    clearTimeout(session.timer)
+    session.timer = setTimeout(() => { closeMysqlSession(sessionId, false).catch(() => {}) }, SESSION_IDLE_MS)
+    return session
+  }
+
+  ipcMain.handle('mysql:session-open', async (_e, { id, database }: { id: string; database?: string }) => {
+    const pool = mysqlPools.get(id)
+    if (!pool) return { ok: false, error: 'Not connected' }
+    let conn: mysql.PoolConnection | undefined
+    try {
+      conn = await pool.getConnection()
+      if (database) await conn.query(`USE \`${database.replace(/`/g, '``')}\``)
+      await conn.beginTransaction()
+      const sessionId = randomUUID()
+      mysqlSessions.set(sessionId, { conn, pool, timer: setTimeout(() => {}, 0) })
+      touchMysqlSession(sessionId)
+      return { ok: true, sessionId }
+    } catch (err) {
+      if (conn) { await conn.rollback().catch(() => {}); conn.release() }
+      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    }
+  })
+
+  ipcMain.handle('mysql:session-query', async (_e, { sessionId, sql, params }: { sessionId: string; sql: string; params?: unknown[] }) => {
+    const session = touchMysqlSession(sessionId)
+    if (!session) return { ok: false, error: 'Transaction session not found (it may have timed out and been rolled back)' }
+    try {
+      const [rows] = await session.conn.query(sql, params) as [any, mysql.FieldPacket[]]
+      return Array.isArray(rows)
+        ? { ok: true, rows, rowCount: rows.length }
+        : { ok: true, rows: [], rowCount: (rows as mysql.ResultSetHeader).affectedRows ?? 0 }
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    }
+  })
+
+  ipcMain.handle('mysql:session-close', async (_e, { sessionId, commit }: { sessionId: string; commit: boolean }) => {
+    try { await closeMysqlSession(sessionId, commit); return { ok: true } }
     catch (err) { return { ok: false, error: err instanceof Error ? err.message : String(err) } }
   })
 
-  ipcMain.handle('mysql:query', async (_e, { id, sql, database }: { id: string; sql: string; database?: string }) => {
+  ipcMain.handle('mysql:session-cancel', async (_e, { sessionId }: { sessionId: string }) => {
+    const session = mysqlSessions.get(sessionId)
+    if (!session) return { ok: false, error: 'Transaction session not found' }
+    try {
+      await session.pool.query(`KILL QUERY ${Number(session.conn.threadId)}`)
+      return { ok: true }
+    } catch (err) { return { ok: false, error: err instanceof Error ? err.message : String(err) } }
+  })
+
+  ipcMain.handle('mysql:query', async (_e, { id, sql, database, params }: { id: string; sql: string; database?: string; params?: unknown[] }) => {
     const pool = mysqlPools.get(id)
     if (!pool) return { ok: false, error: 'Not connected' }
     try {
@@ -385,11 +653,12 @@ app.on('ready', () => {
       try {
         if (database) await conn.query(`USE \`${database}\``)
         const start = Date.now()
-        const [rows, fields] = await conn.query({ sql, rowsAsArray: false }) as [any[], mysql.FieldPacket[]]
+        const [rows, fields] = await conn.query({ sql, rowsAsArray: false }, params) as [any[], mysql.FieldPacket[]]
         const ms = Date.now() - start
         const fieldNames = Array.isArray(fields) ? fields.map((f: any) => f.name) : []
         const normalizedRows = Array.isArray(rows) ? rows : []
-        return { ok: true, rows: normalizedRows, fields: fieldNames, rowCount: normalizedRows.length, ms }
+        const rowCount = Array.isArray(rows) ? rows.length : ((rows as mysql.ResultSetHeader).affectedRows ?? 0)
+        return { ok: true, rows: normalizedRows, fields: fieldNames, rowCount, ms }
       } finally { conn.release() }
     } catch (err) { return { ok: false, error: err instanceof Error ? err.message : String(err) } }
   })
@@ -454,31 +723,27 @@ app.on('ready', () => {
   const mongoClients = new Map<string, MongoClient>()
 
   ipcMain.handle('mongodb:connect', async (_e, { id, host }: { id: string; host: string }) => {
+    const attempt = beginConnectAttempt(id)
+    let client: MongoClient | undefined
     try {
-      if (mongoClients.has(id)) {
-        await mongoClients.get(id)!.close().catch(() => {})
-        mongoClients.delete(id)
-      }
-      const client = new MongoClient(host, { connectTimeoutMS: 15000 })
-      await client.connect()
+      mongoClients.get(id)?.close().catch(() => {})
+      mongoClients.delete(id)
+      client = new MongoClient(host, { connectTimeoutMS: 15000, serverSelectionTimeoutMS: 15000 })
+      await attempt.race(client.connect())
       mongoClients.set(id, client)
       return { ok: true }
     } catch (err) {
-      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+      client?.close().catch(() => {})
+      return connectFailure(attempt, id, err)
+    } finally {
+      attempt.finish()
     }
   })
 
   ipcMain.handle('mongodb:disconnect', async (_e, { id }: { id: string }) => {
-    try {
-      const client = mongoClients.get(id)
-      if (client) {
-        await client.close().catch(() => {})
-        mongoClients.delete(id)
-      }
-      return { ok: true }
-    } catch (err) {
-      return { ok: false, error: err instanceof Error ? err.message : String(err) }
-    }
+    mongoClients.get(id)?.close().catch(() => {})
+    mongoClients.delete(id)
+    return { ok: true }
   })
 
   ipcMain.handle('mongodb:introspect', async (_e, { id }: { id: string }) => {

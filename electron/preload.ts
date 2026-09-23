@@ -36,7 +36,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
   pg: {
     connect:        (opts: any) => ipcRenderer.invoke('pg:connect', opts),
     disconnect:     (id: string) => ipcRenderer.invoke('pg:disconnect', { id }),
-    query:          (id: string, sql: string, database?: string) => ipcRenderer.invoke('pg:query', { id, sql, database }),
+    query:          (id: string, sql: string, database?: string, params?: unknown[], opts?: { searchPath?: string; settings?: Record<string, string> }) =>
+                      ipcRenderer.invoke('pg:query', { id, sql, database, params, searchPath: opts?.searchPath, settings: opts?.settings }),
+    sessionOpen:    (id: string, database?: string, settings?: Record<string, string>, readOnly?: boolean) => ipcRenderer.invoke('pg:session-open', { id, database, settings, readOnly }),
+    sessionQuery:   (sessionId: string, sql: string, params?: unknown[]) => ipcRenderer.invoke('pg:session-query', { sessionId, sql, params }),
+    sessionClose:   (sessionId: string, commit: boolean) => ipcRenderer.invoke('pg:session-close', { sessionId, commit }),
+    sessionCancel:  (sessionId: string) => ipcRenderer.invoke('pg:session-cancel', { sessionId }),
+    executeScript:  (id: string, sql: string, database?: string) => ipcRenderer.invoke('pg:execute-script', { id, sql, database }),
     introspect:     (id: string) => ipcRenderer.invoke('pg:introspect', { id }),
     introspectDb:   (id: string, database: string) => ipcRenderer.invoke('pg:introspect-db', { id, database }),
     selectOvpnFile: () => ipcRenderer.invoke('pg:select-ovpn-file'),
@@ -45,7 +51,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
   mysql: {
     connect:      (opts: any) => ipcRenderer.invoke('mysql:connect', opts),
     disconnect:   (id: string) => ipcRenderer.invoke('mysql:disconnect', { id }),
-    query:        (id: string, sql: string, database?: string) => ipcRenderer.invoke('mysql:query', { id, sql, database }),
+    query:        (id: string, sql: string, database?: string, params?: unknown[]) => ipcRenderer.invoke('mysql:query', { id, sql, database, params }),
+    sessionOpen:  (id: string, database?: string) => ipcRenderer.invoke('mysql:session-open', { id, database }),
+    sessionQuery: (sessionId: string, sql: string, params?: unknown[]) => ipcRenderer.invoke('mysql:session-query', { sessionId, sql, params }),
+    sessionClose: (sessionId: string, commit: boolean) => ipcRenderer.invoke('mysql:session-close', { sessionId, commit }),
+    sessionCancel: (sessionId: string) => ipcRenderer.invoke('mysql:session-cancel', { sessionId }),
     introspect:   (id: string) => ipcRenderer.invoke('mysql:introspect', { id }),
     introspectDb: (id: string, database: string) => ipcRenderer.invoke('mysql:introspect-db', { id, database }),
   },
@@ -57,6 +67,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     introspect:   (id: string) => ipcRenderer.invoke('mongodb:introspect', { id }),
     introspectDb: (id: string, database: string) => ipcRenderer.invoke('mongodb:introspect-db', { id, database }),
   },
+
+  cancelConnect: (id: string) => ipcRenderer.invoke('db:cancel-connect', { id }),
 
   onRunQuery:  (cb: () => void) => ipcRenderer.on('run-query', cb),
   offRunQuery: (cb: () => void) => ipcRenderer.removeListener('run-query', cb),

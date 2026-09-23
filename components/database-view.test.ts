@@ -6,7 +6,97 @@ import {
   getNestedValue,
   flattenObject,
   processMongoRows,
+  buildRowSavePlans,
+  cellEditText,
+  buildTableOrderBy,
+  buildMongoSort,
 } from './database-view'
+
+describe('buildTableOrderBy', () => {
+  it('orders by primary key by default so pages are stable', () => {
+    expect(buildTableOrderBy('postgres', undefined, ['id'])).toBe('ORDER BY "id" ASC NULLS LAST')
+  })
+
+  it('returns nothing when there is no sort and no primary key', () => {
+    expect(buildTableOrderBy('postgres', undefined, [])).toBe('')
+  })
+
+  it('sorts by the chosen column with the primary key as tiebreaker', () => {
+    expect(buildTableOrderBy('postgres', { column: 'created_at', dir: 'desc' }, ['id']))
+      .toBe('ORDER BY "created_at" DESC NULLS LAST, "id" ASC NULLS LAST')
+  })
+
+  it('does not repeat the key when sorting by it', () => {
+    expect(buildTableOrderBy('postgres', { column: 'id', dir: 'desc' }, ['id'])).toBe('ORDER BY "id" DESC NULLS LAST')
+  })
+
+  it('puts NULLs last on mysql via IS NULL and quotes with backticks', () => {
+    expect(buildTableOrderBy('mysql', { column: 'created`at', dir: 'desc' }, ['id']))
+      .toBe('ORDER BY `created``at` IS NULL, `created``at` DESC, `id` IS NULL, `id` ASC')
+  })
+})
+
+describe('buildMongoSort', () => {
+  it('defaults to _id and adds _id as tiebreaker', () => {
+    expect(buildMongoSort(undefined)).toEqual({ _id: 1 })
+    expect(buildMongoSort({ column: 'createdAt', dir: 'desc' })).toEqual({ createdAt: -1, _id: 1 })
+    expect(buildMongoSort({ column: '_id', dir: 'desc' })).toEqual({ _id: -1 })
+  })
+})
+
+describe('buildRowSavePlans', () => {
+  const rows = [
+    { id: 1, name: 'a', note: 'x' },
+    { id: 2, name: 'b', note: 'y' },
+  ]
+
+  it('builds one parameterized postgres UPDATE ... RETURNING per row, in row order', () => {
+    const plans = buildRowSavePlans('postgres', 'public', 'users', ['id'], rows, [
+      { rowIndex: 1, col: 'name', value: 'B' },
+      { rowIndex: 0, col: 'name', value: 'A' },
+      { rowIndex: 1, col: 'note', value: 'Y' },
+    ])
+    expect(plans).toEqual([
+      { rowIndex: 0, update: { sql: 'UPDATE "public"."users" SET "name" = $1 WHERE "id" = $2 RETURNING *', params: ['A', 1] } },
+      { rowIndex: 1, update: { sql: 'UPDATE "public"."users" SET "name" = $1, "note" = $2 WHERE "id" = $3 RETURNING *', params: ['B', 'Y', 2] } },
+    ])
+  })
+
+  it('uses backticks and ? placeholders for mysql, and re-selects the row by key', () => {
+    const plans = buildRowSavePlans('mysql', 'shop', 'items', ['id', 'name'], rows, [
+      { rowIndex: 0, col: 'note', value: 'z' },
+    ])
+    expect(plans).toEqual([{
+      rowIndex: 0,
+      update: { sql: 'UPDATE `shop`.`items` SET `note` = ? WHERE `id` = ? AND `name` = ?', params: ['z', 1, 'a'] },
+      reselect: { sql: 'SELECT * FROM `shop`.`items` WHERE `id` = ? AND `name` = ?', params: [1, 'a'] },
+    }])
+  })
+
+  it('escapes quote characters in identifiers', () => {
+    const [pg] = buildRowSavePlans('postgres', 's', 'we"ird', ['id'], rows, [{ rowIndex: 0, col: 'na"me', value: 'v' }])
+    expect(pg.update.sql).toBe('UPDATE "s"."we""ird" SET "na""me" = $1 WHERE "id" = $2 RETURNING *')
+    const [my] = buildRowSavePlans('mysql', 's', 'we`ird', ['id'], rows, [{ rowIndex: 0, col: 'na`me', value: 'v' }])
+    expect(my.update.sql).toBe('UPDATE `s`.`we``ird` SET `na``me` = ? WHERE `id` = ?')
+  })
+
+  it('matches on the original key but re-selects by the new key when the key column is edited', () => {
+    const [pg] = buildRowSavePlans('postgres', 'public', 'users', ['id'], rows, [{ rowIndex: 0, col: 'id', value: '10' }])
+    expect(pg.update.params).toEqual(['10', 1])
+    const [my] = buildRowSavePlans('mysql', 'db', 'users', ['id'], rows, [{ rowIndex: 0, col: 'id', value: '10' }])
+    expect(my.update.params).toEqual(['10', 1])
+    expect(my.reselect?.params).toEqual(['10'])
+  })
+})
+
+describe('cellEditText', () => {
+  it('renders null as empty, dates as ISO, objects as JSON', () => {
+    expect(cellEditText(null)).toBe('')
+    expect(cellEditText(new Date('2026-01-02T03:04:05.000Z'))).toBe('2026-01-02T03:04:05.000Z')
+    expect(cellEditText({ a: 1 })).toBe('{"a":1}')
+    expect(cellEditText(42)).toBe('42')
+  })
+})
 
 describe('splitSqlStatements', () => {
   it('splits simple statements on semicolons', () => {
