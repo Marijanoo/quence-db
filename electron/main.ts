@@ -2,8 +2,7 @@ import { app, BrowserWindow, ipcMain, dialog } from 'electron'
 import { Pool, PoolClient } from 'pg'
 import { randomUUID } from 'crypto'
 import * as mysql from 'mysql2/promise'
-import { MongoClient, ObjectId } from 'mongodb'
-import * as vm from 'vm'
+import { MongoClient } from 'mongodb'
 import * as path from 'path'
 import * as fs from 'fs'
 import { spawn, ChildProcess } from 'child_process'
@@ -14,6 +13,7 @@ import {
   dbGetConnections, dbGetConnection, dbCreateConnection, dbUpdateConnection, dbDeleteConnection,
   dbGetSavedQueries, dbCreateSavedQuery, dbUpdateSavedQuery, dbDeleteSavedQuery,
 } from './sqlite-db'
+import { runMongoShell } from './mongo-shell'
 
 const isProd = app.isPackaged || process.env.NODE_ENV === 'production'
 
@@ -776,103 +776,11 @@ app.on('ready', () => {
     }
   })
 
-  function getUniqueKeys(arr: any[]): string[] {
-    const keys = new Set<string>()
-    for (const obj of arr) {
-      if (obj && typeof obj === 'object') {
-        for (const k of Object.keys(obj)) {
-          keys.add(k)
-        }
-      }
-    }
-    return Array.from(keys)
-  }
-
-  ipcMain.handle('mongodb:query', async (_e, { id, sql, database }: { id: string; sql: string; database?: string }) => {
+  ipcMain.handle('mongodb:query', async (_e, { id, sql, database, typed }: { id: string; sql: string; database?: string; typed?: boolean }) => {
     const client = mongoClients.get(id)
     if (!client) return { ok: false, error: 'Not connected' }
     try {
-      const dbName = database || 'test'
-      const dbInstance = client.db(dbName)
-
-      const wrapCursor = (cursor: any) => {
-        const proxyObj = {
-          skip: (n: number) => { cursor.skip(n); return proxyObj },
-          limit: (n: number) => { cursor.limit(n); return proxyObj },
-          sort: (spec: any) => { cursor.sort(spec); return proxyObj },
-          toArray: () => cursor.toArray(),
-          then: (onfulfilled: any, onrejected: any) => {
-            return cursor.toArray().then(onfulfilled, onrejected)
-          }
-        }
-        return proxyObj
-      }
-
-      const dbProxy = new Proxy({
-        collection: (name: string) => {
-          return {
-            find: (filter = {}, options = {}) => wrapCursor(dbInstance.collection(name).find(filter, options)),
-            findOne: (filter = {}, options = {}) => dbInstance.collection(name).findOne(filter, options),
-            insertOne: (doc: any) => dbInstance.collection(name).insertOne(doc),
-            insertMany: (docs: any[]) => dbInstance.collection(name).insertMany(docs),
-            updateOne: (filter = {}, update = {}, options = {}) => dbInstance.collection(name).updateOne(filter, update, options),
-            updateMany: (filter = {}, update = {}, options = {}) => dbInstance.collection(name).updateMany(filter, update, options),
-            deleteOne: (filter = {}, options = {}) => dbInstance.collection(name).deleteOne(filter, options),
-            deleteMany: (filter = {}, options = {}) => dbInstance.collection(name).deleteMany(filter, options),
-            aggregate: (pipeline = [], options = {}) => wrapCursor(dbInstance.collection(name).aggregate(pipeline, options)),
-            countDocuments: (filter = {}, options = {}) => dbInstance.collection(name).countDocuments(filter, options),
-          }
-        }
-      }, {
-        get(target: any, prop: string) {
-          if (prop in target) return target[prop]
-          if (prop === 'then') return undefined
-          return target.collection(prop)
-        }
-      })
-
-      const context = vm.createContext({
-        db: dbProxy,
-        ObjectId: (val: string) => new ObjectId(val),
-        ObjectID: (val: string) => new ObjectId(val),
-        console: { log: () => {} }
-      })
-
-      const start = Date.now()
-      const script = new vm.Script(sql.trim())
-      const rawResult = await script.runInContext(context, { timeout: 15000 })
-      const ms = Date.now() - start
-
-      let rows: any[] = []
-      let fields: string[] = []
-
-      if (rawResult !== undefined && rawResult !== null) {
-        if (Array.isArray(rawResult)) {
-          rows = rawResult
-          fields = getUniqueKeys(rows)
-        } else if (typeof rawResult === 'object') {
-          rows = [rawResult]
-          fields = Object.keys(rawResult)
-        } else {
-          rows = [{ result: rawResult }]
-          fields = ['result']
-        }
-      }
-
-      const cleanRows = JSON.parse(JSON.stringify(rows, (key, value) => {
-        if (value && typeof value === 'object' && value.val !== undefined) {
-          return String(value)
-        }
-        return value
-      }))
-
-      return {
-        ok: true,
-        rows: cleanRows,
-        fields,
-        rowCount: cleanRows.length,
-        ms
-      }
+      return { ok: true, ...(await runMongoShell(client, database, sql, { typed })) }
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) }
     }

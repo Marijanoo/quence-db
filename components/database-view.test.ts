@@ -7,6 +7,7 @@ import {
   flattenObject,
   processMongoRows,
   buildRowSavePlans,
+  buildRowDelete,
   cellEditText,
   buildTableOrderBy,
   buildMongoSort,
@@ -86,6 +87,24 @@ describe('buildRowSavePlans', () => {
     const [my] = buildRowSavePlans('mysql', 'db', 'users', ['id'], rows, [{ rowIndex: 0, col: 'id', value: '10' }])
     expect(my.update.params).toEqual(['10', 1])
     expect(my.reselect?.params).toEqual(['10'])
+  })
+})
+
+describe('buildRowDelete', () => {
+  const row = { id: 1, tenant: 'a', name: 'x' }
+  it('deletes by every primary key column with placeholders', () => {
+    expect(buildRowDelete('postgres', 'public', 'users', ['id', 'tenant'], row))
+      .toEqual({ sql: 'DELETE FROM "public"."users" WHERE "id" = $1 AND "tenant" = $2', params: [1, 'a'] })
+    expect(buildRowDelete('mysql', 'shop', 'users', ['id'], row))
+      .toEqual({ sql: 'DELETE FROM `shop`.`users` WHERE `id` = ?', params: [1] })
+  })
+})
+
+describe('buildRowSavePlans with NULL', () => {
+  it('passes null through as a parameter', () => {
+    const [plan] = buildRowSavePlans('postgres', 'public', 'users', ['id'], [{ id: 1, note: 'x' }], [{ rowIndex: 0, col: 'note', value: null }])
+    expect(plan.update.sql).toBe('UPDATE "public"."users" SET "note" = $1 WHERE "id" = $2 RETURNING *')
+    expect(plan.update.params).toEqual([null, 1])
   })
 })
 

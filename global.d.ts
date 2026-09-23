@@ -61,8 +61,9 @@ declare global {
       mongodb: {
         connect:      (opts: { id: string; host: string; port: number; database: string; user: string; password: string; ssl: boolean; vpnConfigPath?: string; vpnUsername?: string; vpnPassword?: string }) => Promise<{ ok: boolean; cancelled?: boolean; error?: string }>
         disconnect:   (id: string) => Promise<{ ok: boolean; error?: string }>
-        // params is accepted for signature parity with pg/mysql but ignored
-        query:        (id: string, sql: string, database?: string, params?: unknown[]) => Promise<{ ok: boolean; rows?: Record<string, unknown>[]; fields?: string[]; rowCount?: number | null; ms?: number; error?: string }>
+        // params is accepted for signature parity with pg/mysql but ignored. typed keeps Int32/Double/Long
+        // distinct in find results; types holds each row's BSON field types (dotted paths).
+        query:        (id: string, sql: string, database?: string, params?: unknown[], options?: { typed?: boolean }) => Promise<{ ok: boolean; rows?: Record<string, unknown>[]; fields?: string[]; rowCount?: number | null; ms?: number; types?: Record<string, string>[]; error?: string }>
         introspect:   (id: string) => Promise<{ ok: boolean; databases?: string[]; error?: string }>
         introspectDb: (id: string, database: string) => Promise<{ ok: boolean; tables?: any[]; functions?: any[]; enums?: any[]; types?: any[]; columns?: any[]; error?: string }>
       }

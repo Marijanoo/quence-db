@@ -10,14 +10,23 @@ import {
   Database, Table2, FunctionSquare, ChevronRight, ChevronDown,
   Plus, Play, PlugZap, FileCode2, RefreshCw, X, FileText, Loader2, View, Pencil, Save, FileCode, Search, Plug,
   Circle, Wrench, Check, Workflow, Key, Minus, Download, Sparkles, Braces, Clock, AlignLeft, AlignCenter, AlignRight, Shield, Tag, Shapes, AlertTriangle,
-  GitCompareArrows, DatabaseZap, Link2,
+  GitCompareArrows, DatabaseZap, Link2, Leaf, Copy, ClipboardPaste, Trash2, ArrowUp, ArrowDown, Undo2, CircleSlash, ExternalLink,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { StructureSyncView, initialSyncState, type StructureSyncConfig, type StructureSyncState } from '@/components/structure-sync'
 import { DataSyncView, initialDataSyncState, type DataSyncConfig, type DataSyncState } from '@/components/data-sync'
 import { quenceTheme } from '@/components/sql-highlight'
-import { sqlEditorLanguage, type FunctionInfo } from '@/lib/sql-completion'
+import { sqlEditorLanguage, type FunctionInfo, type SqlEditorLanguageConfig } from '@/lib/sql-completion'
+import { mongoEditorLanguage } from '@/lib/mongo-completion'
 import { FOREIGN_KEYS_SQL, parseForeignKeys, type FkRef } from '@/lib/fk-lookup'
+import { queryLanguageMismatch } from '@/lib/query-language'
+import { buildInsertStatement, buildUpdateStatement, cellText as cellEditText, quoteIdent, rowsToTsv } from '@/lib/grid-copy'
+import { BSON_TYPE_LABELS, MONGO_TYPE_OPTIONS, buildMongoCellScript, mongoIdFilter, type MongoCellEdit } from '@/lib/mongo-cell'
+import { ContextMenuAt, type MenuEntry } from '@/components/context-menu'
+import {
+  AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter,
+  AlertDialogHeader, AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 import { FkLookupPopover, type FkLookupTarget } from '@/components/fk-lookup'
 import { TableActionsBar, type TableChange } from '@/components/table-actions'
 import { generateId } from '@/lib/utils'
@@ -69,7 +78,7 @@ interface DbDatabase {
 
 const SCHEMA_PRELOAD_CONCURRENCY = 3
 
-interface ColumnInfo { name: string; type: string }
+interface ColumnInfo { name: string; type: string; nullable?: boolean }
 
 interface SchemaEntry {
   name: string
@@ -266,18 +275,14 @@ interface QueryTab {
   foreignKeyRefs?: FkRef[]
 }
 
-interface CellEdit { rowIndex: number; col: string; value: string }
+// value null means SQL NULL
+interface CellEdit { rowIndex: number; col: string; value: string | null }
 
 function cellEditKey(rowIndex: number, col: string) {
   return `${rowIndex}\u0000${col}`
 }
 
-export function cellEditText(raw: unknown): string {
-  if (raw === null || raw === undefined) return ''
-  if (raw instanceof Date) return raw.toISOString()
-  if (typeof raw === 'object') return JSON.stringify(raw)
-  return String(raw)
-}
+export { cellEditText }
 
 function hasPendingTableEdits(tab: QueryTab) {
   return tab.kind === 'table' && Object.keys(tab.pendingEdits ?? {}).length > 0
@@ -289,11 +294,6 @@ interface ParamQuery { sql: string; params: unknown[] }
 // MySQL has no RETURNING, so `reselect` re-reads it by its (possibly edited) key.
 export interface RowSavePlan { rowIndex: number; update: ParamQuery; reselect?: ParamQuery }
 
-function quoteIdent(dbType: 'postgres' | 'mysql') {
-  return dbType === 'mysql'
-    ? (s: string) => '`' + s.replace(/`/g, '``') + '`'
-    : (s: string) => '"' + s.replace(/"/g, '""') + '"'
-}
 
 export interface TableSort { column: string; dir: 'asc' | 'desc' }
 
@@ -350,6 +350,14 @@ export function buildRowSavePlans(
   })
 }
 
+// Deletes one row by its primary key; rowCount tells whether it was still there
+export function buildRowDelete(dbType: 'postgres' | 'mysql', schema: string, table: string, primaryKeys: string[], row: Record<string, unknown>): ParamQuery {
+  const q = quoteIdent(dbType)
+  const params = primaryKeys.map(pk => row[pk])
+  const where = primaryKeys.map((pk, i) => `${q(pk)} = ${dbType === 'mysql' ? '?' : `$${i + 1}`}`)
+  return { sql: `DELETE FROM ${q(schema)}.${q(table)} WHERE ${where.join(' AND ')}`, params }
+}
+
 interface SavedQuery {
   id: string
   title: string
@@ -366,6 +374,7 @@ interface QueryResult {
   ms: number
   error?: string
   statement?: string  // the SQL statement that produced this result
+  types?: Record<string, string>[]  // MongoDB: each row's BSON field types, by dotted path
 }
 
 // ── Small reusable dialogs ────────────────────────────────────────────────────
@@ -1874,23 +1883,32 @@ function ConnectionsPanel({
 
 // ── Query tab bar ─────────────────────────────────────────────────────────────
 
+const DB_TYPE_COLORS = { postgres: 'text-blue-400', mysql: 'text-orange-400', mongodb: 'text-emerald-400' } as const
+const DB_TYPE_LABELS = { postgres: 'PostgreSQL', mysql: 'MySQL', mongodb: 'MongoDB' } as const
+
 function QueryTabBar({
-  tabs, activeId, onSelect, onClose,
+  tabs, activeId, onSelect, onClose, dbTypeOf,
 }: {
   tabs: QueryTab[]
   activeId: string
   onSelect: (id: string) => void
   onClose: (id: string) => void
+  dbTypeOf: (tab: QueryTab) => 'postgres' | 'mysql' | 'mongodb' | undefined
 }) {
   return (
     <div className="flex items-end border-b border-border bg-card shrink-0 overflow-x-auto">
       {tabs.map(tab => {
+        const dbType = dbTypeOf(tab)
+        const isMongo = dbType === 'mongodb'
+        // Same colors as the connection badges in the sidebar
+        const dbColor = dbType ? DB_TYPE_COLORS[dbType] : 'text-primary'
         const isChanged = (tab.isFunction && tab.sql !== tab.originalSql) || (tab.kind === 'design' && isTableDesignChanged(tab)) || (!tab.isFunction && tab.kind === 'query' && tab.originalSql !== undefined && tab.sql !== tab.originalSql && tab.sql.trim() !== '') || (tab.kind === 'create-table' && (tab.columns ?? []).length > 0) || (tab.kind === 'create-view' && tab.sql.trim() !== '') || hasPendingTableEdits(tab)
         return (
           <div
             key={tab.id}
             onClick={() => onSelect(tab.id)}
             onMouseDown={e => { if (e.button === 1) { e.preventDefault(); onClose(tab.id) } }}
+            title={dbType ? `${tab.title} (${DB_TYPE_LABELS[dbType]})` : undefined}
             className={cn(
               'group flex items-center gap-1.5 px-3 h-8 text-xs cursor-pointer border-r border-border shrink-0 transition-colors select-none',
               tab.id === activeId
@@ -1899,7 +1917,7 @@ function QueryTabBar({
             )}
           >
             {tab.kind === 'table' ? (
-              <Table2 className="h-3 w-3 shrink-0 text-primary" />
+              <Table2 className={cn('h-3 w-3 shrink-0', dbColor)} />
             ) : tab.kind === 'design' ? (
               <Wrench className="h-3 w-3 shrink-0 text-primary" />
             ) : tab.kind === 'erd' ? (
@@ -1916,6 +1934,10 @@ function QueryTabBar({
               <FunctionSquare className="h-3 w-3 shrink-0 text-purple-300" />
             ) : tab.tableName?.startsWith('type:') ? (
               <Shapes className="h-3 w-3 shrink-0 text-orange-400" />
+            ) : isMongo ? (
+              <Leaf className={cn('h-3 w-3 shrink-0', dbColor)} />
+            ) : dbType ? (
+              <Database className={cn('h-3 w-3 shrink-0', dbColor)} />
             ) : (
               <FileText className="h-3 w-3 shrink-0 text-muted-foreground" />
             )}
@@ -1945,25 +1967,33 @@ const MIN_COL_WIDTH = 40
 interface TableGridProps {
   editable?: boolean
   pendingEdits?: Record<string, CellEdit>
-  onCellEdit?: (rowIndex: number, col: string, value: string | undefined) => void
+  onCellEdit?: (rowIndex: number, col: string, value: string | null | undefined) => void
   errorRowIndex?: number
-  // When set, header clicks sort the whole table on the server instead of the rows on screen
-  serverSort?: { sort?: TableSort; onSort: (column: string) => void }
+  // When set, header clicks sort the whole table on the server instead of the rows on screen.
+  // `dir` sets the order directly (null clears it); without it the column's sort cycles.
+  serverSort?: { sort?: TableSort; onSort: (column: string, dir?: 'asc' | 'desc' | null) => void }
+  // The table or collection the rows come from, for "Copy As" statements and cell actions
+  table?: { schema: string; name: string; primaryKeys: string[] }
+  onDeleteRow?: (rowIndex: number) => void
+  // Why rows can't be deleted right now (e.g. unsaved edits), shown in the menu
+  deleteBlockedReason?: string
+  onMongoEdit?: (rowIndex: number, edit: MongoCellEdit) => void
   // Foreign keys of the table: their cells get a row-picker popup over the referenced table
   foreignKeys?: FkRef[]
   fkTarget?: FkLookupTarget
   onOpenReferencedTable?: (fk: FkRef) => void
 }
 
-function SingleResultGrid({ result, columnTypes, dbType, editable = false, pendingEdits, onCellEdit, errorRowIndex, serverSort, foreignKeys, fkTarget, onOpenReferencedTable }: { result: QueryResult; columnTypes?: ColumnInfo[]; dbType?: 'postgres' | 'mysql' | 'mongodb' } & TableGridProps) {
+function SingleResultGrid({ result, columnTypes, dbType, editable = false, pendingEdits, onCellEdit, errorRowIndex, serverSort, foreignKeys, fkTarget, onOpenReferencedTable, table, onDeleteRow, deleteBlockedReason, onMongoEdit }: { result: QueryResult; columnTypes?: ColumnInfo[]; dbType?: 'postgres' | 'mysql' | 'mongodb' } & TableGridProps) {
   const [selectedCell, setSelectedCell] = useState<{ ri: number; col: string } | null>(null)
+  const [cellMenu, setCellMenu] = useState<{ x: number; y: number; ri: number; rowIndex: number; col: string; anchor: DOMRect } | null>(null)
   const [editingCell, setEditingCell] = useState<{ ri: number; col: string } | null>(null)
   const [colWidths, setColWidths] = useState<Record<string, number>>({})
   const [fkPopup, setFkPopup] = useState<{ rowIndex: number; col: string; fk: FkRef; anchor: DOMRect } | null>(null)
   const fkByColumn = useMemo(() => new Map((fkTarget ? foreignKeys ?? [] : []).map(fk => [fk.column, fk])), [foreignKeys, fkTarget])
   const justResizedRef = useRef(false)
   // Pending value of the cell when editing started, so Escape can restore it
-  const editStartRef = useRef<string | undefined>(undefined)
+  const editStartRef = useRef<string | null | undefined>(undefined)
   const commitTimerRef = useRef<{ timer: ReturnType<typeof setTimeout>; commit: () => void } | null>(null)
 
   const cancelPendingCommit = () => {
@@ -2081,7 +2111,7 @@ function SingleResultGrid({ result, columnTypes, dbType, editable = false, pendi
   // Keyed on `fields` (a fresh array per query) rather than `result`, so saving edited rows in
   // place keeps the user's sort, filter and selection.
   // eslint-disable-next-line react-hooks/set-state-in-effect
-  useEffect(() => { setSelectedCell(null); setEditingCell(null); setRowSearch(''); setRowFilter(''); setExportMenuOpen(false); setSortCol(null); setExpandedColumns(new Set()) }, [result.fields])
+  useEffect(() => { setSelectedCell(null); setEditingCell(null); setCellMenu(null); setRowSearch(''); setRowFilter(''); setExportMenuOpen(false); setSortCol(null); setExpandedColumns(new Set()) }, [result.fields])
 
   const handleSortClick = (col: string) => {
     if (sortCol === col) {
@@ -2225,6 +2255,130 @@ function SingleResultGrid({ result, columnTypes, dbType, editable = false, pendi
       return sortDir === 'asc' ? aStr.localeCompare(bStr) : bStr.localeCompare(aStr)
     })
   }, [visibleRows, sortCol, sortDir, serverSort])
+
+  // Right-click menu of a cell, modeled on Navicat's grid menu
+  const cellMenuEntries = (menu: NonNullable<typeof cellMenu>): MenuEntry[] => {
+    const { rowIndex, ri, col } = menu
+    const row = result.rows[rowIndex]
+    const raw = getNestedValue(row, col)
+    const pending = pendingEdits?.[cellEditKey(rowIndex, col)]
+    const isMongo = dbType === 'mongodb'
+    const sep: MenuEntry = { kind: 'separator' }
+    const entries: MenuEntry[] = []
+
+    const copy = (text: string, what: string) => {
+      navigator.clipboard.writeText(text)
+        .then(() => toast.success(`Copied ${what}`), () => toast.error('Could not write to the clipboard'))
+    }
+    // What the grid shows: the row with its unsaved edits applied
+    const shownRow: Record<string, unknown> = { ...row }
+    for (const e of Object.values(pendingEdits ?? {})) if (e.rowIndex === rowIndex) shownRow[e.col] = e.value
+    // Mongo rows also hold flattened "parent.child" copies of nested fields; the document is the rest
+    const document = Object.fromEntries(Object.entries(row).filter(([k]) => !k.includes('.') || !(k.split('.')[0] in row)))
+
+    const fk = fkTarget ? fkByColumn.get(col) : undefined
+    if (fk) {
+      entries.push(
+        { label: `Pick from ${fk.refTable}…`, icon: <Link2 className="h-3.5 w-3.5" />, onSelect: () => setFkPopup({ rowIndex, col, fk, anchor: menu.anchor }) },
+        { label: `Open ${fk.refTable}`, icon: <ExternalLink className="h-3.5 w-3.5" />, disabled: !onOpenReferencedTable, onSelect: () => onOpenReferencedTable?.(fk) },
+        sep,
+      )
+    }
+
+    if (isMongo && onMongoEdit && table) {
+      const types = result.types?.[rowIndex] ?? {}
+      const type = types[col]
+      const isId = col === '_id' || col.startsWith('_id.')
+      const idOk = mongoIdFilter(row._id, types._id) !== null
+      const blocked = isId ? "_id can't be changed" : !idOk ? '_id type not supported' : undefined
+      entries.push(
+        { label: 'Set to Null', icon: <CircleSlash className="h-3.5 w-3.5" />, disabled: !!blocked || type === 'null', hint: blocked, onSelect: () => onMongoEdit(rowIndex, { kind: 'changeType', col, to: 'null' }) },
+        { label: 'Set to Empty String', disabled: !!blocked || raw === '', onSelect: () => onMongoEdit(rowIndex, { kind: 'emptyString', col }) },
+        {
+          label: 'Change Type to', disabled: !!blocked, submenu: [
+            { kind: 'label', label: `Current: ${type ? BSON_TYPE_LABELS[type] ?? type : 'missing'}` },
+            ...MONGO_TYPE_OPTIONS.map(o => ({
+              label: o.label, checked: type === o.type, disabled: type === o.type,
+              onSelect: () => onMongoEdit(rowIndex, { kind: 'changeType', col, to: o.type }),
+            })),
+          ],
+        },
+        { label: 'Delete Field', icon: <Trash2 className="h-3.5 w-3.5" />, disabled: !!blocked || type === undefined, onSelect: () => onMongoEdit(rowIndex, { kind: 'unset', col }) },
+        sep,
+      )
+    } else if (!isMongo && editable && onCellEdit) {
+      const nullable = columnTypes?.find(c => c.name === col)?.nullable
+      const isNull = raw === null || raw === undefined
+      entries.push(
+        {
+          label: 'Set to NULL', icon: <CircleSlash className="h-3.5 w-3.5" />,
+          disabled: nullable === false || (pending ? pending.value === null : isNull),
+          hint: nullable === false ? 'NOT NULL' : undefined,
+          onSelect: () => onCellEdit(rowIndex, col, isNull ? undefined : null),
+        },
+        {
+          label: 'Set to Empty String',
+          disabled: pending ? pending.value === '' : raw === '',
+          onSelect: () => onCellEdit(rowIndex, col, raw === '' ? undefined : ''),
+        },
+        {
+          label: 'Paste', icon: <ClipboardPaste className="h-3.5 w-3.5" />,
+          onSelect: () => {
+            navigator.clipboard.readText().then(
+              text => onCellEdit(rowIndex, col, !isNull && text === cellEditText(raw) ? undefined : text),
+              () => toast.error('Could not read the clipboard'),
+            )
+          },
+        },
+        { label: 'Edit Cell', shortcut: 'Double-click', onSelect: () => setEditingCell({ ri, col }) },
+        { label: 'Revert Cell', icon: <Undo2 className="h-3.5 w-3.5" />, disabled: !pending, onSelect: () => onCellEdit(rowIndex, col, undefined) },
+        sep,
+      )
+    }
+
+    const sqlDialect = dbType === 'mysql' ? 'mysql' : 'postgres'
+    const shownValue = pending ? pending.value : raw
+    entries.push(
+      { label: 'Copy', icon: <Copy className="h-3.5 w-3.5" />, onSelect: () => copy(cellEditText(shownValue), 'value') },
+      {
+        label: 'Copy As', submenu: [
+          ...(!isMongo ? [
+            { label: 'Insert Statement', disabled: !table, onSelect: () => copy(buildInsertStatement(sqlDialect, table!.schema, table!.name, result.fields, shownRow), 'INSERT statement') },
+            { label: 'Update Statement', disabled: !table || table.primaryKeys.length === 0, onSelect: () => copy(buildUpdateStatement(sqlDialect, table!.schema, table!.name, table!.primaryKeys, result.fields, shownRow), 'UPDATE statement') },
+            sep,
+          ] : []),
+          { label: 'Tab-Separated Values (Data Only)', onSelect: () => copy(rowsToTsv(visibleFields, [shownRow], false), 'row') },
+          { label: 'Tab-Separated Values (Field Names Only)', onSelect: () => copy(rowsToTsv(visibleFields, [], true), 'field names') },
+          { label: 'Tab-Separated Values (Field Names and Data)', onSelect: () => copy(rowsToTsv(visibleFields, [shownRow], true), 'row with field names') },
+          sep,
+          { label: isMongo ? 'JSON Document' : 'JSON', onSelect: () => copy(JSON.stringify(isMongo ? document : shownRow, null, 2), 'JSON') },
+        ],
+      },
+      { label: 'Copy Field Name', onSelect: () => copy(col, 'field name') },
+      sep,
+    )
+
+    const activeSort = serverSort
+      ? (serverSort.sort?.column === col ? serverSort.sort.dir : undefined)
+      : (sortCol === col ? sortDir : undefined)
+    const sortBy = (dir: 'asc' | 'desc' | null) => {
+      if (serverSort) { serverSort.onSort(col, dir); return }
+      if (dir) { setSortCol(col); setSortDir(dir) } else setSortCol(null)
+    }
+    entries.push(
+      { label: 'Sort Ascending', icon: <ArrowUp className="h-3.5 w-3.5" />, checked: activeSort === 'asc', onSelect: () => sortBy('asc') },
+      { label: 'Sort Descending', icon: <ArrowDown className="h-3.5 w-3.5" />, checked: activeSort === 'desc', onSelect: () => sortBy('desc') },
+      { label: 'Remove Sort', disabled: !activeSort, onSelect: () => sortBy(null) },
+    )
+
+    if (isMongo && onMongoEdit && table) {
+      const idOk = mongoIdFilter(row._id, result.types?.[rowIndex]?._id) !== null
+      entries.push(sep, { label: 'Delete Document', icon: <Trash2 className="h-3.5 w-3.5" />, destructive: true, disabled: !idOk, onSelect: () => onMongoEdit(rowIndex, { kind: 'deleteDocument' }) })
+    } else if (!isMongo && editable && onDeleteRow) {
+      entries.push(sep, { label: 'Delete Record', icon: <Trash2 className="h-3.5 w-3.5" />, destructive: true, disabled: !!deleteBlockedReason, hint: deleteBlockedReason, onSelect: () => onDeleteRow(rowIndex) })
+    }
+    return entries
+  }
 
   if (result.error) {
     return (
@@ -2396,16 +2550,16 @@ function SingleResultGrid({ result, columnTypes, dbType, editable = false, pendi
                             return next
                           })
                         } else {
-                          editStartRef.current = pending?.value
                           setEditingCell({ ri, col })
                         }
                       }}
                       onContextMenu={e => {
-                        const fk = fkByColumn.get(col)
-                        if (!fk || isEditing || rowIndex < 0) return
+                        // Inside the cell editor the browser's own menu (cut/copy/paste) is more useful
+                        if (isEditing || rowIndex < 0) return
                         e.preventDefault()
+                        e.stopPropagation()
                         setSelectedCell({ ri, col })
-                        setFkPopup({ rowIndex, col, fk, anchor: e.currentTarget.getBoundingClientRect() })
+                        setCellMenu({ x: e.clientX, y: e.clientY, ri, rowIndex, col, anchor: e.currentTarget.getBoundingClientRect() })
                       }}
                       className={cn(
                         'border-r border-border/50 font-mono whitespace-nowrap',
@@ -2422,8 +2576,9 @@ function SingleResultGrid({ result, columnTypes, dbType, editable = false, pendi
                         <input
                           autoFocus
                           readOnly={!editable}
-                          defaultValue={pending ? pending.value : cellEditText(raw)}
+                          defaultValue={pending ? (pending.value ?? '') : cellEditText(raw)}
                           onFocus={e => {
+                            editStartRef.current = pending?.value
                             cellHistoryRef.current = { past: [], future: [], current: e.currentTarget.value }
                             e.currentTarget.select()
                           }}
@@ -2456,7 +2611,7 @@ function SingleResultGrid({ result, columnTypes, dbType, editable = false, pendi
                           className={cn('w-full h-full px-2 py-0.5 text-foreground text-xs font-mono outline-none border-none ring-1 ring-inset', editable ? 'bg-background ring-amber-500' : 'bg-primary/10 ring-primary')}
                         />
                       ) : pending ? (
-                        <span className={isFailedEdit ? 'text-red-400' : 'text-amber-400'}>{pending.value}</span>
+                        <span className={cn(isFailedEdit ? 'text-red-400' : 'text-amber-400', pending.value === null && 'italic')}>{pending.value ?? 'NULL'}</span>
                       ) : raw === null || raw === undefined ? (
                         <span className="text-muted-foreground/50 italic">null</span>
                       ) : isDoc ? (
@@ -2493,7 +2648,7 @@ function SingleResultGrid({ result, columnTypes, dbType, editable = false, pendi
       {fkPopup && fkTarget && (() => {
         const row = result.rows[fkPopup.rowIndex]
         const original = cellEditText(getNestedValue(row, fkPopup.col))
-        const pendingValue = pendingEdits?.[cellEditKey(fkPopup.rowIndex, fkPopup.col)]?.value
+        const pendingEdit = pendingEdits?.[cellEditKey(fkPopup.rowIndex, fkPopup.col)]
         const rawValue = getNestedValue(row, fkPopup.col)
         return (
           <FkLookupPopover
@@ -2501,7 +2656,7 @@ function SingleResultGrid({ result, columnTypes, dbType, editable = false, pendi
             anchor={fkPopup.anchor}
             fk={fkPopup.fk}
             target={fkTarget}
-            currentValue={pendingValue ?? (rawValue === null || rawValue === undefined ? null : original)}
+            currentValue={pendingEdit ? pendingEdit.value : (rawValue === null || rawValue === undefined ? null : original)}
             editable={editable}
             onPick={value => {
               onCellEdit?.(fkPopup.rowIndex, fkPopup.col, value === original ? undefined : value)
@@ -2512,11 +2667,20 @@ function SingleResultGrid({ result, columnTypes, dbType, editable = false, pendi
           />
         )
       })()}
+      {cellMenu && (
+        <ContextMenuAt
+          key={`${cellMenu.rowIndex}:${cellMenu.col}:${cellMenu.x}:${cellMenu.y}`}
+          x={cellMenu.x}
+          y={cellMenu.y}
+          entries={cellMenuEntries(cellMenu)}
+          onClose={() => setCellMenu(null)}
+        />
+      )}
     </div>
   )
 }
 
-function ResultsGrid({ results, running, statusBorder, columnTypes, dbType, editable, pendingEdits, onCellEdit, errorRowIndex, serverSort, foreignKeys, fkTarget, onOpenReferencedTable }: {
+function ResultsGrid({ results, running, statusBorder, columnTypes, dbType, editable, pendingEdits, onCellEdit, errorRowIndex, serverSort, foreignKeys, fkTarget, onOpenReferencedTable, table, onDeleteRow, deleteBlockedReason, onMongoEdit }: {
   results: QueryResult[]
   running: boolean
   statusBorder: 'top' | 'bottom'
@@ -2578,7 +2742,7 @@ function ResultsGrid({ results, running, statusBorder, columnTypes, dbType, edit
       </div>
     )
   } else if (result) {
-    grid = <SingleResultGrid result={result} columnTypes={columnTypes} dbType={dbType} editable={editable} pendingEdits={pendingEdits} onCellEdit={onCellEdit} errorRowIndex={errorRowIndex} serverSort={serverSort} foreignKeys={foreignKeys} fkTarget={fkTarget} onOpenReferencedTable={onOpenReferencedTable} />
+    grid = <SingleResultGrid result={result} columnTypes={columnTypes} dbType={dbType} editable={editable} pendingEdits={pendingEdits} onCellEdit={onCellEdit} errorRowIndex={errorRowIndex} serverSort={serverSort} foreignKeys={foreignKeys} fkTarget={fkTarget} onOpenReferencedTable={onOpenReferencedTable} table={table} onDeleteRow={onDeleteRow} deleteBlockedReason={deleteBlockedReason} onMongoEdit={onMongoEdit} />
   } else {
     grid = <div className="flex-1 flex items-center justify-center"><p className="text-xs text-muted-foreground">No results yet</p></div>
   }
@@ -2641,7 +2805,15 @@ interface SqlEditorHandle {
   countMatches: (query: string, caseSensitive: boolean) => number
 }
 
-function SqlEditor({ value, onChange, onRun, onOpenFind, editorRef, schema, defaultTable, defaultSchema, dialect = 'postgres', functions }: {
+function editorLanguage({ dialect, collections, ...sqlConfig }: Omit<SqlEditorLanguageConfig, 'dialect'> & { dialect: 'postgres' | 'mysql' | 'mongodb'; collections?: string[] }) {
+  return dialect === 'mongodb' ? mongoEditorLanguage(collections ?? []) : sqlEditorLanguage({ ...sqlConfig, dialect })
+}
+
+function editorPlaceholder(dialect: 'postgres' | 'mysql' | 'mongodb') {
+  return dialect === 'mongodb' ? 'Write your MongoDB query here… e.g. db.users.find({})' : 'Write your SQL query here…'
+}
+
+function SqlEditor({ value, onChange, onRun, onOpenFind, editorRef, schema, defaultTable, defaultSchema, dialect = 'postgres', functions, collections }: {
   value: string
   onChange: (v: string) => void
   onRun: () => void
@@ -2650,12 +2822,14 @@ function SqlEditor({ value, onChange, onRun, onOpenFind, editorRef, schema, defa
   schema?: SQLNamespace
   defaultTable?: string
   defaultSchema?: string
-  dialect?: 'postgres' | 'mysql'
+  dialect?: 'postgres' | 'mysql' | 'mongodb'
   functions?: FunctionInfo[]
+  collections?: string[]   // MongoDB only: suggested after `db.`
 }) {
   const containerRef = useRef<HTMLDivElement>(null)
   const viewRef = useRef<EditorView | null>(null)
   const sqlCompartmentRef = useRef(new Compartment())
+  const placeholderCompartmentRef = useRef(new Compartment())
   const onRunRef = useRef(onRun)
   const onChangeRef = useRef(onChange)
   const onOpenFindRef = useRef(onOpenFind)
@@ -2767,13 +2941,13 @@ function SqlEditor({ value, onChange, onRun, onOpenFind, editorRef, schema, defa
           ...defaultKeymap,
           ...historyKeymap,
         ]),
-        sqlCompartmentRef.current.of(sqlEditorLanguage({ dialect, schema, defaultSchema, defaultTable, functions })),
+        sqlCompartmentRef.current.of(editorLanguage({ dialect, schema, defaultSchema, defaultTable, functions, collections })),
         autocompletion({ activateOnTyping: true }),
         syntaxHighlighting(classHighlighter),
         searchHighlightField,
         searchHighlightTheme,
         quenceTheme,
-        cmPlaceholder('Write your SQL query here…'),
+        placeholderCompartmentRef.current.of(cmPlaceholder(editorPlaceholder(dialect))),
         EditorView.updateListener.of(update => {
           if (update.docChanged) onChangeRef.current(update.state.doc.toString())
         }),
@@ -2786,16 +2960,19 @@ function SqlEditor({ value, onChange, onRun, onOpenFind, editorRef, schema, defa
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Reconfigure SQL schema/dialect live when connection/database/table selection changes
+  // Reconfigure language/schema live when connection/database/table selection changes
   useEffect(() => {
     const view = viewRef.current
     if (!view) return
     view.dispatch({
-      effects: sqlCompartmentRef.current.reconfigure(
-        sqlEditorLanguage({ dialect, schema, defaultSchema, defaultTable, functions })
-      ),
+      effects: [
+        sqlCompartmentRef.current.reconfigure(
+          editorLanguage({ dialect, schema, defaultSchema, defaultTable, functions, collections })
+        ),
+        placeholderCompartmentRef.current.reconfigure(cmPlaceholder(editorPlaceholder(dialect))),
+      ],
     })
-  }, [schema, defaultTable, defaultSchema, dialect, functions])
+  }, [schema, defaultTable, defaultSchema, dialect, functions, collections])
 
   // Sync external value changes (e.g. tab switch) without re-creating editor
   useEffect(() => {
@@ -3737,7 +3914,7 @@ function QueryPane({
   onChange: (id: string, patch: Partial<QueryTab>) => void
   onSave: (tab: QueryTab) => void
   onSaveTableEdits: (tab: QueryTab) => Promise<boolean>
-  onTableSort: (tab: QueryTab, column: string) => void
+  onTableSort: (tab: QueryTab, column: string, dir?: 'asc' | 'desc' | null) => void
   onUpdateSync: (tabId: string, fn: (s: StructureSyncState) => StructureSyncState) => void
   onUpdateDataSync: (tabId: string, fn: (s: DataSyncState) => DataSyncState) => void
   onTableChanged: (connId: string, dbName: string, schema: string, table: string, change: TableChange) => void
@@ -4231,7 +4408,13 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
     const connForRun = connections.find(c => c.id === connId)
     const isMongoRun = connForRun?.dbType === 'mongodb'
 
-    // For MongoDB, send the whole text as a single JS expression (no SQL splitting)
+    const mismatch = queryLanguageMismatch(connForRun?.dbType, sqlToRun)
+    if (mismatch) {
+      onChange(tab.id, { results: [{ fields: [], rows: [], rowCount: null, ms: 0, error: mismatch, statement: sqlToRun }], connectionId: connId, dbType: connForRun?.dbType })
+      return
+    }
+
+    // For MongoDB, send the whole text as one shell script (no SQL splitting)
     const statements = isMongoRun ? [sqlToRun] : splitSqlStatements(sqlToRun)
 
     onChange(tab.id, { running: true, results: [], connectionId: connId, dbType: connForRun?.dbType })
@@ -4270,11 +4453,21 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
     const connId = tab.connectionId ?? connections.find(c => c.status === 'connected')?.id
     if (!connId) return
 
-    const explainStmt = `EXPLAIN (ANALYZE, COSTS, VERBOSE, BUFFERS) ${sqlToRun};`
+    const dbType = connections.find(c => c.id === connId)?.dbType
+    const mismatch = queryLanguageMismatch(dbType, sqlToRun)
+    if (mismatch) {
+      onChange(tab.id, { results: [{ fields: [], rows: [], rowCount: null, ms: 0, error: mismatch, statement: sqlToRun }], connectionId: connId })
+      return
+    }
+
+    const isMongo = dbType === 'mongodb'
+    const explainStmt = isMongo
+      ? `${sqlToRun.replace(/;\s*$/, '')}.explain("executionStats")`
+      : `EXPLAIN (ANALYZE, COSTS, VERBOSE, BUFFERS) ${sqlToRun};`
     onChange(tab.id, { running: true, results: [], connectionId: connId })
 
     let res = await dbIpc(connId).query(connId, explainStmt, tab.databaseName ?? undefined)
-    if (!res.ok) {
+    if (!res.ok && !isMongo) {
       const fallbackStmt = `EXPLAIN ${sqlToRun};`
       res = await dbIpc(connId).query(connId, fallbackStmt, tab.databaseName ?? undefined)
     }
@@ -4361,7 +4554,7 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
   const pendingEditsRef = useRef(tab.pendingEdits)
   useEffect(() => { pendingEditsRef.current = tab.pendingEdits }, [tab.pendingEdits])
 
-  const handleCellEdit = useCallback((rowIndex: number, col: string, value: string | undefined) => {
+  const handleCellEdit = useCallback((rowIndex: number, col: string, value: string | null | undefined) => {
     const next = { ...pendingEditsRef.current }
     const key = cellEditKey(rowIndex, col)
     if (value === undefined) delete next[key]
@@ -4374,6 +4567,55 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
     if (tab.savingEdits || Object.keys(pendingEditsRef.current ?? {}).length === 0) return
     onSaveTableEdits({ ...tab, pendingEdits: pendingEditsRef.current })
   }, [tab, onSaveTableEdits])
+
+  const [rowToDelete, setRowToDelete] = useState<{ rowIndex: number } | null>(null)
+
+  // Deletes a row (SQL, by primary key) or document (MongoDB, by _id), then reloads the page
+  const deleteTableRow = useCallback(async (rowIndex: number) => {
+    setRowToDelete(null)
+    const connId = tab.connectionId
+    const row = tab.results[0]?.rows[rowIndex]
+    if (!connId || !tab.schemaName || !tab.tableName || !row) return
+    const dbType = getTabDbType(tab, connections)
+    let res
+    try {
+      if (dbType === 'mongodb') {
+        const script = buildMongoCellScript(tab.tableName, row._id, tab.results[0]?.types?.[rowIndex]?._id, { kind: 'deleteDocument' })
+        res = await dbIpc(connId).query(connId, script, tab.databaseName ?? undefined)
+      } else {
+        const del = buildRowDelete(dbType, tab.schemaName, tab.tableName, tab.primaryKeys ?? [], row)
+        res = await dbIpc(connId).query(connId, del.sql, tab.databaseName ?? undefined, del.params)
+      }
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : String(err))
+      return
+    }
+    if (!res.ok) { toast.error(`Delete failed: ${res.error}`); return }
+    const deleted = dbType === 'mongodb' ? Number(res.rows?.[0]?.deletedCount ?? 0) : (res.rowCount ?? 0)
+    if (deleted === 0) toast.error('Nothing was deleted: the row may have already been changed or deleted')
+    else toast.success(dbType === 'mongodb' ? 'Document deleted' : 'Record deleted')
+    onPageChange({ ...tab, totalRows: undefined }, tab.page ?? 0)
+  }, [tab, connections, dbIpc, onPageChange])
+
+  // MongoDB cell actions apply right away (collections have no pending-edit mode), then reload
+  const applyMongoEdit = useCallback(async (rowIndex: number, edit: MongoCellEdit) => {
+    const connId = tab.connectionId
+    const result = tab.results[0]
+    const row = result?.rows[rowIndex]
+    if (!connId || !tab.tableName || !row || edit.kind === 'deleteDocument') return
+    const types = result.types?.[rowIndex] ?? {}
+    let script: string
+    try {
+      script = buildMongoCellScript(tab.tableName, row._id, types._id, edit, getNestedValue(row, edit.col), types[edit.col])
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : String(err))
+      return
+    }
+    const res = await dbIpc(connId).query(connId, script, tab.databaseName ?? undefined)
+    if (!res.ok) { toast.error(`Update failed: ${res.error}`); return }
+    if (Number(res.rows?.[0]?.matchedCount ?? 0) === 0) toast.error('Document not found: it may have been changed or deleted')
+    onPageChange(tab, tab.page ?? 0)
+  }, [tab, dbIpc, onPageChange])
 
   const discardTableEdits = useCallback(() => {
     pendingEditsRef.current = undefined
@@ -4435,7 +4677,12 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
   const availableDbs = boundConn?.databases ?? []
   const boundDb = boundConn?.databases.find(d => d.name === tab.databaseName)
   const availableSchemas = boundDb?.schemas ?? []
-  const editorDialect: 'postgres' | 'mysql' = boundConn?.dbType === 'mysql' ? 'mysql' : 'postgres'
+  const editorDialect: 'postgres' | 'mysql' | 'mongodb' = boundConn?.dbType ?? 'postgres'
+  // Memoized on the underlying state so the editor only reconfigures when the collections really change
+  const mongoCollections = useMemo(() => {
+    const conn = connections.find(c => c.id === tab.connectionId && c.status === 'connected' && c.dbType === 'mongodb')
+    return conn?.databases.find(d => d.name === tab.databaseName)?.schemas.flatMap(s => [...s.tables, ...s.views].map(t => t.name))
+  }, [connections, tab.connectionId, tab.databaseName])
   // Memoized on the underlying state so the editor only reconfigures when the schemas really change
   const completionSchemas = useMemo(() => {
     const conn = connections.find(c => c.id === tab.connectionId && c.status === 'connected' && c.dbType !== 'mongodb')
@@ -4581,15 +4828,42 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
             onOpenReferencedTable={fk => onOpenTable(tab.connectionId!, tableDbType === 'mysql' ? fk.refSchema : tab.databaseName!, fk.refSchema, fk.refTable)}
             serverSort={{
               sort: tab.tableSort,
-              onSort: column => {
+              onSort: (column, dir) => {
                 if (busy) return
                 // Re-sorting reloads the rows, which would drop pending edits
                 if (hasEdits) { toast.error('Save or discard your changes before sorting'); return }
-                onTableSort(tab, column)
+                onTableSort(tab, column, dir)
               },
             }}
+            table={tab.schemaName && tab.tableName ? { schema: tab.schemaName, name: tab.tableName, primaryKeys: tab.primaryKeys ?? [] } : undefined}
+            onDeleteRow={rowIndex => setRowToDelete({ rowIndex })}
+            deleteBlockedReason={busy ? 'busy' : hasEdits ? 'save changes first' : undefined}
+            onMongoEdit={tableDbType === 'mongodb' ? (rowIndex, edit) => {
+              if (busy) return
+              if (edit.kind === 'deleteDocument') setRowToDelete({ rowIndex })
+              else applyMongoEdit(rowIndex, edit)
+            } : undefined}
           />
         </div>
+        <AlertDialog open={!!rowToDelete} onOpenChange={open => { if (!open) setRowToDelete(null) }}>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>{tableDbType === 'mongodb' ? 'Delete document?' : 'Delete record?'}</AlertDialogTitle>
+              <AlertDialogDescription>
+                {rowToDelete && describeRowForDelete(tab, tableDbType, rowToDelete.rowIndex)} This can&apos;t be undone.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>Cancel</AlertDialogCancel>
+              <AlertDialogAction
+                className="bg-destructive text-white hover:bg-destructive/90"
+                onClick={() => { if (rowToDelete) deleteTableRow(rowToDelete.rowIndex) }}
+              >
+                Delete
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
         <div className="flex items-center gap-2 px-3 h-8 border-t border-border bg-card shrink-0">
           <button
             onClick={discardTableEdits}
@@ -5827,21 +6101,23 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
             <button
               onClick={explainQuery}
               disabled={tab.running || !tab.sql.trim()}
-              title="Run EXPLAIN ANALYZE on the current query"
+              title={boundConn?.dbType === 'mongodb' ? 'Explain the current query (executionStats)' : 'Run EXPLAIN ANALYZE on the current query'}
               className="flex items-center gap-1 px-2 h-5 rounded border border-border text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-accent/20 transition-colors disabled:opacity-40"
             >
               <Sparkles className="h-3 w-3 text-amber-400" />
               Explain
             </button>
-            <button
-              onClick={beautifyQuery}
-              disabled={!tab.sql.trim()}
-              title="Format and beautify the SQL query"
-              className="flex items-center gap-1 px-2 h-5 rounded border border-border text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-accent/20 transition-colors disabled:opacity-40"
-            >
-              <Braces className="h-3 w-3 text-violet-400" />
-              Beautify
-            </button>
+            {boundConn?.dbType !== 'mongodb' && (
+              <button
+                onClick={beautifyQuery}
+                disabled={!tab.sql.trim()}
+                title="Format and beautify the SQL query"
+                className="flex items-center gap-1 px-2 h-5 rounded border border-border text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-accent/20 transition-colors disabled:opacity-40"
+              >
+                <Braces className="h-3 w-3 text-violet-400" />
+                Beautify
+              </button>
+            )}
           </>
         )}
         <div className="flex items-center rounded border border-border overflow-hidden">
@@ -5891,7 +6167,7 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
             <Plug className={cn("h-3 w-3 shrink-0", tab.connectionId ? "text-green-400" : "text-muted-foreground/50")} />
             <select
               value={tab.connectionId ?? ''}
-              onChange={e => onChange(tab.id, { connectionId: e.target.value || null, databaseName: null, schemaName: undefined })}
+              onChange={e => onChange(tab.id, { connectionId: e.target.value || null, databaseName: null, schemaName: undefined, dbType: connections.find(c => c.id === e.target.value)?.dbType })}
               className="text-xs bg-background border border-border rounded px-1.5 h-5 text-muted-foreground outline-none"
             >
               <option value="">Connection…</option>
@@ -5996,6 +6272,7 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
               defaultSchema={editorDefaultSchema}
               dialect={editorDialect}
               functions={editorFunctions}
+              collections={mongoCollections}
             />
           </div>
         </ResizablePanel>
@@ -6408,6 +6685,16 @@ export function processMongoRows(rows: any[]) {
     rows: processedRows,
     fields: Array.from(keys)
   }
+}
+
+// "The row with id = 5" / "The document with _id 64b…" for delete confirmations
+function describeRowForDelete(tab: QueryTab, dbType: 'postgres' | 'mysql' | 'mongodb', rowIndex: number): string {
+  const row = tab.results[0]?.rows[rowIndex]
+  if (!row) return ''
+  const short = (v: unknown) => { const t = cellEditText(v); return t.length > 60 ? `${t.slice(0, 60)}…` : t }
+  if (dbType === 'mongodb') return `The document with _id ${short(row._id)} will be deleted from ${tab.tableName}.`
+  const keys = (tab.primaryKeys ?? []).map(pk => `${pk} = ${short(row[pk])}`).join(', ')
+  return `The row with ${keys} will be deleted from ${tab.schemaName}.${tab.tableName}.`
 }
 
 function makeTab(n: number, connectionId: string | null, databaseName: string | null = null): QueryTab {
@@ -7029,12 +7316,13 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
 
     if (isMongo) {
       const skip = page * TABLE_PAGE_SIZE
-      const findQuery = `db.${tab.tableName}.find({}).sort(${JSON.stringify(buildMongoSort(tab.tableSort))}).skip(${skip}).limit(${TABLE_PAGE_SIZE})`
-      const countQuery = `db.${tab.tableName}.countDocuments({})`
+      const collection = `db.getCollection(${JSON.stringify(tab.tableName)})`
+      const findQuery = `${collection}.find({}).sort(${JSON.stringify(buildMongoSort(tab.tableSort))}).skip(${skip}).limit(${TABLE_PAGE_SIZE})`
+      const countQuery = `${collection}.countDocuments({})`
       setTabs(prev => prev.map(t => t.id === tab.id ? { ...t, running: true, page, sql: findQuery } : t))
 
       const [res, countRes] = await Promise.all([
-        dbIpc(tab.connectionId).query(tab.connectionId, findQuery, tab.databaseName),
+        window.electronAPI!.mongodb.query(tab.connectionId, findQuery, tab.databaseName, undefined, { typed: true }),
         tab.totalRows === undefined
           ? dbIpc(tab.connectionId).query(tab.connectionId, countQuery, tab.databaseName)
           : Promise.resolve(null),
@@ -7050,7 +7338,7 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
         ...t,
         running: false,
         results: res.ok
-          ? [{ fields, rows, rowCount: res.rowCount ?? rows.length, ms: res.ms ?? 0 }]
+          ? [{ fields, rows, rowCount: res.rowCount ?? rows.length, ms: res.ms ?? 0, types: res.types }]
           : [{ fields: [], rows: [], rowCount: null, ms: 0, error: res.error }],
         totalRows: countRes?.ok
           ? Number((countRes.rows?.[0] as any)?.result ?? t.totalRows)
@@ -7079,8 +7367,12 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
         tab.totalRows === undefined
           ? dbIpc(tab.connectionId).query(tab.connectionId, `SELECT COUNT(*) AS __count FROM ${tab.schemaName}.${tab.tableName};`, tab.databaseName)
           : Promise.resolve(null),
-        tab.columnTypes === undefined
-          ? dbIpc(tab.connectionId).query(tab.connectionId, `SELECT column_name, udt_name FROM information_schema.columns WHERE table_schema = '${tab.schemaName}' AND table_name = '${tab.tableName}' ORDER BY ordinal_position;`, tab.databaseName)
+        // Refetched when missing nullability (tabs saved by older versions)
+        tab.columnTypes === undefined || tab.columnTypes.some(c => c.nullable === undefined)
+          ? dbIpc(tab.connectionId).query(tab.connectionId, isMysql
+              ? `SELECT COLUMN_NAME AS column_name, COLUMN_TYPE AS udt_name, IS_NULLABLE AS is_nullable FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION`
+              : `SELECT column_name, udt_name, is_nullable FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position`,
+              tab.databaseName, [tab.schemaName, tab.tableName])
           : Promise.resolve(null),
         tab.foreignKeyRefs === undefined
           ? dbIpc(tab.connectionId).query(tab.connectionId, FOREIGN_KEYS_SQL[isMysql ? 'mysql' : 'postgres'], tab.databaseName, [tab.schemaName, tab.tableName])
@@ -7098,7 +7390,7 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
           ? Number((countRes.rows?.[0] as any)?.__count ?? t.totalRows)
           : t.totalRows,
         columnTypes: colRes?.ok
-          ? (colRes.rows ?? []).map((r: any) => ({ name: r.column_name as string, type: r.udt_name as string }))
+          ? (colRes.rows ?? []).map((r: any) => ({ name: r.column_name as string, type: r.udt_name as string, nullable: r.is_nullable === 'YES' }))
           : t.columnTypes,
         primaryKeys: primaryKeys ?? t.primaryKeys,
         foreignKeyRefs: fkRes?.ok ? parseForeignKeys(fkRes.rows ?? []) : t.foreignKeyRefs,
@@ -7106,12 +7398,15 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
     }
   }, [dbIpc, connections])
 
-  const handleTableSort = useCallback((tab: QueryTab, column: string) => {
+  const handleTableSort = useCallback((tab: QueryTab, column: string, dir?: 'asc' | 'desc' | null) => {
     const current = tab.tableSort
-    // Same cycle as the local grid sort: ascending → descending → unsorted
-    const tableSort: TableSort | undefined = current?.column !== column
-      ? { column, dir: 'asc' }
-      : current.dir === 'asc' ? { column, dir: 'desc' } : undefined
+    // An explicit direction (from the cell menu) wins; otherwise the same cycle as the local grid
+    // sort: ascending → descending → unsorted
+    const tableSort: TableSort | undefined = dir !== undefined
+      ? (dir ? { column, dir } : undefined)
+      : current?.column !== column
+        ? { column, dir: 'asc' }
+        : current.dir === 'asc' ? { column, dir: 'desc' } : undefined
     setTabs(prev => prev.map(t => t.id === tab.id ? { ...t, tableSort } : t))
     runTableTab({ ...tab, tableSort }, 0)
   }, [runTableTab])
@@ -7552,6 +7847,7 @@ WHERE n.nspname = '${esc(schema)}' AND t.typname = '${esc(typeName)}';`
               activeId={activeTabId}
               onSelect={setActiveTabId}
               onClose={closeTab}
+              dbTypeOf={t => connections.find(c => c.id === t.connectionId)?.dbType ?? t.dbType}
             />
             {activeTab && (
               <div className="flex-1 min-h-0">

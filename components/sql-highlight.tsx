@@ -136,6 +136,10 @@ export const quenceTheme = EditorView.theme({
   // either inside or outside the syntax-highlighting span.
   '.cm-sql-table, .cm-sql-table [class*="tok-"]': { color: 'var(--db-type)', fontWeight: 'normal' },
   '.cm-sql-column, .cm-sql-column [class*="tok-"]': { color: 'var(--foreground)', fontWeight: 'normal' },
+  // MongoDB shell tokens (see lib/mongo-completion.ts), in the same palette as SQL
+  '.cm-mongo-keyword, .cm-mongo-keyword [class*="tok-"]': { color: 'var(--db-keyword)', fontWeight: 600 },
+  '.cm-mongo-type, .cm-mongo-type [class*="tok-"]': { color: 'var(--db-type)', fontWeight: 'normal' },
+  '.cm-mongo-operator, .cm-mongo-operator [class*="tok-"]': { color: 'var(--db-operator)', fontWeight: 600 },
 }, { dark: true })
 
 function tokenStyle(classes: string): React.CSSProperties | undefined {

@@ -63,7 +63,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   mongodb: {
     connect:      (opts: any) => ipcRenderer.invoke('mongodb:connect', opts),
     disconnect:   (id: string) => ipcRenderer.invoke('mongodb:disconnect', { id }),
-    query:        (id: string, sql: string, database?: string) => ipcRenderer.invoke('mongodb:query', { id, sql, database }),
+    // params is unused (signature parity with pg/mysql); typed keeps exact BSON number types
+    query:        (id: string, sql: string, database?: string, _params?: unknown[], options?: { typed?: boolean }) =>
+      ipcRenderer.invoke('mongodb:query', { id, sql, database, typed: options?.typed }),
     introspect:   (id: string) => ipcRenderer.invoke('mongodb:introspect', { id }),
     introspectDb: (id: string, database: string) => ipcRenderer.invoke('mongodb:introspect-db', { id, database }),
   },
