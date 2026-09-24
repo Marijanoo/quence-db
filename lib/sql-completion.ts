@@ -91,6 +91,212 @@ const semanticHighlighter = ViewPlugin.fromClass(class {
 
 export interface FunctionInfo { schema: string; name: string; arguments: string }
 
+// ── Go to definition (Ctrl+click) ─────────────────────────────────────────────
+// A table/view or function name in the editor resolves to the object it names in the connected
+// database; Ctrl+hover underlines it and Ctrl+click opens it.
+
+export type SqlTarget =
+  | { kind: 'table'; schema: string; name: string }
+  | { kind: 'function'; schema: string; name: string; arguments: string }
+
+export interface SqlReference { from: number; to: number; target: SqlTarget }
+
+interface SqlObjects {
+  tables: Map<string, string[]> // schema → table names
+  functions: FunctionInfo[]
+  defaultSchema?: string
+}
+
+const sqlObjectsFacet = Facet.define<SqlObjects, SqlObjects>({
+  combine: values => values[values.length - 1] ?? { tables: new Map(), functions: [] },
+})
+
+function objectsFromConfig(schema: SQLNamespace | undefined, functions: FunctionInfo[], defaultSchema: string | undefined): SqlObjects {
+  const tables = new Map<string, string[]>()
+  if (schema && typeof schema === 'object' && !Array.isArray(schema)) {
+    for (const [schemaName, t] of Object.entries(schema as Record<string, unknown>)) {
+      tables.set(schemaName, t && typeof t === 'object' && !Array.isArray(t) ? Object.keys(t) : [])
+    }
+  }
+  return { tables, functions, defaultSchema }
+}
+
+// Exact spelling wins, otherwise a case-insensitive match (unquoted names fold case)
+function findName<T>(items: T[], name: string, key: (item: T) => string, quoted: boolean): T[] {
+  const exact = items.filter(i => key(i) === name)
+  if (exact.length > 0 || quoted) return exact
+  const lower = name.toLowerCase()
+  return items.filter(i => key(i).toLowerCase() === lower)
+}
+
+function findSchema(objects: SqlObjects, name: string, quoted: boolean): string | undefined {
+  return findName([...objects.tables.keys()], name, s => s, quoted)[0]
+}
+
+// Unqualified names: the editor's schema, then public, then a schema where the name is unique
+function pickBySchema<T>(matches: T[], schemaOf: (m: T) => string, defaultSchema: string | undefined): T | undefined {
+  for (const preferred of [defaultSchema, 'public']) {
+    const hit = preferred ? matches.find(m => schemaOf(m) === preferred) : undefined
+    if (hit) return hit
+  }
+  return new Set(matches.map(schemaOf)).size === 1 ? matches[0] : undefined
+}
+
+function resolveTable(objects: SqlObjects, schema: string | undefined, name: string, quoted: boolean): SqlTarget | undefined {
+  const all = [...objects.tables.entries()].flatMap(([s, names]) => names.map(n => ({ schema: s, name: n })))
+  const matches = findName(schema ? all.filter(t => t.schema === schema) : all, name, t => t.name, quoted)
+  const hit = schema ? matches[0] : pickBySchema(matches, t => t.schema, objects.defaultSchema)
+  return hit && { kind: 'table', ...hit }
+}
+
+function resolveFunction(objects: SqlObjects, schema: string | undefined, name: string, quoted: boolean): SqlTarget | undefined {
+  const pool = schema ? objects.functions.filter(f => f.schema === schema) : objects.functions
+  const matches = findName(pool, name, f => f.name, quoted)
+  const hit = schema ? matches[0] : pickBySchema(matches, f => f.schema, objects.defaultSchema)
+  return hit && { kind: 'function', schema: hit.schema, name: hit.name, arguments: hit.arguments }
+}
+
+const WORD_CHAR = /[\w$]/
+
+// A name part around `pos`: a bare word, or a "quoted" / `quoted` identifier
+interface NamePart { from: number; to: number; name: string; quoted: boolean }
+
+function namePartAt(text: string, offset: number): NamePart | null {
+  // Quoted identifier containing the position
+  for (const q of ['"', '`']) {
+    const open = text.lastIndexOf(q, offset - 1)
+    if (open === -1) continue
+    const close = text.indexOf(q, open + 1)
+    if (close !== -1 && close >= offset && !text.slice(open + 1, close).includes('\n')) {
+      // Make sure `open` is an opening quote: an even number of quotes precede it
+      const before = text.slice(0, open).split(q).length - 1
+      if (before % 2 === 0) return { from: open, to: close + 1, name: text.slice(open + 1, close), quoted: true }
+    }
+  }
+  let from = offset, to = offset
+  while (from > 0 && WORD_CHAR.test(text[from - 1])) from--
+  while (to < text.length && WORD_CHAR.test(text[to])) to++
+  if (from === to || /^\d/.test(text.slice(from, to))) return null
+  return { from, to, name: text.slice(from, to), quoted: false }
+}
+
+// The name part directly before a "." that precedes `pos` (the qualifier of `schema.name`)
+function qualifierBefore(text: string, pos: number): NamePart | null {
+  let i = pos
+  while (i > 0 && text[i - 1] === ' ') i--
+  if (text[i - 1] !== '.') return null
+  i--
+  while (i > 0 && text[i - 1] === ' ') i--
+  if (i === 0) return null
+  return namePartAt(text, text[i - 1] === '"' || text[i - 1] === '`' ? i - 1 : i)
+}
+
+const NON_CODE_NODES = /String|Comment/
+
+export function sqlReferenceAt(state: EditorState, pos: number): SqlReference | null {
+  const objects = state.facet(sqlObjectsFacet)
+  if (objects.tables.size === 0 && objects.functions.length === 0) return null
+  const node = syntaxTree(state).resolveInner(pos, 1)
+  if (NON_CODE_NODES.test(node.name)) return null
+
+  const line = state.doc.lineAt(pos)
+  const text = line.text
+  const part = namePartAt(text, pos - line.from)
+  if (!part) return null
+  const qualifier = qualifierBefore(text, part.from)
+  const rest = text.slice(part.to)
+  const isCall = /^\s*\(/.test(rest)
+  const qualifiesSomething = /^\s*\.\s*["`\w$]/.test(rest)
+
+  let schema: string | undefined
+  if (qualifier) {
+    schema = findSchema(objects, qualifier.name, qualifier.quoted)
+    if (!schema) return null // alias.column, or a schema we don't know
+  }
+  if (!qualifier && qualifiesSomething && findSchema(objects, part.name, part.quoted)) return null // the schema in schema.table
+
+  const target = isCall
+    ? resolveFunction(objects, schema, part.name, part.quoted) ?? resolveTable(objects, schema, part.name, part.quoted)
+    : resolveTable(objects, schema, part.name, part.quoted) ?? resolveFunction(objects, schema, part.name, part.quoted)
+  if (!target) return null
+  return { from: line.from + part.from, to: line.from + part.to, target }
+}
+
+const linkMark = Decoration.mark({ class: 'cm-sql-link' })
+
+// Tracks Ctrl/Cmd and the mouse, underlines the reference under the mouse while the key is held,
+// and calls `onNavigate` on Ctrl/Cmd+click
+export function sqlNavigation(onNavigate: (target: SqlTarget) => void): Extension {
+  const plugin = ViewPlugin.fromClass(class {
+    decorations: DecorationSet = Decoration.none
+    mod = false
+    mouse: { x: number; y: number } | null = null
+    link: SqlReference | null = null
+
+    constructor(readonly view: EditorView) {
+      window.addEventListener('keydown', this.onKey)
+      window.addEventListener('keyup', this.onKey)
+      window.addEventListener('blur', this.onBlur)
+    }
+
+    onKey = (e: KeyboardEvent) => {
+      const mod = e.ctrlKey || e.metaKey
+      if (mod !== this.mod) { this.mod = mod; this.refresh() }
+    }
+    onBlur = () => { this.mod = false; this.refresh() }
+
+    refresh() {
+      let link: SqlReference | null = null
+      if (this.mod && this.mouse) {
+        const pos = this.view.posAtCoords(this.mouse)
+        if (pos !== null) {
+          const ref = sqlReferenceAt(this.view.state, pos)
+          // posAtCoords snaps to the nearest character; only link when the mouse is over the name
+          const start = ref && this.view.coordsAtPos(ref.from)
+          const end = ref && this.view.coordsAtPos(ref.to, -1)
+          if (ref && start && end && this.mouse.y >= start.top && this.mouse.y <= start.bottom
+            && (start.top !== end.top || (this.mouse.x >= start.left && this.mouse.x <= end.right))) link = ref
+        }
+      }
+      if (link?.from === this.link?.from && link?.to === this.link?.to) return
+      this.link = link
+      this.decorations = link ? Decoration.set([linkMark.range(link.from, link.to)]) : Decoration.none
+      this.view.dispatch({}) // redraw decorations
+    }
+
+    update(u: ViewUpdate) {
+      if (this.link && u.docChanged) { this.link = null; this.decorations = Decoration.none }
+    }
+
+    destroy() {
+      window.removeEventListener('keydown', this.onKey)
+      window.removeEventListener('keyup', this.onKey)
+      window.removeEventListener('blur', this.onBlur)
+    }
+  }, {
+    decorations: v => v.decorations,
+    eventHandlers: {
+      mousemove(e) {
+        this.mouse = { x: e.clientX, y: e.clientY }
+        this.mod = e.ctrlKey || e.metaKey
+        if (this.mod || this.link) this.refresh()
+      },
+      mouseleave() { this.mouse = null; if (this.link) this.refresh() },
+      mousedown(e) {
+        if (e.button !== 0 || !(e.ctrlKey || e.metaKey)) return false
+        this.mouse = { x: e.clientX, y: e.clientY }
+        this.mod = true
+        this.refresh()
+        if (!this.link) return false
+        e.preventDefault() // no cursor move or extra selection range
+        onNavigate(this.link.target)
+        return true
+      },
+    },
+  })
+  return plugin
+}
+
 const PG_BUILTINS = [
   'count', 'sum', 'avg', 'min', 'max', 'coalesce', 'nullif', 'greatest', 'least',
   'now', 'current_date', 'date_trunc', 'date_part', 'extract', 'age', 'to_char', 'to_date', 'to_timestamp', 'make_interval',
@@ -160,6 +366,7 @@ export function sqlEditorLanguage(config: SqlEditorLanguageConfig): Extension {
     }),
     dialect.language.data.of({ autocomplete: functionCompletionSource(options) }),
     sqlNamesFacet.of(namesFromNamespace(config.schema)),
+    sqlObjectsFacet.of(objectsFromConfig(config.schema, config.functions ?? [], config.defaultSchema)),
     semanticHighlighter,
   ]
 }

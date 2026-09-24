@@ -136,6 +136,8 @@ export const quenceTheme = EditorView.theme({
   // either inside or outside the syntax-highlighting span.
   '.cm-sql-table, .cm-sql-table [class*="tok-"]': { color: 'var(--db-type)', fontWeight: 'normal' },
   '.cm-sql-column, .cm-sql-column [class*="tok-"]': { color: 'var(--foreground)', fontWeight: 'normal' },
+  // Ctrl+hover on a table or function name: it opens on click
+  '.cm-sql-link, .cm-sql-link *': { textDecoration: 'underline', textUnderlineOffset: '2px', cursor: 'pointer' },
   // MongoDB shell tokens (see lib/mongo-completion.ts), in the same palette as SQL
   '.cm-mongo-keyword, .cm-mongo-keyword [class*="tok-"]': { color: 'var(--db-keyword)', fontWeight: 600 },
   '.cm-mongo-type, .cm-mongo-type [class*="tok-"]': { color: 'var(--db-type)', fontWeight: 'normal' },

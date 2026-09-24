@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, dialog } from 'electron'
+import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron'
 import { Pool, PoolClient } from 'pg'
 import { randomUUID } from 'crypto'
 import * as mysql from 'mysql2/promise'
@@ -168,6 +168,55 @@ app.on('ready', () => {
       properties: ['openFile'],
     })
     return result.canceled ? null : result.filePaths[0]
+  })
+
+  // ── Export files: save dialog + streaming writes (exports are written batch by batch) ──
+  const exportFiles = new Map<string, { handle: fs.promises.FileHandle; filePath: string }>()
+
+  ipcMain.handle('file:save-dialog', async (_e, { title, defaultName, filters }: { title?: string; defaultName?: string; filters?: { name: string; extensions: string[] }[] }) => {
+    const result = await dialog.showSaveDialog(mainWindow!, { title, defaultPath: defaultName, filters })
+    return result.canceled || !result.filePath ? null : result.filePath
+  })
+
+  ipcMain.handle('file:open-write', async (_e, { filePath }: { filePath: string }) => {
+    try {
+      const handle = await fs.promises.open(filePath, 'w')
+      const fileId = randomUUID()
+      exportFiles.set(fileId, { handle, filePath })
+      return { ok: true, fileId }
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    }
+  })
+
+  ipcMain.handle('file:write', async (_e, { fileId, text }: { fileId: string; text: string }) => {
+    const file = exportFiles.get(fileId)
+    if (!file) return { ok: false, error: 'File is not open' }
+    try {
+      await file.handle.write(text)
+      return { ok: true }
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    }
+  })
+
+  // discard: delete the partial file (a cancelled or failed export)
+  ipcMain.handle('file:close', async (_e, { fileId, discard }: { fileId: string; discard?: boolean }) => {
+    const file = exportFiles.get(fileId)
+    if (!file) return { ok: true }
+    exportFiles.delete(fileId)
+    try {
+      await file.handle.close()
+      if (discard) await fs.promises.unlink(file.filePath).catch(() => {})
+      return { ok: true }
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    }
+  })
+
+  ipcMain.handle('file:show-in-folder', (_e, { filePath }: { filePath: string }) => {
+    shell.showItemInFolder(filePath)
+    return { ok: true }
   })
 
   // ── Postgres connections ────────────────────────────────────────────────────
@@ -340,6 +389,16 @@ app.on('ready', () => {
     }
     return dbQueryPools.get(key)!
   }
+
+  // Renaming or dropping a database needs every connection to it closed, including ours. Awaited
+  // (unlike endPgPoolsFor): the caller runs the DROP/RENAME right after.
+  ipcMain.handle('pg:close-db-pool', async (_e, { id, database }: { id: string; database: string }) => {
+    const key = `${id}::${database}`
+    const pool = dbQueryPools.get(key)
+    dbQueryPools.delete(key)
+    await pool?.end().catch(() => {})
+    return { ok: true }
+  })
 
   // Applies session settings in a single round trip (set_config accepts any GUC by name)
   async function applySettings(client: PoolClient, settings: Record<string, string>, local: boolean) {

@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { Decimal128, Long, MongoClient, ObjectId, UUID } from 'mongodb'
 import { compileShellScript, preprocessShellCommands, runMongoShell, toPlain, toRows } from './mongo-shell'
-import { buildMongoCellScript, MONGO_TYPE_OPTIONS, type MongoTargetType } from '../lib/mongo-cell'
+import { buildMongoCellScript, buildMongoSetScript, MONGO_TYPE_OPTIONS, type MongoTargetType } from '../lib/mongo-cell'
 
 describe('preprocessShellCommands', () => {
   it('rewrites use and show lines and leaves everything else alone', () => {
@@ -24,6 +24,38 @@ describe('compileShellScript', () => {
 
   it('rejects SQL as invalid syntax', () => {
     expect(() => compileShellScript('SELECT * FROM users')).toThrow()
+  })
+})
+
+describe('grid edit scripts', () => {
+  it('reach updateOne with each field in its BSON type', async () => {
+    let captured: { filter: any; update: any } | undefined
+    const collection = {
+      updateOne: async (filter: unknown, update: unknown) => {
+        captured = { filter, update }
+        return { acknowledged: true, matchedCount: 1, modifiedCount: 1 }
+      },
+    }
+    const client = { db: () => ({ databaseName: 'test', collection: () => collection }) } as unknown as MongoClient
+    const script = buildMongoSetScript('posts', '64b7f0c2a1b2c3d4e5f60718', 'objectId', [
+      { col: 'title', text: 'Hi', type: 'string' },
+      { col: 'stats.views', text: '10', type: 'int' },
+      { col: 'price', text: '9.99', type: 'decimal' },
+      { col: 'publishedAt', text: '2026-09-24T10:00:00Z', type: 'date' },
+    ])
+    const res = await runMongoShell(client, 'test', script)
+
+    expect(res.rows[0]).toMatchObject({ matchedCount: 1 })
+    expect(captured!.filter._id).toBeInstanceOf(ObjectId)
+    expect(captured!.filter._id.toHexString()).toBe('64b7f0c2a1b2c3d4e5f60718')
+    const set = captured!.update.$set
+    expect(set.title).toBe('Hi')
+    expect(set['stats.views']._bsontype).toBe('Int32')
+    expect(Number(set['stats.views'])).toBe(10)
+    expect(set.price).toBeInstanceOf(Decimal128)
+    expect(set.price.toString()).toBe('9.99')
+    expect(set.publishedAt).toBeInstanceOf(Date)
+    expect(set.publishedAt.toISOString()).toBe('2026-09-24T10:00:00.000Z')
   })
 })
 

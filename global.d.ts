@@ -13,6 +13,14 @@ declare global {
       onUpdateDownloaded: (cb: () => void) => void
       installUpdate?: () => void
       cancelConnect: (id: string) => Promise<{ ok: boolean }>
+      // Writing exports: pick a path, then stream text into it
+      files?: {
+        saveDialog:   (opts: { title?: string; defaultName?: string; filters?: { name: string; extensions: string[] }[] }) => Promise<string | null>
+        openWrite:    (filePath: string) => Promise<{ ok: boolean; fileId?: string; error?: string }>
+        write:        (fileId: string, text: string) => Promise<{ ok: boolean; error?: string }>
+        close:        (fileId: string, discard?: boolean) => Promise<{ ok: boolean; error?: string }>
+        showInFolder: (filePath: string) => Promise<{ ok: boolean }>
+      }
       onRunQuery?: (cb: () => void) => void
       offRunQuery?: (cb: () => void) => void
       onCloseActiveTab?: (cb: () => void) => void
@@ -45,6 +53,8 @@ declare global {
         executeScript:  (id: string, sql: string, database?: string) => Promise<{ ok: boolean; error?: string; position?: number }>
         introspect:     (id: string) => Promise<{ ok: boolean; databases?: string[]; error?: string }>
         introspectDb:   (id: string, database: string) => Promise<{ ok: boolean; tables?: any[]; functions?: any[]; enums?: any[]; types?: any[]; columns?: any[]; error?: string }>
+        // Ends the app's own connections to one database (before it is renamed or dropped)
+        closeDbPool:    (id: string, database: string) => Promise<{ ok: boolean }>
         selectOvpnFile: () => Promise<string | null>
       }
       mysql: {

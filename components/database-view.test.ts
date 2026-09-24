@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, afterEach } from 'vitest'
 import {
   splitSqlStatements,
   buildSchemaEntries,
@@ -11,6 +11,8 @@ import {
   cellEditText,
   buildTableOrderBy,
   buildMongoSort,
+  nextTabCell,
+  refreshMongoDocuments,
 } from './database-view'
 
 describe('buildTableOrderBy', () => {
@@ -87,6 +89,41 @@ describe('buildRowSavePlans', () => {
     const [my] = buildRowSavePlans('mysql', 'db', 'users', ['id'], rows, [{ rowIndex: 0, col: 'id', value: '10' }])
     expect(my.update.params).toEqual(['10', 1])
     expect(my.reselect?.params).toEqual(['10'])
+  })
+})
+
+describe('nextTabCell', () => {
+  // 3 columns × 2 rows
+  it('moves right and wraps to the start of the next row', () => {
+    expect(nextTabCell(0, 0, 3, 2, false)).toEqual({ ri: 0, ci: 1 })
+    expect(nextTabCell(0, 2, 3, 2, false)).toEqual({ ri: 1, ci: 0 })
+    expect(nextTabCell(1, 2, 3, 2, false)).toEqual({ ri: 1, ci: 2 })
+  })
+
+  it('moves left with Shift and wraps to the end of the previous row', () => {
+    expect(nextTabCell(1, 1, 3, 2, true)).toEqual({ ri: 1, ci: 0 })
+    expect(nextTabCell(1, 0, 3, 2, true)).toEqual({ ri: 0, ci: 2 })
+    expect(nextTabCell(0, 0, 3, 2, true)).toEqual({ ri: 0, ci: 0 })
+  })
+})
+
+describe('buildRowSavePlans for new rows', () => {
+  it('inserts only the typed columns so the rest get their defaults', () => {
+    expect(buildRowSavePlans('postgres', 'public', 'users', ['id'], [], [
+      { rowIndex: 0, col: 'name', value: 'Ann' },
+      { rowIndex: 0, col: 'bio', value: null },
+    ])).toEqual([{ rowIndex: 0, insert: true, update: { sql: 'INSERT INTO "public"."users" ("name", "bio") VALUES ($1, $2) RETURNING *', params: ['Ann', null] } }])
+
+    expect(buildRowSavePlans('mysql', 'shop', 'users', ['id'], [], [{ rowIndex: 0, col: 'name', value: 'Ann' }]))
+      .toEqual([{ rowIndex: 0, insert: true, update: { sql: 'INSERT INTO `shop`.`users` (`name`) VALUES (?)', params: ['Ann'] } }])
+  })
+
+  it('saves updates to loaded rows before inserting the new row', () => {
+    const plans = buildRowSavePlans('postgres', 'public', 'users', ['id'], [{ id: 1, name: 'a' }], [
+      { rowIndex: 1, col: 'name', value: 'new' },
+      { rowIndex: 0, col: 'name', value: 'A' },
+    ])
+    expect(plans.map(p => [p.rowIndex, !!p.insert])).toEqual([[0, false], [1, true]])
   })
 })
 
@@ -294,5 +331,40 @@ describe('processMongoRows', () => {
     const result = processMongoRows([])
     expect(result.rows).toEqual([])
     expect(result.fields).toEqual([])
+  })
+})
+
+describe('refreshMongoDocuments', () => {
+  const setQuery = (query: (...args: unknown[]) => Promise<unknown>) => {
+    ;(globalThis as { window?: unknown }).window = { electronAPI: { mongodb: { query } } }
+  }
+  afterEach(() => { delete (globalThis as { window?: unknown }).window })
+
+  const result = {
+    fields: ['_id', 'title', 'views'],
+    rows: [{ _id: 'a1', title: 'one', views: 1 }, { _id: 'b2', title: 'two', views: 2 }],
+    rowCount: 2, ms: 1,
+    types: [{ _id: 'objectId', title: 'string', views: 'int' }, { _id: 'objectId', title: 'string', views: 'int' }],
+  }
+
+  it('re-reads only the edited documents by _id and patches them in place', async () => {
+    let script = ''
+    setQuery(async (_id, s) => {
+      script = s as string
+      return { ok: true, rows: [{ _id: 'b2', title: 'two', views: '2' }], types: [{ _id: 'objectId', title: 'string', views: 'string' }] }
+    })
+    const patched = await refreshMongoDocuments('c', 'db', 'posts', result, [1])
+    expect(script).toBe('db.getCollection("posts").find({ $or: [{ _id: ObjectId("b2") }] })')
+    expect(patched.rows[0]).toBe(result.rows[0])
+    expect(patched.rows[1]).toMatchObject({ views: '2' })
+    expect(patched.types?.[1].views).toBe('string')
+    expect(patched.fields).toBe(result.fields) // same identity: the grid keeps its state
+  })
+
+  it('appends fields that appear, and keeps a row whose document is gone', async () => {
+    setQuery(async () => ({ ok: true, rows: [{ _id: 'a1', title: 'one', views: 1, tags: ['x'] }], types: [{}] }))
+    const patched = await refreshMongoDocuments('c', 'db', 'posts', result, [0, 1])
+    expect(patched.fields).toEqual(['_id', 'title', 'views', 'tags'])
+    expect(patched.rows[1]).toBe(result.rows[1])
   })
 })

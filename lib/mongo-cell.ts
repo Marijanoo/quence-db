@@ -155,6 +155,47 @@ export function convertMongoValue(value: unknown, fromType: string | undefined, 
   }
 }
 
+const UUID_TEXT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+// Shell expression for text typed into a cell, keeping the field's current BSON type
+// (typing "42" into an Int32 field stores NumberInt(42), not the string "42")
+export function typedValueFromText(text: string | null, type: string | undefined): string {
+  if (text === null) return 'null'
+  switch (type) {
+    case undefined:
+    case 'string':
+    case 'null': // an empty field: store what was typed as text; "Change Type to" converts it
+      return lit(text)
+    case 'int': case 'long': case 'double': case 'decimal': case 'bool': case 'date': case 'objectId':
+      return convertMongoValue(text, 'string', type)
+    case 'array':
+    case 'object': {
+      let parsed: unknown
+      try { parsed = JSON.parse(text) } catch { return fail(text, type === 'array' ? 'Array (enter JSON)' : 'Object (enter JSON)') }
+      if (type === 'array' ? !Array.isArray(parsed) : (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))) {
+        return fail(text, type === 'array' ? 'Array (enter JSON)' : 'Object (enter JSON)')
+      }
+      return lit(parsed)
+    }
+    case 'uuid':
+      if (UUID_TEXT.test(text.trim())) return `UUID(${lit(text.trim().toLowerCase())})`
+      return fail(text, 'UUID')
+    default:
+      throw new Error(`Editing ${BSON_TYPE_LABELS[type] ?? type} values isn't supported`)
+  }
+}
+
+// One update for all edited fields of a document; dotted names set nested fields
+export function buildMongoSetScript(collection: string, id: unknown, idType: string | undefined, fields: { col: string; text: string | null; type: string | undefined }[]): string {
+  const filter = mongoIdFilter(id, idType)
+  if (!filter) throw new Error('This document\'s _id type is not supported for editing')
+  const sets = fields.map(f => {
+    if (f.col === '_id' || f.col.startsWith('_id.')) throw new Error("_id can't be changed")
+    return `${lit(f.col)}: ${typedValueFromText(f.text, f.type)}`
+  })
+  return `db.getCollection(${lit(collection)}).updateOne(${filter}, { $set: { ${sets.join(', ')} } })`
+}
+
 // Filter expression matching the document by _id, or null when its _id type can't be rebuilt
 export function mongoIdFilter(id: unknown, idType: string | undefined): string | null {
   if (id === null || id === undefined) return null

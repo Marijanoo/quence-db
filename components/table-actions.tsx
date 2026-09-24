@@ -25,7 +25,7 @@ export type TableChange =
   | { kind: 'data' }
   | { kind: 'maintenance' }
 
-interface TableRef { dbType: TableDbType; connectionId: string; database: string; schema: string; table: string }
+export interface TableRef { dbType: TableDbType; connectionId: string; database: string; schema: string; table: string }
 
 // ── IPC ───────────────────────────────────────────────────────────────────────
 
@@ -59,7 +59,7 @@ function startAction(t: TableRef, kind: TableActionKind, statements: string[], o
   return { cancellable: true, ...runInTransaction(open, statements, onCommitting) }
 }
 
-async function createStatement(t: TableRef): Promise<string> {
+export async function createStatement(t: TableRef): Promise<string> {
   if (t.dbType === 'mysql') {
     const rows = await query(t, `SHOW CREATE TABLE \`${t.schema.replace(/`/g, '``')}\`.\`${t.table.replace(/`/g, '``')}\``)
     return String(rows[0]?.['Create Table'] ?? '') + ';'
@@ -95,9 +95,12 @@ const SPECS: Record<TableActionKind, ActionSpec> = {
   optimize: { title: 'Optimize table', description: 'Rebuilds the table and its indexes to reclaim space. The table may be locked while it runs.' },
 }
 
-function ActionDialog({ kind, target, onClose, onDone }: {
+export const tableActionTitle = (kind: TableActionKind) => SPECS[kind].title
+
+export function ActionDialog({ kind, target, initialOptions, onClose, onDone }: {
   kind: TableActionKind
   target: TableRef
+  initialOptions?: TableActionOptions   // e.g. Duplicate ▸ Structure Only (withData: false)
   onClose: () => void
   onDone: (change: TableChange) => void
 }) {
@@ -106,6 +109,7 @@ function ActionDialog({ kind, target, onClose, onDone }: {
   const [opts, setOpts] = useState<TableActionOptions>(() => ({
     newName: kind === 'rename' ? target.table : kind === 'duplicate' ? `${target.table}_copy` : undefined,
     withData: kind === 'duplicate' ? true : undefined,
+    ...initialOptions,
   }))
   const [columns, setColumns] = useState<TableColumnInfo[] | null>(null)
   const [confirmText, setConfirmText] = useState('')

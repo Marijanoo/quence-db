@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { buildMongoCellScript, convertMongoValue, mongoIdFilter, typedLiteral } from './mongo-cell'
+import { buildMongoCellScript, buildMongoSetScript, convertMongoValue, mongoIdFilter, typedLiteral, typedValueFromText } from './mongo-cell'
 
 describe('convertMongoValue', () => {
   it.each([
@@ -76,5 +76,46 @@ describe('buildMongoCellScript', () => {
 
   it('refuses documents whose _id cannot be matched', () => {
     expect(() => buildMongoCellScript('c', 'AAAA', 'binData', { kind: 'deleteDocument' })).toThrow(/_id type/)
+  })
+})
+
+describe('typedValueFromText', () => {
+  it("keeps the field's BSON type", () => {
+    expect(typedValueFromText('hello', 'string')).toBe('"hello"')
+    expect(typedValueFromText('42', 'int')).toBe('NumberInt(42)')
+    expect(typedValueFromText('9007199254740993', 'long')).toBe('NumberLong("9007199254740993")')
+    expect(typedValueFromText('1.5', 'double')).toBe('new Double(1.5)')
+    expect(typedValueFromText('0.10', 'decimal')).toBe('NumberDecimal("0.10")')
+    expect(typedValueFromText('yes', 'bool')).toBe('true')
+    expect(typedValueFromText('2026-09-24T10:00:00Z', 'date')).toBe('ISODate("2026-09-24T10:00:00.000Z")')
+    expect(typedValueFromText('64b7f0c2a1b2c3d4e5f60718', 'objectId')).toBe('ObjectId("64b7f0c2a1b2c3d4e5f60718")')
+    expect(typedValueFromText('[1, "a"]', 'array')).toBe('[1,"a"]')
+    expect(typedValueFromText('{"a": 1}', 'object')).toBe('{"a":1}')
+    expect(typedValueFromText(null, 'int')).toBe('null')
+  })
+
+  it('stores text for missing or null fields', () => {
+    expect(typedValueFromText('5', undefined)).toBe('"5"')
+    expect(typedValueFromText('5', 'null')).toBe('"5"')
+  })
+
+  it('rejects text that does not fit the type', () => {
+    expect(() => typedValueFromText('abc', 'int')).toThrow(/Can't convert abc to Int32/)
+    expect(() => typedValueFromText('{"a":1}', 'array')).toThrow(/Array \(enter JSON\)/)
+    expect(() => typedValueFromText('not-a-uuid', 'uuid')).toThrow(/UUID/)
+    expect(() => typedValueFromText('x', 'binData')).toThrow(/Editing Binary values isn't supported/)
+  })
+})
+
+describe('buildMongoSetScript', () => {
+  it('sets every edited field of one document by its _id', () => {
+    expect(buildMongoSetScript('posts', '64b7f0c2a1b2c3d4e5f60718', 'objectId', [
+      { col: 'title', text: 'Hi', type: 'string' },
+      { col: 'stats.views', text: '10', type: 'int' },
+    ])).toBe('db.getCollection("posts").updateOne({ _id: ObjectId("64b7f0c2a1b2c3d4e5f60718") }, { $set: { "title": "Hi", "stats.views": NumberInt(10) } })')
+  })
+
+  it('refuses to change _id', () => {
+    expect(() => buildMongoSetScript('posts', 1, 'int', [{ col: '_id', text: '2', type: 'int' }])).toThrow(/_id can't be changed/)
   })
 })

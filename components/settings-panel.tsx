@@ -34,7 +34,25 @@ interface Settings {
   dbType:      OklchColor
   dbComment:   OklchColor
   dbOperator:  OklchColor
+  // Cell tints for "highlight by data type" in result grids
+  hlString:    OklchColor
+  hlNumber:    OklchColor
+  hlDatetime:  OklchColor
+  hlBoolean:   OklchColor
+  hlJson:      OklchColor
+  hlUuid:      OklchColor
+  hlBinary:    OklchColor
 }
+
+const HIGHLIGHT_SETTINGS = [
+  ['hlString', '--hl-string', 'Text'],
+  ['hlNumber', '--hl-number', 'Numbers'],
+  ['hlDatetime', '--hl-datetime', 'Dates & times'],
+  ['hlBoolean', '--hl-boolean', 'Booleans'],
+  ['hlJson', '--hl-json', 'JSON & arrays'],
+  ['hlUuid', '--hl-uuid', 'UUIDs'],
+  ['hlBinary', '--hl-binary', 'Binary'],
+] as const
 
 export const DEFAULTS: Settings = {
   accent:      { l: 0.68, c: 0.20, h: 258 },
@@ -50,6 +68,13 @@ export const DEFAULTS: Settings = {
   dbType:      { l: 0.90, c: 0.10, h: 100 },
   dbComment:   { l: 0.55, c: 0.01, h: 282 },
   dbOperator:  { l: 0.75, c: 0.08, h: 282 },
+  hlString:    { l: 0.72, c: 0.16, h: 350 },
+  hlNumber:    { l: 0.72, c: 0.13, h: 240 },
+  hlDatetime:  { l: 0.80, c: 0.13, h: 80 },
+  hlBoolean:   { l: 0.75, c: 0.15, h: 150 },
+  hlJson:      { l: 0.70, c: 0.15, h: 300 },
+  hlUuid:      { l: 0.76, c: 0.11, h: 195 },
+  hlBinary:    { l: 0.65, c: 0.02, h: 280 },
 }
 
 const STORAGE_KEY = 'quence-db-theme'
@@ -77,6 +102,7 @@ function clampSettings(s: Settings): Settings {
     dbType:      clampColor(s.dbType),
     dbComment:   clampColor(s.dbComment),
     dbOperator:  clampColor(s.dbOperator),
+    ...Object.fromEntries(HIGHLIGHT_SETTINGS.map(([key]) => [key, clampColor(s[key])])) as Pick<Settings, typeof HIGHLIGHT_SETTINGS[number][0]>,
   }
 }
 
@@ -124,6 +150,7 @@ export function applySettings(s: Settings) {
   setRaw('--db-type',     fmt(s.dbType))
   setRaw('--db-comment',  fmt(s.dbComment))
   setRaw('--db-operator', fmt(s.dbOperator))
+  for (const [key, cssVar] of HIGHLIGHT_SETTINGS) setRaw(cssVar, fmt(s[key]))
 }
 
 // ── Sub-components ──────────────────────────────────────────────────────────
@@ -323,6 +350,28 @@ export function SettingsPanel({ open, onClose }: Props) {
               onChange={c => update(prev => ({ ...prev, dbComment: c }))} />
             <Swatch color={s.dbComment} />
           </div>
+        </section>
+
+        <div className="border-t border-border" />
+
+        {/* Grid highlights */}
+        <section className="space-y-4">
+          <p className="text-[11px] font-semibold uppercase tracking-widest text-muted-foreground">Data Type Highlights</p>
+          <p className="text-[11px] text-muted-foreground">
+            Cell tints for <span className="text-foreground">Highlight</span> in the table toolbar, where you pick which types are shown.
+          </p>
+          <div className="grid grid-cols-2 gap-1.5">
+            {HIGHLIGHT_SETTINGS.map(([key, , label]) => (
+              <div key={key} className="px-2 py-1 rounded-sm text-[11px] font-mono truncate border border-border/50"
+                style={{ background: `color-mix(in oklch, ${fmt(s[key])} 22%, transparent)` }}>
+                {label}
+              </div>
+            ))}
+          </div>
+          {HIGHLIGHT_SETTINGS.map(([key, , label]) => (
+            <ColorSection key={key} label={label} color={s[key]}
+              onChange={c => update(prev => ({ ...prev, [key]: c }))} />
+          ))}
         </section>
 
       </div>

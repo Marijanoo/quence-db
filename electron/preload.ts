@@ -45,6 +45,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     executeScript:  (id: string, sql: string, database?: string) => ipcRenderer.invoke('pg:execute-script', { id, sql, database }),
     introspect:     (id: string) => ipcRenderer.invoke('pg:introspect', { id }),
     introspectDb:   (id: string, database: string) => ipcRenderer.invoke('pg:introspect-db', { id, database }),
+    closeDbPool:    (id: string, database: string) => ipcRenderer.invoke('pg:close-db-pool', { id, database }),
     selectOvpnFile: () => ipcRenderer.invoke('pg:select-ovpn-file'),
   },
 
@@ -68,6 +69,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.invoke('mongodb:query', { id, sql, database, typed: options?.typed }),
     introspect:   (id: string) => ipcRenderer.invoke('mongodb:introspect', { id }),
     introspectDb: (id: string, database: string) => ipcRenderer.invoke('mongodb:introspect-db', { id, database }),
+  },
+
+  files: {
+    saveDialog:   (opts: { title?: string; defaultName?: string; filters?: { name: string; extensions: string[] }[] }) => ipcRenderer.invoke('file:save-dialog', opts),
+    openWrite:    (filePath: string) => ipcRenderer.invoke('file:open-write', { filePath }),
+    write:        (fileId: string, text: string) => ipcRenderer.invoke('file:write', { fileId, text }),
+    close:        (fileId: string, discard?: boolean) => ipcRenderer.invoke('file:close', { fileId, discard }),
+    showInFolder: (filePath: string) => ipcRenderer.invoke('file:show-in-folder', { filePath }),
   },
 
   cancelConnect: (id: string) => ipcRenderer.invoke('db:cancel-connect', { id }),
