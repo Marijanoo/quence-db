@@ -11,7 +11,7 @@ import {
   Plus, Play, PlugZap, FileCode2, RefreshCw, X, FileText, Loader2, View, Pencil, Save, FileCode, Search, Plug,
   Circle, Wrench, Check, Workflow, Key, Minus, Download, Sparkles, Braces, Clock, AlignLeft, AlignCenter, AlignRight, Shield, Tag, Shapes, AlertTriangle,
   GitCompareArrows, DatabaseZap, Link2, Leaf, Copy, ClipboardPaste, Trash2, ArrowUp, ArrowDown, Undo2, CircleSlash, ExternalLink, Palette, CalendarDays,
-  Blocks, FolderPlus, Eraser, Scissors, CopyPlus, Gauge, Brush, FileDown, FileOutput,
+  Blocks, FolderPlus, Eraser, Scissors, CopyPlus, Gauge, Brush, FileDown, FileOutput, FileInput, FileUp,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { StructureSyncView, initialSyncState, type StructureSyncConfig, type StructureSyncState } from '@/components/structure-sync'
@@ -41,6 +41,8 @@ import { cellDateKind, dateColumnKind, formatCellDate, parseCellDate, type DateC
 import { ActionDialog, TableActionsBar, createStatement, tableActionTitle, type TableChange, type TableRef } from '@/components/table-actions'
 import { tableActionAvailable, type TableActionKind, type TableActionOptions } from '@/lib/table-actions'
 import { ExportDialog, type ExportPreset } from '@/components/table-export'
+import { DatabaseExportDialog, MongoExportDialog, MongoImportDialog, SqlFileImportDialog } from '@/components/database-transfer'
+import { TableImportDialog } from '@/components/table-import'
 import { generateId } from '@/lib/utils'
 import { toast } from 'sonner'
 import { EditorView, keymap, placeholder as cmPlaceholder, Decoration, DecorationSet, ViewPlugin, ViewUpdate } from '@codemirror/view'
@@ -1241,6 +1243,13 @@ function ConnectionsPanel({
   }
 
   const [dbMenu, setDbMenu] = useState<{ x: number; y: number; connId: string; dbName: string } | null>(null)
+  // Database/collection export and import dialogs
+  const [transfer, setTransfer] = useState<
+    | { kind: 'dump' | 'execute'; dbType: 'postgres' | 'mysql'; connId: string; dbName: string }
+    | { kind: 'mongo-export' | 'mongo-import'; connId: string; dbName: string; collection?: string }
+    | { kind: 'table-import'; target: TableRef }
+    | null
+  >(null)
 
   const dbMenuEntries = (conn: DbConnection, db: DbDatabase): MenuEntry[] => {
     const isPg = conn.dbType === 'postgres'
@@ -1264,6 +1273,14 @@ function ConnectionsPanel({
         { label: 'New Schema…', icon: <FolderPlus className="h-3.5 w-3.5" />, onSelect: act('schema') },
       ] satisfies MenuEntry[] : []),
       { label: 'New Query', icon: <FileCode className="h-3.5 w-3.5" />, onSelect: () => onNewQueryFor(conn.id, db.name) },
+      sep,
+      ...(conn.dbType === 'mongodb' ? [
+        { label: 'Export Database…', icon: <FileOutput className="h-3.5 w-3.5" />, onSelect: () => setTransfer({ kind: 'mongo-export', connId: conn.id, dbName: db.name }) },
+        { label: 'Import…', icon: <FileInput className="h-3.5 w-3.5" />, onSelect: () => setTransfer({ kind: 'mongo-import', connId: conn.id, dbName: db.name }) },
+      ] satisfies MenuEntry[] : [
+        { label: 'Dump SQL File…', icon: <FileDown className="h-3.5 w-3.5" />, onSelect: () => setTransfer({ kind: 'dump', dbType: conn.dbType as 'postgres' | 'mysql', connId: conn.id, dbName: db.name }) },
+        { label: 'Execute SQL File…', icon: <FileUp className="h-3.5 w-3.5" />, onSelect: () => setTransfer({ kind: 'execute', dbType: conn.dbType as 'postgres' | 'mysql', connId: conn.id, dbName: db.name }) },
+      ] satisfies MenuEntry[]),
       sep,
       ...(isPg ? [{
         label: 'Maintain', icon: <Wrench className="h-3.5 w-3.5" />, submenu: maintenance.map((kind): MenuEntry => ({
@@ -1293,6 +1310,14 @@ function ConnectionsPanel({
     const refresh: MenuEntry = { label: 'Refresh', icon: <RefreshCw className="h-3.5 w-3.5" />, onSelect: () => onRefreshDb(conn.id, dbName) }
     const open: MenuEntry = { label: m.isView ? 'Open View' : conn.dbType === 'mongodb' ? 'Open Collection' : 'Open Table', icon: <Table2 className="h-3.5 w-3.5" />, onSelect: () => onOpenTable(conn.id, dbName, schema, table) }
     const copyName: MenuEntry = { label: 'Copy Name', icon: <Copy className="h-3.5 w-3.5" />, onSelect: () => copy(table, 'name') }
+    if (conn.dbType === 'mongodb' && !m.isView) {
+      return [
+        open, sep,
+        { label: 'Export Collection…', icon: <FileOutput className="h-3.5 w-3.5" />, onSelect: () => setTransfer({ kind: 'mongo-export', connId: conn.id, dbName, collection: table }) },
+        { label: 'Import Documents…', icon: <FileInput className="h-3.5 w-3.5" />, onSelect: () => setTransfer({ kind: 'mongo-import', connId: conn.id, dbName, collection: table }) },
+        sep, copyName, sep, refresh,
+      ]
+    }
     if (conn.dbType === 'mongodb' || m.isView) return [open, sep, copyName, sep, refresh]
 
     const dbType = conn.dbType
@@ -1319,6 +1344,7 @@ function ConnectionsPanel({
         ],
       },
       sep,
+      { label: 'Import Wizard…', icon: <FileInput className="h-3.5 w-3.5" />, onSelect: () => setTransfer({ kind: 'table-import', target }) },
       { label: 'Export Wizard…', icon: <FileOutput className="h-3.5 w-3.5" />, onSelect: () => setExportDialog({ target }) },
       sep,
       {
@@ -2042,6 +2068,23 @@ function ConnectionsPanel({
       })()}
       {exportDialog && (
         <ExportDialog target={exportDialog.target} preset={exportDialog.preset} onClose={() => setExportDialog(null)} />
+      )}
+      {transfer?.kind === 'dump' && (
+        <DatabaseExportDialog target={{ dbType: transfer.dbType, connectionId: transfer.connId, database: transfer.dbName }} onClose={() => setTransfer(null)} />
+      )}
+      {transfer?.kind === 'execute' && (
+        <SqlFileImportDialog target={{ dbType: transfer.dbType, connectionId: transfer.connId, database: transfer.dbName }}
+          onClose={() => setTransfer(null)} onDone={() => onRefreshDb(transfer.connId, transfer.dbName)} />
+      )}
+      {transfer?.kind === 'mongo-export' && (
+        <MongoExportDialog connectionId={transfer.connId} database={transfer.dbName} only={transfer.collection} onClose={() => setTransfer(null)} />
+      )}
+      {transfer?.kind === 'mongo-import' && (
+        <MongoImportDialog connectionId={transfer.connId} database={transfer.dbName} collection={transfer.collection}
+          onClose={() => setTransfer(null)} onDone={() => onRefreshDb(transfer.connId, transfer.dbName)} />
+      )}
+      {transfer?.kind === 'table-import' && (
+        <TableImportDialog target={transfer.target} onClose={() => setTransfer(null)} />
       )}
       {tableDialog && (
         <ActionDialog

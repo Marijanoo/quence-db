@@ -14,6 +14,11 @@ import {
   dbGetSavedQueries, dbCreateSavedQuery, dbUpdateSavedQuery, dbDeleteSavedQuery,
 } from './sqlite-db'
 import { runMongoShell } from './mongo-shell'
+import {
+  closeExportCursor, createIndexesFromMetadata, importDocuments, listCollectionsForExport, openExportCursor,
+  prepareCollection, readExportCursor,
+} from './mongo-transfer'
+import { StringDecoder } from 'string_decoder'
 
 const isProd = app.isPackaged || process.env.NODE_ENV === 'production'
 
@@ -213,6 +218,72 @@ app.on('ready', () => {
       return { ok: false, error: err instanceof Error ? err.message : String(err) }
     }
   })
+
+  // ── Import files: open dialog + streaming reads (imports are read chunk by chunk) ──
+  const importFiles = new Map<string, { handle: fs.promises.FileHandle; decoder: StringDecoder; position: number; size: number }>()
+
+  ipcMain.handle('file:open-dialog', async (_e, { title, filters, directory, multiple }: {
+    title?: string; filters?: { name: string; extensions: string[] }[]; directory?: boolean; multiple?: boolean
+  }) => {
+    const result = await dialog.showOpenDialog(mainWindow!, {
+      title,
+      filters: directory ? undefined : filters,
+      properties: directory
+        ? ['openDirectory', 'createDirectory', 'promptToCreate']
+        : ['openFile', ...(multiple ? ['multiSelections' as const] : [])],
+    })
+    return result.canceled ? null : result.filePaths
+  })
+
+  ipcMain.handle('file:open-read', async (_e, { filePath }: { filePath: string }) => {
+    try {
+      const handle = await fs.promises.open(filePath, 'r')
+      const { size } = await handle.stat()
+      const fileId = randomUUID()
+      importFiles.set(fileId, { handle, decoder: new StringDecoder('utf8'), position: 0, size })
+      return { ok: true, fileId, size }
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    }
+  })
+
+  // The next chunk as text. The decoder keeps a multi-byte character split across chunks intact.
+  ipcMain.handle('file:read', async (_e, { fileId, maxBytes }: { fileId: string; maxBytes?: number }) => {
+    const file = importFiles.get(fileId)
+    if (!file) return { ok: false, error: 'File is not open' }
+    try {
+      const buffer = Buffer.alloc(Math.min(Math.max(maxBytes ?? 1 << 20, 1024), 16 << 20))
+      const { bytesRead } = await file.handle.read(buffer, 0, buffer.length, file.position)
+      file.position += bytesRead
+      const done = bytesRead === 0
+      const text = done ? file.decoder.end() : file.decoder.write(buffer.subarray(0, bytesRead))
+      return { ok: true, text, done, position: file.position, size: file.size }
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    }
+  })
+
+  ipcMain.handle('file:close-read', async (_e, { fileId }: { fileId: string }) => {
+    const file = importFiles.get(fileId)
+    importFiles.delete(fileId)
+    await file?.handle.close().catch(() => {})
+    return { ok: true }
+  })
+
+  ipcMain.handle('file:list-dir', async (_e, { dirPath }: { dirPath: string }) => {
+    try {
+      const entries = await fs.promises.readdir(dirPath, { withFileTypes: true })
+      const files = await Promise.all(entries.filter(e => e.isFile()).map(async e => ({
+        name: e.name,
+        size: (await fs.promises.stat(path.join(dirPath, e.name))).size,
+      })))
+      return { ok: true, files }
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    }
+  })
+
+  ipcMain.handle('file:join', (_e, { parts }: { parts: string[] }) => path.join(...parts))
 
   ipcMain.handle('file:show-in-folder', (_e, { filePath }: { filePath: string }) => {
     shell.showItemInFolder(filePath)
@@ -468,15 +539,16 @@ app.on('ready', () => {
     return session
   }
 
-  ipcMain.handle('pg:session-open', async (_e, { id, database, settings, readOnly }: { id: string; database?: string; settings?: Record<string, string>; readOnly?: boolean }) => {
+  // autocommit: no surrounding transaction, each statement commits on its own (SQL file imports)
+  ipcMain.handle('pg:session-open', async (_e, { id, database, settings, readOnly, autocommit }: { id: string; database?: string; settings?: Record<string, string>; readOnly?: boolean; autocommit?: boolean }) => {
     const pool = pgPoolFor(id, database)
     if (!pool) return { ok: false, error: 'Not connected' }
     let client: PoolClient | undefined
     try {
       client = await pool.connect()
       // Read-only sessions see one consistent snapshot for their whole lifetime
-      await client.query(readOnly ? 'BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY' : 'BEGIN')
-      await applySettings(client, settings ?? {}, true)
+      if (!autocommit) await client.query(readOnly ? 'BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY' : 'BEGIN')
+      await applySettings(client, settings ?? {}, !autocommit)
       const sessionId = randomUUID()
       sessions.set(sessionId, { client, pool, timer: setTimeout(() => {}, 0) })
       touchSession(sessionId)
@@ -659,14 +731,16 @@ app.on('ready', () => {
     return session
   }
 
-  ipcMain.handle('mysql:session-open', async (_e, { id, database }: { id: string; database?: string }) => {
+  ipcMain.handle('mysql:session-open', async (_e, { id, database, autocommit, consistentSnapshot }: { id: string; database?: string; autocommit?: boolean; consistentSnapshot?: boolean }) => {
     const pool = mysqlPools.get(id)
     if (!pool) return { ok: false, error: 'Not connected' }
     let conn: mysql.PoolConnection | undefined
     try {
       conn = await pool.getConnection()
       if (database) await conn.query(`USE \`${database.replace(/`/g, '``')}\``)
-      await conn.beginTransaction()
+      // A consistent snapshot makes every table of an export read as of the same moment
+      if (consistentSnapshot) await conn.query('START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY')
+      else if (!autocommit) await conn.beginTransaction()
       const sessionId = randomUUID()
       mysqlSessions.set(sessionId, { conn, pool, timer: setTimeout(() => {}, 0) })
       touchMysqlSession(sessionId)
@@ -844,6 +918,36 @@ app.on('ready', () => {
       return { ok: false, error: err instanceof Error ? err.message : String(err) }
     }
   })
+
+  // ── MongoDB database export/import (see mongo-transfer.ts) ──
+  const withMongo = <T>(id: string, fn: (client: MongoClient) => Promise<T>) => async () => {
+    const client = mongoClients.get(id)
+    if (!client) return { ok: false, error: 'Not connected' }
+    try {
+      return { ok: true, ...(await fn(client)) }
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    }
+  }
+
+  ipcMain.handle('mongodb:export-collections', (_e, { id, database }: { id: string; database: string }) =>
+    withMongo(id, async client => ({ collections: await listCollectionsForExport(client, database) }))())
+  ipcMain.handle('mongodb:export-open', (_e, { id, database, collection }: { id: string; database: string; collection: string }) =>
+    withMongo(id, async client => ({ cursorId: openExportCursor(client, database, collection) }))())
+  ipcMain.handle('mongodb:export-read', async (_e, { cursorId, limit }: { cursorId: string; limit: number }) => {
+    try { return { ok: true, ...(await readExportCursor(cursorId, limit)) } }
+    catch (err) { return { ok: false, error: err instanceof Error ? err.message : String(err) } }
+  })
+  ipcMain.handle('mongodb:export-close', async (_e, { cursorId }: { cursorId: string }) => {
+    await closeExportCursor(cursorId)
+    return { ok: true }
+  })
+  ipcMain.handle('mongodb:import-prepare', (_e, { id, database, metadata, drop }: { id: string; database: string; metadata: string; drop: boolean }) =>
+    withMongo(id, client => prepareCollection(client, database, metadata, drop))())
+  ipcMain.handle('mongodb:import-documents', (_e, { id, database, collection, documents }: { id: string; database: string; collection: string; documents: string[] }) =>
+    withMongo(id, client => importDocuments(client, database, collection, documents))())
+  ipcMain.handle('mongodb:import-indexes', (_e, { id, database, metadata }: { id: string; database: string; metadata: string }) =>
+    withMongo(id, client => createIndexesFromMetadata(client, database, metadata))())
 
   app.on('will-quit', () => {
     for (const [id] of vpnProcesses) killVpn(id)

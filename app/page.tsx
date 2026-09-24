@@ -7,7 +7,7 @@ import { DatabaseView } from '@/components/database-view'
 import { UpdateBar } from '@/components/update-bar'
 import { SettingsPanel, applySettings, DEFAULTS } from '@/components/settings-panel'
 
-const version = '0.3.1'
+const version = '0.4.0'
 
 export default function Home() {
   const [updateProgress, setUpdateProgress] = useState<number | null>(null)

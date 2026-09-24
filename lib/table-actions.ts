@@ -151,7 +151,7 @@ export const TABLE_COLUMNS_SQL: Record<TableDbType, string> = {
     WHERE a.attrelid = (quote_ident($1) || '.' || quote_ident($2))::regclass AND a.attnum > 0 AND NOT a.attisdropped
     ORDER BY a.attnum`,
   mysql: `
-    SELECT COLUMN_NAME AS name, EXTRA LIKE '%GENERATED%' AS generated, '' AS identity
+    SELECT COLUMN_NAME AS name, EXTRA LIKE '%GENERATED%' AS \`generated\`, '' AS identity
     FROM information_schema.COLUMNS
     WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
     ORDER BY ORDINAL_POSITION`,

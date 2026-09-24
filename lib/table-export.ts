@@ -41,7 +41,7 @@ export const EXPORT_COLUMNS_SQL: Record<ExportDbType, string> = {
     ORDER BY a.attnum`,
   mysql: `
     SELECT COLUMN_NAME AS name, COLUMN_TYPE AS type, DATA_TYPE AS typname, '' AS category,
-      EXTRA LIKE '%GENERATED%' AS generated, '' AS identity, EXTRA LIKE '%auto_increment%' AS serial
+      EXTRA LIKE '%GENERATED%' AS \`generated\`, '' AS identity, EXTRA LIKE '%auto_increment%' AS serial
     FROM information_schema.COLUMNS
     WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
     ORDER BY ORDINAL_POSITION`,
@@ -242,6 +242,32 @@ export class ExportCancelled extends Error {
 const toTextRow = (row: Record<string, unknown>): TextRow =>
   Object.fromEntries(Object.entries(row).map(([k, v]) => [k, v === null || v === undefined ? null : String(v)]))
 
+// Reads a SELECT from a snapshot in batches: PostgreSQL through a cursor, MySQL in LIMIT/OFFSET
+// pages (the SELECT is ordered by primary key, and the snapshot doesn't change between pages)
+export async function streamRows(
+  snapshot: ExportSnapshot, dbType: ExportDbType, select: string, batchSize: number,
+  onBatch: (rows: TextRow[], total: number) => Promise<void>, check: () => void, cursor = 'quence_export',
+): Promise<number> {
+  const batch = Math.max(1, batchSize)
+  let total = 0
+  if (dbType === 'postgres') await snapshot.query(`DECLARE ${cursor} NO SCROLL CURSOR FOR ${select}`)
+  try {
+    for (;;) {
+      check()
+      const rows = (dbType === 'postgres'
+        ? await snapshot.query(`FETCH ${batch} FROM ${cursor}`)
+        : await snapshot.query(`${select} LIMIT ${batch} OFFSET ${total}`)).map(toTextRow)
+      if (rows.length === 0) break
+      total += rows.length
+      await onBatch(rows, total)
+      if (rows.length < batch) break
+    }
+  } finally {
+    if (dbType === 'postgres') await snapshot.query(`CLOSE ${cursor}`).catch(() => {})
+  }
+  return total
+}
+
 export async function runExport(io: ExportIO, job: ExportJob, opts: {
   onProgress?: (rows: number) => void
   isCancelled?: () => boolean
@@ -285,33 +311,25 @@ export async function runExport(io: ExportIO, job: ExportJob, opts: {
   // ── Rows ──
   let total = 0
   if (withData) {
-    const batch = Math.max(1, job.batchSize ?? 2000)
     const select = exportSelectSql(dbType, schema, table, columns, primaryKey)
     const snapshot = await io.openSnapshot()
     try {
-      if (dbType === 'postgres') await snapshot.query(`DECLARE quence_export NO SCROLL CURSOR FOR ${select}`)
-      for (;;) {
-        check()
-        const rows = (dbType === 'postgres'
-          ? await snapshot.query(`FETCH ${batch} FROM quence_export`)
-          : await snapshot.query(`${select} LIMIT ${batch} OFFSET ${total}`)).map(toTextRow)
-        if (rows.length === 0) break
+      total = await streamRows(snapshot, dbType, select, job.batchSize ?? 2000, async (rows, sofar) => {
         let text = ''
         if (format.kind === 'sql') {
           text = insertStatements(dbType, table, columns, rows, format.rowsPerStatement).join('\n') + '\n'
         } else if (format.kind === 'csv') {
           text = csvLines(columns, rows, format.csv)
         } else {
+          const first = sofar === rows.length
           const items = rows.map(r => JSON.stringify(jsonObject(columns, r), null, format.layout === 'array' && format.pretty ? 2 : undefined))
           text = format.layout === 'lines'
             ? items.join('\n') + '\n'
-            : (total === 0 ? '\n' : ',\n') + items.map(i => format.pretty ? i.replace(/^/gm, '  ') : i).join(',\n')
+            : (first ? '\n' : ',\n') + items.map(i => format.pretty ? i.replace(/^/gm, '  ') : i).join(',\n')
         }
         await io.write(text)
-        total += rows.length
-        opts.onProgress?.(total)
-        if (rows.length < batch) break
-      }
+        opts.onProgress?.(sofar)
+      }, check)
     } finally {
       await snapshot.close()
     }

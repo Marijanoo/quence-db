@@ -619,7 +619,7 @@ export function defaultSelection(items: SyncItem[]): string[] {
   return items.filter(i => isSelectable(i) && i.action !== 'drop').map(i => i.key)
 }
 
-function orderedStatements(items: SyncItem[]): SyncStatement[] {
+export function orderedStatements(items: SyncItem[]): SyncStatement[] {
   const all = items.flatMap(item => item.statements)
     .map((s, seq) => ({ ...s, seq }))
     .sort((a, b) => a.phase - b.phase || a.order - b.order || a.seq - b.seq)
