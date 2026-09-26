@@ -2,7 +2,7 @@
 // and some statements are checked before they run at all (an UPDATE/DELETE without WHERE, MySQL
 // DDL that commits on its own). This file classifies statements; the query tab does the running.
 
-export type SqlDialect = 'postgres' | 'mysql'
+export type SqlDialect = 'postgres' | 'mysql' | 'sqlite'
 
 export interface StatementInfo {
   kind: 'read' | 'dml' | 'ddl' | 'other'

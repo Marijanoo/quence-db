@@ -1,6 +1,6 @@
-export type DbType = 'postgres' | 'mysql' | 'mongodb'
+export type DbType = 'postgres' | 'mysql' | 'mongodb' | 'sqlite' | 'redis'
 
-const DB_LABELS: Record<DbType, string> = { postgres: 'PostgreSQL', mysql: 'MySQL', mongodb: 'MongoDB' }
+const DB_LABELS: Record<DbType, string> = { postgres: 'PostgreSQL', mysql: 'MySQL', mongodb: 'MongoDB', sqlite: 'SQLite', redis: 'Redis' }
 
 // Statements that can only be SQL. `use` and `show` are left out: mongosh has them too.
 const SQL_START = /^(select|insert|update|delete|with|create|alter|drop|truncate|explain|grant|revoke|begin|commit|rollback|describe|desc|call|replace|merge|vacuum|analyze|copy|values|table|lock|refresh|reindex|cluster|savepoint|release)\b/i

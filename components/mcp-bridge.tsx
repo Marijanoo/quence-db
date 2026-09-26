@@ -12,7 +12,7 @@ import { buildMongoCellScript } from '@/lib/mongo-cell'
 import { cellText } from '@/lib/grid-copy'
 import { dataToolEnabled, type DataTool, type DataToolSettings } from '@/lib/mcp-data-tools'
 
-type DbType = 'postgres' | 'mysql' | 'mongodb'
+type DbType = 'postgres' | 'mysql' | 'mongodb' | 'sqlite' | 'redis'
 type Ipc = { query: (id: string, sql: string, database?: string, params?: unknown[]) => Promise<{ ok: boolean; rows?: Record<string, unknown>[]; fields?: string[]; rowCount?: number | null; ms?: number; error?: string; types?: Record<string, string>[] }> }
 
 // What the database view lends the bridge
@@ -469,7 +469,7 @@ export async function runMcpCommand(api: McpAppApi, command: string, args: Args,
       for (const { i, row } of rows) {
         const res = dbType === 'mongodb'
           ? await ipc.query(t.connectionId!, buildMongoCellScript(t.tableName!, row._id, r.types?.[i]?._id, { kind: 'deleteDocument' }), t.databaseName ?? undefined)
-          : await (() => { const d = api.buildRowDelete(dbType, t.schemaName!, t.tableName!, t.primaryKeys!, row); return ipc.query(t.connectionId!, d.sql, t.databaseName ?? undefined, d.params) })()
+          : await (() => { const d = api.buildRowDelete(dbType === 'mysql' ? 'mysql' : 'postgres', t.schemaName!, t.tableName!, t.primaryKeys!, row); return ipc.query(t.connectionId!, d.sql, t.databaseName ?? undefined, d.params) })()
         if (!res.ok) { errors.push(`row ${i}: ${res.error}`); continue }
         deleted += dbType === 'mongodb' ? Number(res.rows?.[0]?.deletedCount ?? 0) : (res.rowCount ?? 0)
       }

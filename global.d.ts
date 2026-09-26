@@ -2,6 +2,21 @@ import type { DataTool, DataToolSettings } from './lib/mcp-data-tools'
 
 export {}
 
+// A Redis key's value as electron/redis-conn.ts reads it (collections capped; `size` is the full size)
+interface RedisValue {
+  key: string
+  type: string
+  ttl: number
+  size: number
+  truncated: boolean
+  unsupported?: boolean
+  value?: string
+  fields?: { field: string; value: string }[]
+  items?: { index: number; value: string }[]
+  members?: string[] | { member: string; score: string }[]
+  entries?: { id: string; fields: Record<string, string> }[]
+}
+
 // MCP server state, as the main process reports it (see electron/main.ts)
 interface McpStatus {
   enabled: boolean
@@ -18,6 +33,7 @@ interface McpStatus {
 
 declare global {
   type McpServerStatus = McpStatus
+  type RedisKeyValue = RedisValue
   interface Window {
     electronAPI?: {
       minimize: () => void
@@ -100,6 +116,29 @@ declare global {
         sessionCancel: (sessionId: string) => Promise<{ ok: boolean; error?: string }>
         introspect:   (id: string) => Promise<{ ok: boolean; databases?: string[]; error?: string }>
         introspectDb: (id: string, database: string) => Promise<{ ok: boolean; tables?: any[]; functions?: any[]; enums?: any[]; types?: any[]; columns?: any[]; error?: string }>
+      }
+      redis: {
+        connect:    (opts: { id: string; host: string; port?: number; user?: string; password?: string; database?: string; ssl?: boolean; [key: string]: unknown }) => Promise<{ ok: boolean; cancelled?: boolean; error?: string }>
+        disconnect: (id: string) => Promise<{ ok: boolean; error?: string }>
+        databases:  (id: string) => Promise<{ ok: boolean; databases?: { index: number; keys: number }[]; error?: string }>
+        info:       (id: string) => Promise<{ ok: boolean; info?: Record<string, Record<string, string>>; error?: string }>
+        scan:       (id: string, db: number, opts: { pattern?: string; cursor?: string; count?: number; type?: string }) => Promise<{ ok: boolean; cursor?: string; keys?: { key: string; type: string; ttl: number }[]; error?: string }>
+        get:        (id: string, db: number, key: string, limit?: number) => Promise<{ ok: boolean; value?: RedisValue; error?: string }>
+        edit:       (id: string, db: number, edit: unknown) => Promise<{ ok: boolean; changed?: number; error?: string }>
+        command:    (id: string, db: number, line: string) => Promise<{ ok: boolean; reply?: unknown; ms?: number; error?: string }>
+      }
+      // SQLite: `host` is the database file; `create` makes a new one
+      sqlite: {
+        connect:      (opts: { id: string; host: string; create?: boolean; [key: string]: unknown }) => Promise<{ ok: boolean; cancelled?: boolean; error?: string }>
+        disconnect:   (id: string) => Promise<{ ok: boolean; error?: string }>
+        query:        (id: string, sql: string, database?: string, params?: unknown[]) => Promise<{ ok: boolean; rows?: Record<string, unknown>[]; fields?: string[]; rowCount?: number | null; ms?: number; error?: string }>
+        sessionOpen:  (id: string, database?: string, opts?: { autocommit?: boolean; readOnly?: boolean }) => Promise<{ ok: boolean; sessionId?: string; error?: string }>
+        sessionQuery: (sessionId: string, sql: string, params?: unknown[]) => Promise<{ ok: boolean; rows?: Record<string, unknown>[]; rowCount?: number | null; error?: string }>
+        sessionClose: (sessionId: string, commit: boolean) => Promise<{ ok: boolean; error?: string }>
+        sessionCancel: (sessionId: string) => Promise<{ ok: boolean; error?: string }>
+        introspect:   (id: string) => Promise<{ ok: boolean; databases?: string[]; error?: string }>
+        introspectDb: (id: string, database: string) => Promise<{ ok: boolean; tables?: any[]; functions?: any[]; enums?: any[]; types?: any[]; columns?: any[]; error?: string }>
+        pickFile:     (create?: boolean) => Promise<string | null>
       }
       mongodb: {
         connect:      (opts: { id: string; host: string; port: number; database: string; user: string; password: string; ssl: boolean; vpnConfigPath?: string; vpnUsername?: string; vpnPassword?: string }) => Promise<{ ok: boolean; cancelled?: boolean; error?: string }>

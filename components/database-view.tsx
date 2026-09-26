@@ -10,7 +10,7 @@ import {
   Database, Table2, FunctionSquare, ChevronRight, ChevronDown,
   Plus, Play, PlugZap, FileCode2, RefreshCw, X, FileText, Loader2, View, Pencil, Save, FileCode, Search, Plug,
   Circle, Wrench, Check, Workflow, Key, Minus, Download, Sparkles, Braces, Clock, AlignLeft, AlignCenter, AlignRight, Shield, Tag, Shapes, AlertTriangle,
-  GitCompareArrows, DatabaseZap, Link2, Leaf, Copy, ClipboardPaste, Trash2, ArrowUp, ArrowDown, Undo2, CircleSlash, ExternalLink, Palette, CalendarDays,
+  GitCompareArrows, DatabaseZap, Link2, Leaf, KeyRound, SquareTerminal, Copy, ClipboardPaste, Trash2, ArrowUp, ArrowDown, Undo2, CircleSlash, ExternalLink, Palette, CalendarDays,
   Blocks, FolderPlus, Eraser, Scissors, CopyPlus, Gauge, Brush, FileDown, FileOutput, FileInput, FileUp,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
@@ -28,6 +28,8 @@ import { quoteMixedCaseIdentifiers } from '@/lib/pg-identifiers'
 import { connectionColor, environmentInfo, parseConnectionOptions, safeRunEnabled, type ConnectionOptions } from '@/lib/connection-options'
 import { cannotRollBack, classifyStatement, mongoScriptWrites, previewWrap, PREVIEW_ROWS, PREVIEW_TOTAL_COLUMN } from '@/lib/safe-run'
 import { ConfirmHost, confirmAction } from '@/components/confirm-dialog'
+import { RedisBrowser } from '@/components/redis-browser'
+import { RedisConsole } from '@/components/redis-console'
 import { ConnectionTagFields, EnvironmentBadge } from '@/components/connection-tag-fields'
 import { buildInsertStatement, buildUpdateStatement, cellText as cellEditText, quoteIdent, rowsToTsv } from '@/lib/grid-copy'
 import { BSON_TYPE_LABELS, MONGO_TYPE_OPTIONS, buildMongoCellScript, buildMongoSetScript, mongoIdFilter, type MongoCellEdit } from '@/lib/mongo-cell'
@@ -62,7 +64,39 @@ import { autocompletion, closeBrackets, completionKeymap, closeBracketsKeymap } 
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-function getIpc(dbType: 'postgres' | 'mysql' | 'mongodb') {
+// SQL builders written for PostgreSQL or MySQL: SQLite reads PostgreSQL's quoting, NULLS LAST,
+// RETURNING and (translated by the driver) $1 placeholders
+function sqlDialectOf(dbType: 'postgres' | 'mysql' | 'sqlite' | 'redis'): 'postgres' | 'mysql' {
+  return dbType === 'mysql' ? 'mysql' : 'postgres'
+}
+
+// Redis databases are db0, db1, … (the sidebar lists them; a click opens the key browser)
+export const redisDbIndex = (name: string | null | undefined) => Number(/^db(\d+)$/.exec(name ?? '')?.[1] ?? 0)
+
+function redisIpc() {
+  const r = window.electronAPI!.redis
+  return {
+    connect: (opts: Record<string, unknown>) => r.connect(opts as never),
+    disconnect: (id: string) => r.disconnect(id),
+    introspect: async (id: string) => {
+      const res = await r.databases(id)
+      if (!res.ok) return { ok: false as const, error: res.error, databases: undefined }
+      // Databases with keys, and db0 even when empty
+      return { ok: true as const, databases: (res.databases ?? []).filter(d => d.keys > 0 || d.index === 0).map(d => `db${d.index}`) }
+    },
+    introspectDb: async () => ({ ok: true as const, tables: [], columns: [], functions: [], enums: [], types: [] }),
+    query: async (id: string, line: string, database?: string) => {
+      const res = await r.command(id, redisDbIndex(database), line)
+      return res.ok
+        ? { ok: true as const, rows: [{ reply: res.reply }], fields: ['reply'], rowCount: 1, ms: res.ms ?? 0 }
+        : { ok: false as const, error: res.error }
+    },
+  }
+}
+
+function getIpc(dbType: 'postgres' | 'mysql' | 'mongodb' | 'sqlite' | 'redis') {
+  if (dbType === 'redis') return redisIpc() as unknown as NonNullable<Window['electronAPI']>['sqlite']
+  if (dbType === 'sqlite') return window.electronAPI!.sqlite
   if (dbType === 'mongodb') return window.electronAPI!.mongodb
   if (dbType === 'mysql') return window.electronAPI!.mysql
   return window.electronAPI!.pg
@@ -70,7 +104,7 @@ function getIpc(dbType: 'postgres' | 'mysql' | 'mongodb') {
 
 export interface DbConnection {
   id: string
-  dbType: 'postgres' | 'mysql' | 'mongodb'
+  dbType: 'postgres' | 'mysql' | 'mongodb' | 'sqlite' | 'redis'
   label: string   // user-defined display name
   name: string    // auto-generated "host:port / db"
   host: string
@@ -250,7 +284,7 @@ interface ErdRelation {
 
 export interface QueryTab {
   id: string
-  kind: 'query' | 'table' | 'design' | 'erd' | 'create-table' | 'create-view' | 'structure-sync' | 'data-sync'
+  kind: 'query' | 'table' | 'design' | 'erd' | 'create-table' | 'create-view' | 'structure-sync' | 'data-sync' | 'redis-browser' | 'redis-console'
   title: string
   sql: string
   results: QueryResult[]
@@ -259,7 +293,7 @@ export interface QueryTab {
   databaseName: string | null
   schemaName?: string
   tableName?: string
-  dbType?: 'postgres' | 'mysql' | 'mongodb'
+  dbType?: 'postgres' | 'mysql' | 'mongodb' | 'sqlite' | 'redis'
   page?: number
   pageSize?: number
   totalRows?: number
@@ -297,7 +331,7 @@ export interface QueryTab {
   focusCell?: { row: number; col: string; nonce: number }
 
   // Safe Run: changes made in this open transaction, waiting for Commit or Roll back
-  safeRun?: { sessionId: string; dialect: 'postgres' | 'mysql'; changes: { verb: string; table?: string; rows: number | null }[]; startedAt: number }
+  safeRun?: { sessionId: string; dialect: 'postgres' | 'mysql' | 'sqlite'; changes: { verb: string; table?: string; rows: number | null }[]; startedAt: number }
   tableSort?: TableSort
 
   sync?: StructureSyncState
@@ -498,7 +532,7 @@ function connectionBaseDb(conn: DbConnection) {
 }
 type DbKind = DbConnection['dbType']
 
-const DEFAULT_PORTS: Record<DbKind, number> = { postgres: 5432, mysql: 3306, mongodb: 27017 }
+const DEFAULT_PORTS: Record<DbKind, number> = { postgres: 5432, mysql: 3306, mongodb: 27017, sqlite: 0, redis: 6379 }
 
 interface NewConnectionDialogProps {
   onConnect: (conn: ConnectionDraft) => Promise<void>
@@ -512,16 +546,16 @@ function vpnFileName(p: string) {
   return p.split(/[\\/]/).pop() ?? p
 }
 
-export function parseConnectionString(str: string, dbType: 'postgres' | 'mysql' | 'mongodb'): Partial<{ host: string; port: string; database: string; user: string; password: string; ssl: boolean }> {
+export function parseConnectionString(str: string, dbType: 'postgres' | 'mysql' | 'mongodb' | 'sqlite' | 'redis'): Partial<{ host: string; port: string; database: string; user: string; password: string; ssl: boolean }> {
   try {
     const url = new URL(str)
     return {
       host: url.hostname || 'localhost',
-      port: url.port || (dbType === 'mysql' ? '3306' : dbType === 'mongodb' ? '27017' : '5432'),
+      port: url.port || (dbType === 'mysql' ? '3306' : dbType === 'mongodb' ? '27017' : dbType === 'redis' ? '6379' : '5432'),
       database: url.pathname.replace(/^\//, '') || '',
       user: url.username ? decodeURIComponent(url.username) : '',
       password: url.password ? decodeURIComponent(url.password) : '',
-      ssl: url.searchParams.get('sslmode') === 'require' || url.searchParams.get('ssl') === 'true',
+      ssl: url.protocol === 'rediss:' || url.searchParams.get('sslmode') === 'require' || url.searchParams.get('ssl') === 'true',
     }
   } catch {
     return {}
@@ -531,6 +565,14 @@ export function parseConnectionString(str: string, dbType: 'postgres' | 'mysql' 
 // The inverse of parseConnectionString: assembles a pastable URL from the dialog's fields.
 // A saved connection as a URL (MongoDB connections already store theirs)
 export function connectionStringOf(conn: Pick<DbConnection, 'dbType' | 'host' | 'port' | 'database' | 'user' | 'password' | 'ssl'>, withPassword: boolean): string {
+  if (conn.dbType === 'sqlite') return conn.host
+  if (conn.dbType === 'redis') {
+    if (/^rediss?:\/\//i.test(conn.host)) return conn.host
+    const auth = conn.user || (withPassword && conn.password)
+      ? `${encodeURIComponent(conn.user)}${withPassword && conn.password ? `:${encodeURIComponent(conn.password)}` : ''}@`
+      : ''
+    return `${conn.ssl ? 'rediss' : 'redis'}://${auth}${conn.host}:${conn.port}${conn.database ? `/${conn.database}` : ''}`
+  }
   if (conn.dbType === 'mongodb') {
     if (withPassword) return conn.host
     try {
@@ -564,9 +606,43 @@ export function buildConnectionString(dbType: 'postgres' | 'mysql', fields: {
   return `${scheme}://${auth}${fields.host}:${fields.port}${db}${query}`
 }
 
+const fileBaseName = (p: string) => p.split(/[\\/]/).pop() || p
+
+// SQLite: a connection is a database file. New… creates the empty file right away.
+function SqliteFileField({ value, onChange }: { value: string; onChange: (path: string) => void }) {
+  const sqlite = window.electronAPI?.sqlite
+  const create = async () => {
+    const path = await sqlite?.pickFile(true)
+    if (!path) return
+    const probe = `create-${Date.now()}`
+    const res = await sqlite!.connect({ id: probe, host: path, create: true })
+    await sqlite!.disconnect(probe)
+    if (!res.ok) { toast.error(`Could not create the database: ${res.error}`); return }
+    onChange(path)
+  }
+  return (
+    <div className="space-y-1">
+      <label className="text-xs text-muted-foreground">Database file</label>
+      <div className="flex items-center gap-2">
+        <div className="flex-1 bg-background border border-border rounded px-2 py-1.5 text-xs text-muted-foreground truncate font-mono" title={value}>
+          {value || 'No file chosen'}
+        </div>
+        <button type="button" onClick={async () => { const path = await sqlite?.pickFile(false); if (path) onChange(path) }}
+          className="px-2.5 py-1.5 rounded text-xs border border-border text-muted-foreground hover:text-foreground hover:bg-accent/20 transition-colors shrink-0">
+          Open…
+        </button>
+        <button type="button" onClick={() => void create()}
+          className="px-2.5 py-1.5 rounded text-xs border border-border text-muted-foreground hover:text-foreground hover:bg-accent/20 transition-colors shrink-0">
+          New…
+        </button>
+      </div>
+    </div>
+  )
+}
+
 function NewConnectionDialog({ onConnect, onClose, initial, title = 'New Connection' }: NewConnectionDialogProps) {
   const initialType = initial?.dbType ?? 'postgres'
-  const [dbType, setDbType] = useState<'postgres' | 'mysql' | 'mongodb'>(initialType)
+  const [dbType, setDbType] = useState<'postgres' | 'mysql' | 'mongodb' | 'sqlite' | 'redis'>(initialType)
   const [connString, setConnString] = useState('')
   const [label, setLabel] = useState(initial?.label ?? '')
   const [host, setHost] = useState(initial?.host ?? (initialType === 'mongodb' ? 'mongodb://localhost:27017' : 'localhost'))
@@ -585,17 +661,21 @@ function NewConnectionDialog({ onConnect, onClose, initial, title = 'New Connect
   const [error, setError] = useState('')
 
   const defaultPort = dbType === 'mysql' ? '3306' : dbType === 'mongodb' ? '27017' : '5432'
-  const name = dbType === 'mongodb' ? (database ? `MongoDB / ${database}` : 'MongoDB') : `${host}:${port}${database ? ' / ' + database : ''}`
+  const name = dbType === 'sqlite' ? fileBaseName(host) : dbType === 'mongodb' ? (database ? `MongoDB / ${database}` : 'MongoDB') : `${host}:${port}${database ? ' / ' + database : ''}`
 
-  function switchDbType(t: 'postgres' | 'mysql' | 'mongodb') {
+  function switchDbType(t: 'postgres' | 'mysql' | 'mongodb' | 'sqlite' | 'redis') {
     setDbType(t)
     setTestResult(null)
     // Only auto-update port if it's still the default for the current type
-    setPort(prev => (prev === '5432' || prev === '3306' || prev === '27017') ? (t === 'mysql' ? '3306' : t === 'mongodb' ? '27017' : '5432') : prev)
-    if (t === 'mongodb') {
+    setPort(prev => (prev === '5432' || prev === '3306' || prev === '27017' || prev === '6379' || prev === '0') ? String(DEFAULT_PORTS[t] || 5432) : prev)
+    // host is a server name, a MongoDB URI or (SQLite) a file path
+    const isFile = (h: string) => /[\\/]|\.(db|sqlite3?|db3)$/i.test(h) && !h.startsWith('mongodb')
+    if (t === 'sqlite') {
+      setHost(prev => isFile(prev) ? prev : '')
+    } else if (t === 'mongodb') {
       setHost(prev => prev.startsWith('mongodb') ? prev : 'mongodb://localhost:27017')
     } else {
-      setHost(prev => prev.startsWith('mongodb') ? 'localhost' : prev)
+      setHost(prev => prev.startsWith('mongodb') || prev === '' || isFile(prev) ? 'localhost' : prev)
     }
   }
 
@@ -656,7 +736,7 @@ function NewConnectionDialog({ onConnect, onClose, initial, title = 'New Connect
         <form onSubmit={handleConnect} className="p-5 space-y-3">
           {/* DB type toggle */}
           <div className="flex items-center gap-1 p-0.5 bg-muted/40 rounded-md border border-border w-fit">
-            {(['postgres', 'mysql', 'mongodb'] as const).map(t => (
+            {(['postgres', 'mysql', 'mongodb', 'sqlite', 'redis'] as const).map(t => (
               <button
                 key={t} type="button" onClick={() => switchDbType(t)}
                 className={cn(
@@ -664,13 +744,13 @@ function NewConnectionDialog({ onConnect, onClose, initial, title = 'New Connect
                   dbType === t ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'
                 )}
               >
-                {t === 'postgres' ? 'PostgreSQL' : t === 'mysql' ? 'MySQL' : 'MongoDB'}
+                {t === 'postgres' ? 'PostgreSQL' : t === 'mysql' ? 'MySQL' : t === 'mongodb' ? 'MongoDB' : t === 'sqlite' ? 'SQLite' : 'Redis'}
               </button>
             ))}
           </div>
 
           {/* Connection string */}
-          <div className="space-y-1">
+          {dbType !== 'sqlite' && <div className="space-y-1">
             <label className="text-xs text-muted-foreground">
               {dbType === 'mongodb' ? 'Connection URI' : 'Connection String'} <span className="text-muted-foreground/50">{dbType === 'mongodb' ? '' : '(optional — paste to populate fields)'}</span>
             </label>
@@ -678,7 +758,7 @@ function NewConnectionDialog({ onConnect, onClose, initial, title = 'New Connect
               <input
                 value={dbType === 'mongodb' ? host : connString}
                 onChange={e => dbType === 'mongodb' ? setHost(e.target.value) : setConnString(e.target.value)}
-                placeholder={dbType === 'mysql' ? 'mysql://user:pass@host:3306/db' : dbType === 'mongodb' ? 'mongodb://localhost:27017' : 'postgresql://user:pass@host:5432/db'}
+                placeholder={dbType === 'mysql' ? 'mysql://user:pass@host:3306/db' : dbType === 'mongodb' ? 'mongodb://localhost:27017' : dbType === 'redis' ? 'redis://user:pass@host:6379/0' : 'postgresql://user:pass@host:5432/db'}
                 className={cn(inputCls, 'flex-1 font-mono text-xs')}
               />
               {dbType !== 'mongodb' && (
@@ -692,7 +772,7 @@ function NewConnectionDialog({ onConnect, onClose, initial, title = 'New Connect
                 </button>
               )}
             </div>
-          </div>
+          </div>}
 
           <div className="border-t border-border/50" />
 
@@ -703,7 +783,9 @@ function NewConnectionDialog({ onConnect, onClose, initial, title = 'New Connect
 
           <ConnectionTagFields value={options} onChange={setOptions} />
 
-          {dbType === 'mongodb' ? (
+          {dbType === 'sqlite' ? (
+            <SqliteFileField value={host} onChange={setHost} />
+          ) : dbType === 'mongodb' ? (
             <div className="space-y-1">
               <label className="text-xs text-muted-foreground">Default Database <span className="text-muted-foreground/50">(optional)</span></label>
               <input value={database} onChange={e => setDatabase(e.target.value)} placeholder="e.g. admin" className={inputCls} />
@@ -722,8 +804,8 @@ function NewConnectionDialog({ onConnect, onClose, initial, title = 'New Connect
               </div>
 
               <div className="space-y-1">
-                <label className="text-xs text-muted-foreground">Database</label>
-                <input value={database} onChange={e => setDatabase(e.target.value)} placeholder={dbType === 'mysql' ? 'my_database' : 'postgres'} className={inputCls} />
+                <label className="text-xs text-muted-foreground">{dbType === 'redis' ? 'Default database number' : 'Database'} {dbType === 'redis' && <span className="text-muted-foreground/50">(optional)</span>}</label>
+                <input value={database} onChange={e => setDatabase(e.target.value)} placeholder={dbType === 'mysql' ? 'my_database' : dbType === 'redis' ? '0' : 'postgres'} className={inputCls} />
               </div>
 
               <div className="grid grid-cols-2 gap-3">
@@ -877,7 +959,7 @@ function EditConnectionDialog({ conn, onSave, onDisconnectAndEdit, onClose }: Ed
     e.preventDefault()
     setError('')
     setLoading(true)
-    const name = conn.dbType === 'mongodb' ? (database ? `MongoDB / ${database}` : 'MongoDB') : `${host}:${port}${database ? ' / ' + database : ''}`
+    const name = conn.dbType === 'sqlite' ? fileBaseName(host) : conn.dbType === 'mongodb' ? (database ? `MongoDB / ${database}` : 'MongoDB') : `${host}:${port}${database ? ' / ' + database : ''}`
     try {
       await onSave(conn.id, { dbType: conn.dbType, label: label.trim(), name, host, port: parseInt(port) || (conn.dbType === 'mysql' ? 3306 : conn.dbType === 'mongodb' ? 27017 : 5432), database, user, password, ssl, vpnConfigPath: vpnConfigPath || undefined, vpnUsername: vpnUsername || undefined, vpnPassword: vpnPassword || undefined, options })
       onClose()
@@ -932,7 +1014,9 @@ function EditConnectionDialog({ conn, onSave, onDisconnectAndEdit, onClose }: Ed
 
             <ConnectionTagFields value={options} onChange={setOptions} />
 
-            {conn.dbType === 'mongodb' ? (
+            {conn.dbType === 'sqlite' ? (
+              <SqliteFileField value={host} onChange={setHost} />
+            ) : conn.dbType === 'mongodb' ? (
               <>
                 <div className="space-y-1">
                   <label className="text-xs text-muted-foreground">Connection URI</label>
@@ -1228,6 +1312,7 @@ function ConnectionsPanel({
   onRefresh,
   onRefreshDb,
   onOpenErd,
+  onOpenRedis,
   onDisconnect,
   onReconnect,
   onCancelConnect,
@@ -1266,6 +1351,7 @@ function ConnectionsPanel({
   onRefresh: (connId: string) => void
   onRefreshDb: (connId: string, dbName: string) => void
   onOpenErd: (connId: string, dbName: string) => void
+  onOpenRedis: (connId: string, dbName: string, kind: 'redis-browser' | 'redis-console') => void
   onDisconnect: (connId: string) => void
   onReconnect: (connId: string) => void
   onCancelConnect: (connId: string) => void
@@ -1346,6 +1432,14 @@ function ConnectionsPanel({
   >(null)
 
   const dbMenuEntries = (conn: DbConnection, db: DbDatabase): MenuEntry[] => {
+    if (conn.dbType === 'redis') {
+      return [
+        { label: 'Key Browser', icon: <KeyRound className="h-3.5 w-3.5" />, onSelect: () => onOpenRedis(conn.id, db.name, 'redis-browser') },
+        { label: 'Console', icon: <SquareTerminal className="h-3.5 w-3.5" />, onSelect: () => onOpenRedis(conn.id, db.name, 'redis-console') },
+        { kind: 'separator' },
+        { label: 'Refresh', icon: <RefreshCw className="h-3.5 w-3.5" />, onSelect: () => onRefresh(conn.id) },
+      ]
+    }
     const isPg = conn.dbType === 'postgres'
     const isBase = isPg && db.name === connectionBaseDb(conn)
     const act = (kind: 'create' | 'edit' | 'drop' | 'schema' | 'extensions') => () => onDatabaseAction({ kind, connId: conn.id, dbName: db.name })
@@ -1368,7 +1462,8 @@ function ConnectionsPanel({
       ] satisfies MenuEntry[] : []),
       { label: 'New Query', icon: <FileCode className="h-3.5 w-3.5" />, onSelect: () => onNewQueryFor(conn.id, db.name) },
       sep,
-      ...(conn.dbType === 'mongodb' ? [
+      // Dumps and SQL file imports don't support SQLite yet
+      ...(conn.dbType === 'sqlite' ? [] : conn.dbType === 'mongodb' ? [
         { label: 'Export Database…', icon: <FileOutput className="h-3.5 w-3.5" />, onSelect: () => setTransfer({ kind: 'mongo-export', connId: conn.id, dbName: db.name }) },
         { label: 'Import…', icon: <FileInput className="h-3.5 w-3.5" />, onSelect: () => setTransfer({ kind: 'mongo-import', connId: conn.id, dbName: db.name }) },
       ] satisfies MenuEntry[] : [
@@ -1383,7 +1478,7 @@ function ConnectionsPanel({
           onSelect: () => onDatabaseAction({ kind: 'maintain', connId: conn.id, dbName: db.name, maintenance: kind }),
         })),
       }] satisfies MenuEntry[] : []),
-      { label: 'View ER Diagram', icon: <Workflow className="h-3.5 w-3.5" />, onSelect: () => onOpenErd(conn.id, db.name) },
+      ...(conn.dbType === 'sqlite' ? [] : [{ label: 'View ER Diagram', icon: <Workflow className="h-3.5 w-3.5" />, onSelect: () => onOpenErd(conn.id, db.name) }] satisfies MenuEntry[]),
       sep,
       { label: 'Refresh', icon: <RefreshCw className="h-3.5 w-3.5" />, onSelect: () => onRefreshDb(conn.id, db.name) },
     ]
@@ -1413,6 +1508,20 @@ function ConnectionsPanel({
       ]
     }
     if (conn.dbType === 'mongodb' || m.isView) return [open, sep, copyName, sep, refresh]
+    if (conn.dbType === 'redis') return [refresh]
+    if (conn.dbType === 'sqlite') {
+      const sq = (s: string) => '"' + s.replace(/"/g, '""') + '"'
+      return [
+        open, sep,
+        {
+          label: 'Copy', icon: <Copy className="h-3.5 w-3.5" />, submenu: [
+            { label: 'Name', onSelect: () => copy(table, 'name') },
+            { label: 'SELECT Statement', onSelect: () => copy(`SELECT * FROM ${sq(table)};`, 'SELECT statement') },
+          ],
+        },
+        sep, refresh,
+      ]
+    }
 
     const dbType = conn.dbType
     const q = quoteIdent(dbType)
@@ -1629,7 +1738,9 @@ function ConnectionsPanel({
                 )} />
                 <span className="truncate flex-1">{conn.label || conn.name}</span>
                 <EnvironmentBadge options={conn.options} />
-                {conn.dbType === 'mysql'
+                {conn.dbType === 'sqlite'
+                  ? <span className="shrink-0 text-[9px] font-semibold px-1 rounded bg-sky-500/20 text-sky-300 leading-4">SQLite</span>
+                  : conn.dbType === 'mysql'
                   ? <span className="shrink-0 text-[9px] font-semibold px-1 rounded bg-orange-500/20 text-orange-400 leading-4">MySQL</span>
                   : conn.dbType === 'mongodb'
                   ? <span className="shrink-0 text-[9px] font-semibold px-1 rounded bg-emerald-500/20 text-emerald-400 leading-4">Mongo</span>
@@ -1669,8 +1780,8 @@ function ConnectionsPanel({
                   {/* Database row */}
                   <div
                     role="button" tabIndex={0}
-                    onClick={() => { onSelectDb(conn.id, db.name); setActiveItemKey(dbKey) }}
-                    onDoubleClick={() => onToggleDb(conn.id, db.name)}
+                    onClick={() => { onSelectDb(conn.id, db.name); setActiveItemKey(dbKey); if (conn.dbType === 'redis') onOpenRedis(conn.id, db.name, 'redis-browser') }}
+                    onDoubleClick={() => { if (conn.dbType !== 'redis') onToggleDb(conn.id, db.name) }}
                     onKeyDown={e => e.key === 'Enter' && (onSelectDb(conn.id, db.name), setActiveItemKey(dbKey))}
                     onContextMenu={e => {
                       e.preventDefault()
@@ -1684,14 +1795,20 @@ function ConnectionsPanel({
                     )}
                     style={{ paddingLeft: 16 }}
                   >
-                    <span
-                      onClick={e => { e.stopPropagation(); onToggleDb(conn.id, db.name) }}
-                      onDoubleClick={e => e.stopPropagation()}
-                      className="shrink-0 flex items-center justify-center rounded hover:bg-accent/40 transition-colors p-0.5 -m-0.5"
-                    >
-                      {db.open ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
-                    </span>
-                    <Database className="h-3.5 w-3.5 text-blue-300 shrink-0" />
+                    {conn.dbType === 'redis' ? (
+                      <KeyRound className="h-3.5 w-3.5 text-red-300 shrink-0 ml-3" />
+                    ) : (
+                      <>
+                        <span
+                          onClick={e => { e.stopPropagation(); onToggleDb(conn.id, db.name) }}
+                          onDoubleClick={e => e.stopPropagation()}
+                          className="shrink-0 flex items-center justify-center rounded hover:bg-accent/40 transition-colors p-0.5 -m-0.5"
+                        >
+                          {db.open ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+                        </span>
+                        <Database className="h-3.5 w-3.5 text-blue-300 shrink-0" />
+                      </>
+                    )}
                     <span className="truncate flex-1">{db.name}</span>
                     {db.loading && <Loader2 className="h-3 w-3 animate-spin shrink-0" />}
                     {!db.loading && db.error && (
@@ -2224,8 +2341,8 @@ function ConnectionsPanel({
 
 // ── Query tab bar ─────────────────────────────────────────────────────────────
 
-const DB_TYPE_COLORS = { postgres: 'text-blue-400', mysql: 'text-orange-400', mongodb: 'text-emerald-400' } as const
-const DB_TYPE_LABELS = { postgres: 'PostgreSQL', mysql: 'MySQL', mongodb: 'MongoDB' } as const
+const DB_TYPE_COLORS = { postgres: 'text-blue-400', mysql: 'text-orange-400', mongodb: 'text-emerald-400', sqlite: 'text-sky-300', redis: 'text-red-400' } as const
+const DB_TYPE_LABELS = { postgres: 'PostgreSQL', mysql: 'MySQL', mongodb: 'MongoDB', sqlite: 'SQLite', redis: 'Redis' } as const
 
 function QueryTabBar({
   tabs, activeId, onSelect, onClose, dbTypeOf, colorOf,
@@ -2234,7 +2351,7 @@ function QueryTabBar({
   activeId: string
   onSelect: (id: string) => void
   onClose: (id: string) => void
-  dbTypeOf: (tab: QueryTab) => 'postgres' | 'mysql' | 'mongodb' | undefined
+  dbTypeOf: (tab: QueryTab) => 'postgres' | 'mysql' | 'mongodb' | 'sqlite' | 'redis' | undefined
   colorOf?: (tab: QueryTab) => string | null
 }) {
   // Scroll the active tab into view when it changes (e.g. opening something that already has a tab)
@@ -2272,7 +2389,11 @@ function QueryTabBar({
             )}
             style={colorOf?.(tab) ? { boxShadow: `inset 0 2px 0 ${colorOf(tab)}` } : undefined}
           >
-            {tab.kind === 'table' ? (
+            {tab.kind === 'redis-browser' ? (
+              <KeyRound className={cn('h-3 w-3 shrink-0', dbColor)} />
+            ) : tab.kind === 'redis-console' ? (
+              <SquareTerminal className={cn('h-3 w-3 shrink-0', dbColor)} />
+            ) : tab.kind === 'table' ? (
               <Table2 className={cn('h-3 w-3 shrink-0', dbColor)} />
             ) : tab.kind === 'design' ? (
               <Wrench className="h-3 w-3 shrink-0 text-primary" />
@@ -2392,7 +2513,7 @@ interface GridRowProps {
   failed: boolean
   fkPopupCol: string | null
   datePopupCol: string | null
-  dbType?: 'postgres' | 'mysql' | 'mongodb'
+  dbType?: 'postgres' | 'mysql' | 'mongodb' | 'sqlite' | 'redis'
   editable: boolean
   highlightKinds: ReadonlySet<string>
   columnTypeByName: Map<string, string>
@@ -2572,7 +2693,7 @@ const GridRow = React.memo(function GridRow({
   )
 }, gridRowPropsEqual)
 
-function SingleResultGrid({ result, columnTypes, dbType, editable = false, pendingEdits, onCellEdit, errorRowIndex, serverSort, foreignKeys, fkTarget, onOpenReferencedTable, table, onDeleteRow, deleteBlockedReason, onMongoEdit, allowNewRow, focusCell }: { result: QueryResult; columnTypes?: ColumnInfo[]; dbType?: 'postgres' | 'mysql' | 'mongodb' } & TableGridProps) {
+function SingleResultGrid({ result, columnTypes, dbType, editable = false, pendingEdits, onCellEdit, errorRowIndex, serverSort, foreignKeys, fkTarget, onOpenReferencedTable, table, onDeleteRow, deleteBlockedReason, onMongoEdit, allowNewRow, focusCell }: { result: QueryResult; columnTypes?: ColumnInfo[]; dbType?: 'postgres' | 'mysql' | 'mongodb' | 'sqlite' | 'redis' } & TableGridProps) {
   const [selectedCell, setSelectedCell] = useState<{ ri: number; col: string } | null>(null)
   const [cellMenu, setCellMenu] = useState<{ x: number; y: number; ri: number; rowIndex: number; col: string; anchor: DOMRect } | null>(null)
   // `typed`: editing was started by typing this character on the selected cell
@@ -3363,7 +3484,7 @@ function ResultsGrid({ results, running, statusBorder, columnTypes, dbType, edit
   running: boolean
   statusBorder: 'top' | 'bottom'
   columnTypes?: ColumnInfo[]
-  dbType?: 'postgres' | 'mysql' | 'mongodb'
+  dbType?: 'postgres' | 'mysql' | 'mongodb' | 'sqlite' | 'redis'
 } & TableGridProps) {
   const [prevResults, setPrevResults] = useState(results)
   const [activeIdx, setActiveIdx] = useState(() => results.length > 0 ? results.length - 1 : 0)
@@ -3483,11 +3604,11 @@ interface SqlEditorHandle {
   countMatches: (query: string, caseSensitive: boolean) => number
 }
 
-function editorLanguage({ dialect, collections, ...sqlConfig }: Omit<SqlEditorLanguageConfig, 'dialect'> & { dialect: 'postgres' | 'mysql' | 'mongodb'; collections?: string[] }) {
-  return dialect === 'mongodb' ? mongoEditorLanguage(collections ?? []) : sqlEditorLanguage({ ...sqlConfig, dialect })
+function editorLanguage({ dialect, collections, ...sqlConfig }: Omit<SqlEditorLanguageConfig, 'dialect'> & { dialect: 'postgres' | 'mysql' | 'mongodb' | 'sqlite' | 'redis'; collections?: string[] }) {
+  return dialect === 'mongodb' ? mongoEditorLanguage(collections ?? []) : sqlEditorLanguage({ ...sqlConfig, dialect: dialect === 'redis' ? 'postgres' : dialect })
 }
 
-function editorPlaceholder(dialect: 'postgres' | 'mysql' | 'mongodb') {
+function editorPlaceholder(dialect: 'postgres' | 'mysql' | 'mongodb' | 'sqlite' | 'redis') {
   return dialect === 'mongodb' ? 'Write your MongoDB query here… e.g. db.users.find({})' : 'Write your SQL query here…'
 }
 
@@ -3501,7 +3622,7 @@ function SqlEditor({ value, onChange, onRun, onOpenFind, onNavigate, editorRef, 
   schema?: SQLNamespace
   defaultTable?: string
   defaultSchema?: string
-  dialect?: 'postgres' | 'mysql' | 'mongodb'
+  dialect?: 'postgres' | 'mysql' | 'mongodb' | 'sqlite' | 'redis'
   functions?: FunctionInfo[]
   collections?: string[]   // MongoDB only: suggested after `db.`
 }) {
@@ -5143,7 +5264,7 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
         details: everyRow.map(i => `${i.verb} ${i.table ?? ''}`.trim()).join('\n'),
       })) return
 
-      if (safe && infos.some(i => i.kind !== 'read') && connForRun && connForRun.dbType !== 'mongodb') {
+      if (safe && infos.some(i => i.kind !== 'read') && connForRun && connForRun.dbType !== 'mongodb' && connForRun.dbType !== 'redis') {
         const dialect = connForRun.dbType
         const irreversible = infos.filter(i => cannotRollBack(dialect, i))
         if (irreversible.length && !await confirmAction({
@@ -5153,11 +5274,13 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
         })) return
 
         // Safe Run: everything in one transaction that waits for Commit or Roll back
-        const api = dialect === 'mysql' ? window.electronAPI!.mysql : window.electronAPI!.pg
+        const api = dialect === 'mysql' ? window.electronAPI!.mysql : dialect === 'sqlite' ? window.electronAPI!.sqlite : window.electronAPI!.pg
         onChange(tab.id, { running: true, results: [], connectionId: connId, dbType: dialect })
         const opened = dialect === 'mysql'
           ? await window.electronAPI!.mysql.sessionOpen(connId, tab.databaseName ?? undefined)
-          : await window.electronAPI!.pg.sessionOpen(connId, tab.databaseName ?? undefined)
+          : dialect === 'sqlite'
+            ? await window.electronAPI!.sqlite.sessionOpen(connId)
+            : await window.electronAPI!.pg.sessionOpen(connId, tab.databaseName ?? undefined)
         if (!opened.ok || !opened.sessionId) {
           onChange(tab.id, { running: false, results: [{ fields: [], rows: [], rowCount: null, ms: 0, error: opened.error ?? 'Could not start a transaction', statement: sqlToRun }] })
           return
@@ -5228,7 +5351,7 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
   const finishSafeRun = useCallback(async (commit: boolean) => {
     const pending = tab.safeRun
     if (!pending) return
-    const api = pending.dialect === 'mysql' ? window.electronAPI!.mysql : window.electronAPI!.pg
+    const api = pending.dialect === 'mysql' ? window.electronAPI!.mysql : pending.dialect === 'sqlite' ? window.electronAPI!.sqlite : window.electronAPI!.pg
     const res = await api.sessionClose(pending.sessionId, commit)
     onChange(tab.id, { safeRun: undefined })
     if (!res.ok) {
@@ -5421,7 +5544,7 @@ ORDER BY p.oid DESC LIMIT 1`, tab.databaseName, [createdRoutine.name, createdRou
         const script = buildMongoCellScript(tab.tableName, row._id, tab.results[0]?.types?.[rowIndex]?._id, { kind: 'deleteDocument' })
         res = await dbIpc(connId).query(connId, script, tab.databaseName ?? undefined)
       } else {
-        const del = buildRowDelete(dbType, tab.schemaName, tab.tableName, tab.primaryKeys ?? [], row)
+        const del = buildRowDelete(sqlDialectOf(dbType), tab.schemaName, tab.tableName, tab.primaryKeys ?? [], row)
         res = await dbIpc(connId).query(connId, del.sql, tab.databaseName ?? undefined, del.params)
       }
     } catch (err) {
@@ -5525,7 +5648,7 @@ ORDER BY p.oid DESC LIMIT 1`, tab.databaseName, [createdRoutine.name, createdRou
   const availableDbs = boundConn?.databases ?? []
   const boundDb = boundConn?.databases.find(d => d.name === tab.databaseName)
   const availableSchemas = boundDb?.schemas ?? []
-  const editorDialect: 'postgres' | 'mysql' | 'mongodb' = boundConn?.dbType ?? 'postgres'
+  const editorDialect: 'postgres' | 'mysql' | 'mongodb' | 'sqlite' | 'redis' = boundConn?.dbType ?? 'postgres'
   // Memoized on the underlying state so the editor only reconfigures when the collections really change
   const mongoCollections = useMemo(() => {
     const conn = connections.find(c => c.id === tab.connectionId && c.status === 'connected' && c.dbType === 'mongodb')
@@ -5539,7 +5662,7 @@ ORDER BY p.oid DESC LIMIT 1`, tab.databaseName, [createdRoutine.name, createdRou
   const sqlNamespace = useMemo(() => completionSchemas ? buildSqlNamespace(completionSchemas) : undefined, [completionSchemas])
   const tabDbType = getTabDbType(tab, connections)
   useEffect(() => {
-    if (tab.kind !== 'table' || tab.foreignKeyRefs !== undefined || tabDbType === 'mongodb') return
+    if (tab.kind !== 'table' || tab.foreignKeyRefs !== undefined || tabDbType === 'mongodb' || tabDbType === 'sqlite' || tabDbType === 'redis') return
     if (!tab.connectionId || !tab.databaseName || !tab.schemaName || !tab.tableName) return
     if (!connections.some(c => c.id === tab.connectionId && c.status === 'connected')) return
     let cancelled = false
@@ -5551,7 +5674,7 @@ ORDER BY p.oid DESC LIMIT 1`, tab.databaseName, [createdRoutine.name, createdRou
   }, [tab.kind, tab.id, tab.foreignKeyRefs, tab.connectionId, tab.databaseName, tab.schemaName, tab.tableName, tabDbType, connections, dbIpc, onChange])
   // Stable identity: the FK popup refetches when its target changes
   const fkTarget = useMemo<FkLookupTarget | undefined>(
-    () => tab.kind === 'table' && tab.connectionId && tab.databaseName && tabDbType !== 'mongodb'
+    () => tab.kind === 'table' && tab.connectionId && tab.databaseName && tabDbType !== 'mongodb' && tabDbType !== 'sqlite' && tabDbType !== 'redis'
       ? { dbType: tabDbType, connectionId: tab.connectionId, database: tab.databaseName }
       : undefined,
     [tab.kind, tab.connectionId, tab.databaseName, tabDbType],
@@ -5561,7 +5684,8 @@ ORDER BY p.oid DESC LIMIT 1`, tab.databaseName, [createdRoutine.name, createdRou
     [completionSchemas]
   )
   // Tables of this schema are suggested without a prefix; MySQL lists a database's tables under the database name
-  const editorDefaultSchema = editorDialect === 'mysql' ? (tab.databaseName ?? undefined) : (tab.schemaName ?? 'public')
+  // MySQL and SQLite list tables under the database name; PostgreSQL under a schema
+  const editorDefaultSchema = editorDialect === 'mysql' || editorDialect === 'sqlite' ? (tab.databaseName ?? undefined) : (tab.schemaName ?? 'public')
   // Ctrl+click on a name: switch to its tab, or open one
   const handleEditorNavigate = useCallback((target: SqlTarget) => {
     if (!tab.connectionId || !tab.databaseName) return
@@ -5577,14 +5701,26 @@ ORDER BY p.oid DESC LIMIT 1`, tab.databaseName, [createdRoutine.name, createdRou
       ? (!!boundConn && !!tab.databaseName && !tab.running)
       : (!!tab.connectionId && !!tab.databaseName && !!tab.schemaName && !!tab.sql.trim())
 
+  if (tab.kind === 'redis-browser' || tab.kind === 'redis-console') {
+    const conn = connections.find(c => c.id === tab.connectionId)
+    if (!conn || conn.status !== 'connected') {
+      return <div className="h-full flex items-center justify-center text-xs text-muted-foreground">Connect {conn ? (conn.label || conn.name) : 'the connection'} to use this tab.</div>
+    }
+    const label = conn.label || conn.name
+    const db = redisDbIndex(tab.databaseName)
+    return tab.kind === 'redis-browser'
+      ? <RedisBrowser key={`${conn.id}:${db}`} connectionId={conn.id} db={db} label={label} />
+      : <RedisConsole key={`${conn.id}:${db}`} connectionId={conn.id} db={db} label={label} safe={safeRunEnabled(conn.options)} />
+  }
+
   if (tab.kind === 'structure-sync') {
     return (
       <StructureSyncView
         state={tab.sync ?? initialSyncState()}
         update={fn => onUpdateSync(tab.id, fn)}
-        connections={connections.map(c => ({
+        connections={connections.flatMap(c => c.dbType === 'sqlite' || c.dbType === 'redis' ? [] : [{
           id: c.id, label: c.label || c.name, dbType: c.dbType, status: c.status, databases: c.databases.map(d => d.name),
-        }))}
+        }])}
         onDeployed={(connId, database) => onRefreshDb(connId, database)}
       />
     )
@@ -5595,9 +5731,9 @@ ORDER BY p.oid DESC LIMIT 1`, tab.databaseName, [createdRoutine.name, createdRou
       <DataSyncView
         state={tab.dataSync ?? initialDataSyncState()}
         update={fn => onUpdateDataSync(tab.id, fn)}
-        connections={connections.map(c => ({
+        connections={connections.flatMap(c => c.dbType === 'sqlite' || c.dbType === 'redis' ? [] : [{
           id: c.id, label: c.label || c.name, dbType: c.dbType, status: c.status, databases: c.databases.map(d => d.name),
-        }))}
+        }])}
         onDeployed={(connId, database) => onRefreshDb(connId, database)}
       />
     )
@@ -7326,7 +7462,7 @@ async function persistSavedQueries(qs: SavedQuery[], prev: SavedQuery[]) {
 
 interface PersistedConnection {
   id: string
-  dbType: 'postgres' | 'mysql' | 'mongodb'
+  dbType: 'postgres' | 'mysql' | 'mongodb' | 'sqlite' | 'redis'
   label: string
   name: string
   host: string
@@ -7342,7 +7478,7 @@ interface PersistedConnection {
 
 interface PersistedTab {
   id: string
-  kind: 'query' | 'table' | 'design' | 'erd' | 'create-table' | 'create-view' | 'structure-sync' | 'data-sync'
+  kind: 'query' | 'table' | 'design' | 'erd' | 'create-table' | 'create-view' | 'structure-sync' | 'data-sync' | 'redis-browser' | 'redis-console'
   title: string
   sql: string
   connectionId: string | null
@@ -7359,7 +7495,7 @@ interface PersistedTab {
   pageSize?: number
   totalRows?: number
   columnTypes?: ColumnInfo[]
-  dbType?: 'postgres' | 'mysql' | 'mongodb'
+  dbType?: 'postgres' | 'mysql' | 'mongodb' | 'sqlite' | 'redis'
 
   // Design properties
   designActiveTab?: 'fields' | 'indexes' | 'fkeys' | 'uniques' | 'triggers'
@@ -7398,8 +7534,8 @@ async function loadPersistedConnectionsFromDb(): Promise<PersistedConnection[]> 
   try {
     const rows = await window.electronAPI?.db.connections.get()
     return (rows ?? []).map((r: any) => ({
-      id: r.id, dbType: r.dbType === 'pg' ? 'postgres' : r.dbType as 'postgres' | 'mysql' | 'mongodb',
-      label: r.name, name: r.dbType === 'mongodb' ? (r.database ? `MongoDB / ${r.database}` : 'MongoDB') : `${r.host}:${r.port}/${r.database}`,
+      id: r.id, dbType: r.dbType === 'pg' ? 'postgres' : r.dbType as 'postgres' | 'mysql' | 'mongodb' | 'sqlite' | 'redis',
+      label: r.name, name: r.dbType === 'sqlite' ? fileBaseName(r.host) : r.dbType === 'mongodb' ? (r.database ? `MongoDB / ${r.database}` : 'MongoDB') : `${r.host}:${r.port}/${r.database}`,
       host: r.host, port: r.port, database: r.database,
       user: r.username, password: r.password, ssl: r.ssl,
       vpnConfigPath: r.vpnConfigPath, vpnUsername: r.vpnUsername, vpnPassword: r.vpnPassword,
@@ -7425,7 +7561,7 @@ async function savePersistedConnections(conns: DbConnection[], prev: DbConnectio
   }
   // Create/update
   for (const c of conns) {
-    const dbType = c.dbType === 'mysql' ? 'mysql' : c.dbType === 'mongodb' ? 'mongodb' : 'pg'
+    const dbType = c.dbType === 'postgres' ? 'pg' : c.dbType
     if (!prevIds.has(c.id)) {
       await window.electronAPI.db.connections.create({
         id: c.id, name: c.label || c.name, dbType, host: c.host, port: c.port,
@@ -7469,7 +7605,7 @@ function quotePgNames(sql: string, conn: DbConnection | undefined, database: str
   return fix.sql
 }
 
-function getTabDbType(tab: QueryTab, connections: DbConnection[]): 'postgres' | 'mysql' | 'mongodb' {
+function getTabDbType(tab: QueryTab, connections: DbConnection[]): 'postgres' | 'mysql' | 'mongodb' | 'sqlite' | 'redis' {
   if (tab.dbType) return tab.dbType
   if (tab.connectionId) {
     const conn = connections.find(c => c.id === tab.connectionId)
@@ -7649,7 +7785,7 @@ export async function refreshMongoDocuments(connId: string, database: string | u
 }
 
 // "The row with id = 5" / "The document with _id 64b…" for delete confirmations
-function describeRowForDelete(tab: QueryTab, dbType: 'postgres' | 'mysql' | 'mongodb', rowIndex: number): string {
+function describeRowForDelete(tab: QueryTab, dbType: 'postgres' | 'mysql' | 'mongodb' | 'sqlite' | 'redis', rowIndex: number): string {
   const row = tab.results[0]?.rows[rowIndex]
   if (!row) return ''
   const short = (v: unknown) => { const t = cellEditText(v); return t.length > 60 ? `${t.slice(0, 60)}…` : t }
@@ -7669,7 +7805,7 @@ function tablePageSql(schema: string, table: string, page: number, orderBy = '')
   return `SELECT *\nFROM ${schema}.${table}\n${orderBy ? `${orderBy}\n` : ''}LIMIT ${TABLE_PAGE_SIZE} OFFSET ${offset};`
 }
 
-function makeTableTab(connId: string, dbName: string, schema: string, table: string, dbType?: 'postgres' | 'mysql' | 'mongodb'): QueryTab {
+function makeTableTab(connId: string, dbName: string, schema: string, table: string, dbType?: 'postgres' | 'mysql' | 'mongodb' | 'sqlite' | 'redis'): QueryTab {
   return { id: generateId(), kind: 'table', title: table, sql: tablePageSql(schema, table, 0), results: [], running: false, connectionId: connId, databaseName: dbName, schemaName: schema, tableName: table, page: 0, pageSize: TABLE_PAGE_SIZE, totalRows: undefined, dbType }
 }
 
@@ -7781,8 +7917,26 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
   const [unsavedCloseTab, setUnsavedCloseTab] = useState<QueryTab | null>(null)
 
   // A query tab on the connection, in its selected database (else the one it connects to, else its first)
+  const openRedisTab = useCallback((connId: string, dbName: string, kind: 'redis-browser' | 'redis-console') => {
+    const tab: QueryTab = {
+      id: generateId(), kind, title: kind === 'redis-browser' ? dbName : `${dbName} console`,
+      sql: '', results: [], running: false, connectionId: connId, databaseName: dbName, dbType: 'redis', originalSql: '',
+    }
+    // One tab per database and kind: switch to it when it's already open
+    setTabs(prev => {
+      const existing = prev.find(t => t.kind === kind && t.connectionId === connId && t.databaseName === dbName)
+      setActiveTabId(existing ? existing.id : tab.id)
+      return existing ? prev : [...prev, tab]
+    })
+  }, [])
+
   const newQueryFor = useCallback((connId: string | null, database?: string) => {
     const conn = connections.find(c => c.id === connId)
+    // A Redis "query" is its console
+    if (conn?.dbType === 'redis' && connId) {
+      openRedisTab(connId, database ?? activeDbPerConn[connId] ?? conn.databases[0]?.name ?? 'db0', 'redis-console')
+      return
+    }
     const dbName = connId
       ? (database ?? activeDbPerConn[connId] ?? (conn?.databases.some(d => d.name === conn.database) ? conn.database : conn?.databases[0]?.name) ?? null)
       : null
@@ -7791,7 +7945,7 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
     setTabs(prev => [...prev, tab])
     setActiveTabId(tab.id)
     setTabCounter(n => n + 1)
-  }, [tabCounter, activeDbPerConn, activeSchemaPerDb, connections])
+  }, [tabCounter, activeDbPerConn, activeSchemaPerDb, connections, openRedisTab])
   const newQuery = useCallback(() => newQueryFor(activeConnId), [newQueryFor, activeConnId])
 
   const openNewConnection = useCallback((preset?: { initial?: Partial<ConnectionDraft>; title?: string }) => {
@@ -7811,25 +7965,32 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
     setActiveTabId(tab.id)
   }, [])
 
+  // The table and view designers write PostgreSQL/MySQL DDL
+  const designerUnsupported = useCallback((connId: string) => {
+    if (connections.find(c => c.id === connId)?.dbType !== 'sqlite') return false
+    toast.info('The designer doesn’t support SQLite yet', { description: 'Use CREATE TABLE / CREATE VIEW in a query tab.' })
+    return true
+  }, [connections])
+
   const newTable = useCallback(() => {
-    if (!activeConnId) return
+    if (!activeConnId || designerUnsupported(activeConnId)) return
     const dbName = activeDbPerConn[activeConnId]
     if (!dbName) return
     const schemaName = activeSchemaPerDb[`${activeConnId}::${dbName}`] ?? 'public'
     const tab = makeCreateTableTab(activeConnId, dbName, schemaName)
     setTabs(prev => [...prev, tab])
     setActiveTabId(tab.id)
-  }, [activeConnId, activeDbPerConn, activeSchemaPerDb])
+  }, [activeConnId, activeDbPerConn, activeSchemaPerDb, designerUnsupported])
 
   const newView = useCallback(() => {
-    if (!activeConnId) return
+    if (!activeConnId || designerUnsupported(activeConnId)) return
     const dbName = activeDbPerConn[activeConnId]
     if (!dbName) return
     const schemaName = activeSchemaPerDb[`${activeConnId}::${dbName}`] ?? 'public'
     const tab = makeCreateViewTab(activeConnId, dbName, schemaName)
     setTabs(prev => [...prev, tab])
     setActiveTabId(tab.id)
-  }, [activeConnId, activeDbPerConn, activeSchemaPerDb])
+  }, [activeConnId, activeDbPerConn, activeSchemaPerDb, designerUnsupported])
 
   const newStructureSync = useCallback(() => {
     // Pre-fill the source with the PostgreSQL database/schema selected in the sidebar
@@ -7941,7 +8102,7 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
     const open = new Map(tabs.filter(t => t.safeRun).map(t => [t.id, t.safeRun!]))
     for (const [tabId, pending] of safeRunsRef.current) {
       if (tabs.some(t => t.id === tabId)) continue
-      const api = pending.dialect === 'mysql' ? window.electronAPI?.mysql : window.electronAPI?.pg
+      const api = pending.dialect === 'mysql' ? window.electronAPI?.mysql : pending.dialect === 'sqlite' ? window.electronAPI?.sqlite : window.electronAPI?.pg
       void api?.sessionClose(pending.sessionId, false).catch(() => {})
       toast.info('Safe Run rolled back', { description: 'Its tab was closed before the changes were committed.' })
     }
@@ -8485,10 +8646,14 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
       // Pending edits are keyed by row position, so they can't survive a reload
       setTabs(prev => prev.map(t => t.id === tab.id ? { ...t, running: true, page, pendingEdits: undefined, editError: undefined, insertError: undefined } : t))
 
-      const isMysql = getTabDbType(tab, connections) === 'mysql'
+      const tabType = getTabDbType(tab, connections)
+      const isMysql = tabType === 'mysql'
+      const isSqlite = tabType === 'sqlite'
       const pkSql = isMysql
         ? `SELECT COLUMN_NAME AS column_name FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND CONSTRAINT_NAME = 'PRIMARY' ORDER BY ORDINAL_POSITION`
-        : `SELECT a.attname AS column_name FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) WHERE i.indisprimary AND i.indrelid = (quote_ident($1) || '.' || quote_ident($2))::regclass`
+        : isSqlite
+          ? `SELECT name AS column_name FROM pragma_table_info($2, $1) WHERE pk > 0 ORDER BY pk`
+          : `SELECT a.attname AS column_name FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) WHERE i.indisprimary AND i.indrelid = (quote_ident($1) || '.' || quote_ident($2))::regclass`
 
       // The primary key is needed before the page query: it orders pages deterministically
       let primaryKeys = tab.primaryKeys
@@ -8507,10 +8672,13 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
         tab.columnTypes === undefined || tab.columnTypes.some(c => c.nullable === undefined)
           ? dbIpc(tab.connectionId).query(tab.connectionId, isMysql
               ? `SELECT COLUMN_NAME AS column_name, COLUMN_TYPE AS udt_name, IS_NULLABLE AS is_nullable FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION`
-              : `SELECT column_name, udt_name, is_nullable FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position`,
+              : isSqlite
+                ? `SELECT name AS column_name, type AS udt_name, CASE WHEN "notnull" THEN 'NO' ELSE 'YES' END AS is_nullable FROM pragma_table_xinfo($2, $1) WHERE hidden = 0 ORDER BY cid`
+                : `SELECT column_name, udt_name, is_nullable FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position`,
               tab.databaseName, [tab.schemaName, tab.tableName])
           : Promise.resolve(null),
-        tab.foreignKeyRefs === undefined
+        // The foreign key row picker has no SQLite lookups yet
+        tab.foreignKeyRefs === undefined && !isSqlite
           ? dbIpc(tab.connectionId).query(tab.connectionId, FOREIGN_KEYS_SQL[isMysql ? 'mysql' : 'postgres'], tab.databaseName, [tab.schemaName, tab.tableName])
           : Promise.resolve(null),
       ])
@@ -8529,7 +8697,7 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
           ? (colRes.rows ?? []).map((r: any) => ({ name: r.column_name as string, type: r.udt_name as string, nullable: r.is_nullable === 'YES' }))
           : t.columnTypes,
         primaryKeys: primaryKeys ?? t.primaryKeys,
-        foreignKeyRefs: fkRes?.ok ? parseForeignKeys(fkRes.rows ?? []) : t.foreignKeyRefs,
+        foreignKeyRefs: isSqlite ? [] : fkRes?.ok ? parseForeignKeys(fkRes.rows ?? []) : t.foreignKeyRefs,
       }))
     }
   }, [dbIpc, connections])
@@ -8637,7 +8805,7 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
 
     const connId = tab.connectionId
     const database = tab.databaseName ?? undefined
-    const plans = buildRowSavePlans(dbType, tab.schemaName, tab.tableName, primaryKeys, tab.results[0]?.rows ?? [], edits)
+    const plans = buildRowSavePlans(sqlDialectOf(dbType), tab.schemaName, tab.tableName, primaryKeys, tab.results[0]?.rows ?? [], edits)
     const api = getIpc(dbType)
     setTabs(prev => prev.map(t => t.id === tab.id ? { ...t, savingEdits: true, editError: undefined, insertError: undefined } : t))
 
@@ -9086,6 +9254,7 @@ WHERE n.nspname = '${esc(schema)}' AND t.typname = '${esc(typeName)}';`
             onRefresh={handleRefresh}
             onRefreshDb={handleRefreshDb}
             onOpenErd={handleOpenErd}
+            onOpenRedis={openRedisTab}
             onDisconnect={handleDisconnect}
             onReconnect={handleReconnect}
             onCancelConnect={handleCancelConnect}

@@ -15,6 +15,14 @@ import {
 } from './sqlite-db'
 import { runMongoShell } from './mongo-shell'
 import {
+  redisCloseAll, redisCommand, redisConnect, redisConnected, redisDatabases, redisDisconnect, redisEdit, redisGet,
+  redisInfo, redisScan, type RedisEdit,
+} from './redis-conn'
+import {
+  sqliteCloseAll, sqliteConnect, sqliteConnected, sqliteDatabases, sqliteDisconnect, sqliteIntrospect, sqliteQuery,
+  sqliteSessionClose, sqliteSessionOpen, sqliteSessionQuery,
+} from './sqlite-conn'
+import {
   closeExportCursor, createIndexesFromMetadata, importDocuments, listCollectionsForExport, openExportCursor,
   prepareCollection, readExportCursor,
 } from './mongo-transfer'
@@ -923,6 +931,51 @@ app.on('ready', () => {
     }
   })
 
+  // ── SQLite databases (see sqlite-conn.ts): a connection is a file ──
+  const sqliteOk = <T>(fn: () => T) => {
+    try { return { ok: true, ...fn() } } catch (err) { return { ok: false, error: err instanceof Error ? err.message : String(err) } }
+  }
+  ipcMain.handle('sqlite:connect', (_e, { id, host, create }: { id: string; host: string; create?: boolean }) =>
+    sqliteOk(() => { sqliteConnect(id, host, !!create); return {} }))
+  ipcMain.handle('sqlite:disconnect', (_e, { id }: { id: string }) => { sqliteDisconnect(id); return { ok: true } })
+  ipcMain.handle('sqlite:query', (_e, { id, sql, database, params }: { id: string; sql: string; database?: string; params?: unknown[] }) =>
+    sqliteOk(() => sqliteQuery(id, sql, database, params)))
+  ipcMain.handle('sqlite:introspect', (_e, { id }: { id: string }) => sqliteOk(() => ({ databases: sqliteDatabases(id) })))
+  ipcMain.handle('sqlite:introspect-db', (_e, { id, database }: { id: string; database: string }) => sqliteOk(() => sqliteIntrospect(id, database)))
+  ipcMain.handle('sqlite:session-open', (_e, { id, autocommit, readOnly }: { id: string; autocommit?: boolean; readOnly?: boolean }) =>
+    sqliteOk(() => ({ sessionId: sqliteSessionOpen(id, { autocommit, readOnly }) })))
+  ipcMain.handle('sqlite:session-query', (_e, { sessionId, sql, params }: { sessionId: string; sql: string; params?: unknown[] }) =>
+    sqliteOk(() => sqliteSessionQuery(sessionId, sql, params)))
+  ipcMain.handle('sqlite:session-close', (_e, { sessionId, commit }: { sessionId: string; commit: boolean }) =>
+    sqliteOk(() => { sqliteSessionClose(sessionId, commit); return {} }))
+  // A running SQLite statement can't be interrupted from outside (the driver is synchronous)
+  ipcMain.handle('sqlite:session-cancel', () => ({ ok: false, error: 'SQLite queries cannot be cancelled' }))
+  ipcMain.handle('sqlite:pick-file', async (_e, { create }: { create?: boolean }) => {
+    const filters = [{ name: 'SQLite databases', extensions: ['db', 'sqlite', 'sqlite3', 'db3'] }, { name: 'All Files', extensions: ['*'] }]
+    if (create) {
+      const r = await dialog.showSaveDialog(mainWindow!, { title: 'New SQLite database', defaultPath: 'database.db', filters })
+      return r.canceled ? null : r.filePath ?? null
+    }
+    const r = await dialog.showOpenDialog(mainWindow!, { title: 'Open SQLite database', properties: ['openFile'], filters })
+    return r.canceled ? null : r.filePaths[0] ?? null
+  })
+
+  // ── Redis (see redis-conn.ts) ──
+  const redisOk = async <T>(fn: () => Promise<T>) => {
+    try { return { ok: true, ...(await fn()) } } catch (err) { return { ok: false, error: err instanceof Error ? err.message : String(err) } }
+  }
+  ipcMain.handle('redis:connect', (_e, { id, host, port, user, password, database, ssl }: { id: string; host: string; port?: number; user?: string; password?: string; database?: string; ssl?: boolean }) =>
+    redisOk(async () => { await redisConnect(id, { host, port, user, password, database, ssl }); return {} }))
+  ipcMain.handle('redis:disconnect', async (_e, { id }: { id: string }) => { await redisDisconnect(id); return { ok: true } })
+  ipcMain.handle('redis:databases', (_e, { id }: { id: string }) => redisOk(async () => ({ databases: await redisDatabases(id) })))
+  ipcMain.handle('redis:info', (_e, { id }: { id: string }) => redisOk(async () => ({ info: await redisInfo(id) })))
+  ipcMain.handle('redis:scan', (_e, { id, db, pattern, cursor, count, type }: { id: string; db: number; pattern?: string; cursor?: string; count?: number; type?: string }) =>
+    redisOk(() => redisScan(id, db, { pattern, cursor, count, type })))
+  ipcMain.handle('redis:get', (_e, { id, db, key, limit }: { id: string; db: number; key: string; limit?: number }) =>
+    redisOk(async () => ({ value: await redisGet(id, db, key, { limit }) })))
+  ipcMain.handle('redis:edit', (_e, { id, db, edit }: { id: string; db: number; edit: RedisEdit }) => redisOk(() => redisEdit(id, db, edit)))
+  ipcMain.handle('redis:command', (_e, { id, db, line }: { id: string; db: number; line: string }) => redisOk(() => redisCommand(id, db, line)))
+
   // ── MongoDB database export/import (see mongo-transfer.ts) ──
   const withMongo = <T>(id: string, fn: (client: MongoClient) => Promise<T>) => async () => {
     const client = mongoClients.get(id)
@@ -961,12 +1014,13 @@ app.on('ready', () => {
   const mcpLog: McpLogEntry[] = []
   const dbTypeOf = (t: string): 'pg' | 'mysql' | 'mongodb' => t === 'mysql' ? 'mysql' : t === 'mongodb' ? 'mongodb' : 'pg'
   const isConnected = (c: { id: string; dbType: string }) =>
-    c.dbType === 'mysql' ? mysqlPools.has(c.id) : c.dbType === 'mongodb' ? mongoClients.has(c.id) : pgPools.has(c.id)
+    c.dbType === 'mysql' ? mysqlPools.has(c.id) : c.dbType === 'mongodb' ? mongoClients.has(c.id) : c.dbType === 'sqlite' ? sqliteConnected(c.id) : c.dbType === 'redis' ? redisConnected(c.id) : pgPools.has(c.id)
 
   const mcpBackend: McpBackend = {
     connections: () => {
       const shared = new Set(mcpSettings.sharedConnectionIds)
-      return savedConnections().filter(c => shared.has(c.id)).map(c => ({
+      // SQLite isn't wired into the MCP tools yet
+      return savedConnections().filter(c => shared.has(c.id) && c.dbType !== 'sqlite' && c.dbType !== 'redis').map(c => ({
         id: c.id, name: c.name, dbType: dbTypeOf(c.dbType), database: c.database ?? '', connected: isConnected(c),
       }))
     },
@@ -1078,6 +1132,8 @@ app.on('ready', () => {
   void applyMcp()
 
   app.on('will-quit', () => {
+    sqliteCloseAll()
+    void redisCloseAll()
     void mcpServer?.close()
     for (const [id] of vpnProcesses) killVpn(id)
     for (const [id, client] of mongoClients) {

@@ -78,6 +78,30 @@ contextBridge.exposeInMainWorld('electronAPI', {
     importIndexes: (id: string, database: string, metadata: string) => ipcRenderer.invoke('mongodb:import-indexes', { id, database, metadata }),
   },
 
+  redis: {
+    connect:    (opts: { id: string; host: string; port?: number; user?: string; password?: string; database?: string; ssl?: boolean }) => ipcRenderer.invoke('redis:connect', opts),
+    disconnect: (id: string) => ipcRenderer.invoke('redis:disconnect', { id }),
+    databases:  (id: string) => ipcRenderer.invoke('redis:databases', { id }),
+    info:       (id: string) => ipcRenderer.invoke('redis:info', { id }),
+    scan:       (id: string, db: number, opts: { pattern?: string; cursor?: string; count?: number; type?: string }) => ipcRenderer.invoke('redis:scan', { id, db, ...opts }),
+    get:        (id: string, db: number, key: string, limit?: number) => ipcRenderer.invoke('redis:get', { id, db, key, limit }),
+    edit:       (id: string, db: number, edit: unknown) => ipcRenderer.invoke('redis:edit', { id, db, edit }),
+    command:    (id: string, db: number, line: string) => ipcRenderer.invoke('redis:command', { id, db, line }),
+  },
+
+  sqlite: {
+    connect:      (opts: { id: string; host: string; create?: boolean }) => ipcRenderer.invoke('sqlite:connect', opts),
+    disconnect:   (id: string) => ipcRenderer.invoke('sqlite:disconnect', { id }),
+    query:        (id: string, sql: string, database?: string, params?: unknown[]) => ipcRenderer.invoke('sqlite:query', { id, sql, database, params }),
+    introspect:   (id: string) => ipcRenderer.invoke('sqlite:introspect', { id }),
+    introspectDb: (id: string, database: string) => ipcRenderer.invoke('sqlite:introspect-db', { id, database }),
+    sessionOpen:  (id: string, _database?: string, opts?: { autocommit?: boolean; readOnly?: boolean }) => ipcRenderer.invoke('sqlite:session-open', { id, ...opts }),
+    sessionQuery: (sessionId: string, sql: string, params?: unknown[]) => ipcRenderer.invoke('sqlite:session-query', { sessionId, sql, params }),
+    sessionClose: (sessionId: string, commit: boolean) => ipcRenderer.invoke('sqlite:session-close', { sessionId, commit }),
+    sessionCancel: (sessionId: string) => ipcRenderer.invoke('sqlite:session-cancel', { sessionId }),
+    pickFile:     (create?: boolean) => ipcRenderer.invoke('sqlite:pick-file', { create }),
+  },
+
   files: {
     saveDialog:   (opts: { title?: string; defaultName?: string; filters?: { name: string; extensions: string[] }[] }) => ipcRenderer.invoke('file:save-dialog', opts),
     openWrite:    (filePath: string) => ipcRenderer.invoke('file:open-write', { filePath }),

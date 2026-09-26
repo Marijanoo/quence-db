@@ -8,7 +8,7 @@ import { UpdateBar } from '@/components/update-bar'
 import { SettingsPanel, applySettings, DEFAULTS } from '@/components/settings-panel'
 import { McpPanel } from '@/components/mcp-panel'
 
-const version = '0.5.0'
+const version = '0.6.0'
 
 export default function Home() {
   const [updateProgress, setUpdateProgress] = useState<number | null>(null)

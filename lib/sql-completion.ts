@@ -2,7 +2,7 @@
 // built-ins. Tables and columns come from CodeMirror's schema completion (see buildSqlNamespace).
 import { snippetCompletion, type Completion, type CompletionContext, type CompletionResult } from '@codemirror/autocomplete'
 import { syntaxTree } from '@codemirror/language'
-import { sql, MySQL, PostgreSQL, type SQLNamespace } from '@codemirror/lang-sql'
+import { sql, MySQL, PostgreSQL, SQLite, type SQLNamespace } from '@codemirror/lang-sql'
 import { Facet, RangeSetBuilder, type EditorState, type Extension } from '@codemirror/state'
 import { Decoration, ViewPlugin, type DecorationSet, type EditorView, type ViewUpdate } from '@codemirror/view'
 
@@ -323,7 +323,16 @@ export function visibleFunctions(functions: FunctionInfo[], defaultSchema: strin
   return functions.filter(f => visible.has(f.schema))
 }
 
-export function functionOptions(functions: FunctionInfo[], dialect: 'postgres' | 'mysql'): Completion[] {
+const SQLITE_BUILTINS = [
+  'count', 'sum', 'total', 'avg', 'min', 'max', 'coalesce', 'ifnull', 'nullif', 'iif',
+  'date', 'time', 'datetime', 'julianday', 'unixepoch', 'strftime',
+  'lower', 'upper', 'length', 'trim', 'ltrim', 'rtrim', 'substr', 'replace', 'instr', 'printf', 'format', 'group_concat', 'string_agg',
+  'round', 'abs', 'random', 'typeof', 'cast', 'hex', 'quote',
+  'json', 'json_extract', 'json_object', 'json_array', 'json_group_array', 'json_group_object', 'json_each',
+  'row_number', 'rank', 'dense_rank', 'lag', 'lead', 'last_insert_rowid', 'changes',
+]
+
+export function functionOptions(functions: FunctionInfo[], dialect: 'postgres' | 'mysql' | 'sqlite'): Completion[] {
   const seen = new Set<string>()
   const options: Completion[] = []
   for (const f of functions) {
@@ -339,7 +348,7 @@ export function functionOptions(functions: FunctionInfo[], dialect: 'postgres' |
     }))
   }
   const userNames = new Set(functions.map(f => f.name))
-  for (const name of dialect === 'mysql' ? MYSQL_BUILTINS : PG_BUILTINS) {
+  for (const name of dialect === 'mysql' ? MYSQL_BUILTINS : dialect === 'sqlite' ? SQLITE_BUILTINS : PG_BUILTINS) {
     if (userNames.has(name)) continue
     options.push(snippetCompletion(`${name}(#{})`, { label: name, type: 'function', detail: 'built-in', boost: -1 }))
   }
@@ -347,7 +356,7 @@ export function functionOptions(functions: FunctionInfo[], dialect: 'postgres' |
 }
 
 export interface SqlEditorLanguageConfig {
-  dialect: 'postgres' | 'mysql'
+  dialect: 'postgres' | 'mysql' | 'sqlite'
   schema?: SQLNamespace      // schema → table → columns
   defaultSchema?: string     // whose tables are suggested without a "schema." prefix
   defaultTable?: string
@@ -357,7 +366,7 @@ export interface SqlEditorLanguageConfig {
 // Language + completion setup for the SQL editor. Without `defaultSchema` the schema completion
 // only offers schema names at the top level, so tables would need a "schema." prefix to show up.
 export function sqlEditorLanguage(config: SqlEditorLanguageConfig): Extension {
-  const dialect = config.dialect === 'mysql' ? MySQL : PostgreSQL
+  const dialect = config.dialect === 'mysql' ? MySQL : config.dialect === 'sqlite' ? SQLite : PostgreSQL
   const options = functionOptions(visibleFunctions(config.functions ?? [], config.defaultSchema), config.dialect)
   return [
     sql({
