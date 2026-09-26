@@ -1,6 +1,23 @@
+import type { DataTool, DataToolSettings } from './lib/mcp-data-tools'
+
 export {}
 
+// MCP server state, as the main process reports it (see electron/main.ts)
+interface McpStatus {
+  enabled: boolean
+  running: boolean
+  port: number
+  url: string
+  token: string
+  error: string | null
+  sharedConnectionIds: string[]
+  writeMode: 'off' | 'ask' | 'allow'
+  dataTools: DataToolSettings
+  connections: { id: string; name: string; dbType: 'pg' | 'mysql' | 'mongodb'; connected: boolean }[]
+}
+
 declare global {
+  type McpServerStatus = McpStatus
   interface Window {
     electronAPI?: {
       minimize: () => void
@@ -27,6 +44,15 @@ declare global {
         closeRead:    (fileId: string) => Promise<{ ok: boolean }>
         listDir:      (dirPath: string) => Promise<{ ok: boolean; files?: { name: string; size: number }[]; error?: string }>
         join:         (...parts: string[]) => Promise<string>
+      }
+      mcp?: {
+        status:   () => Promise<McpStatus>
+        update:   (patch: { enabled?: boolean; port?: number; sharedConnectionIds?: string[]; writeMode?: 'off' | 'ask' | 'allow' }) => Promise<McpStatus>
+        setDataTool: (args: { tool: DataTool; connectionId?: string; enabled: boolean | null }) => Promise<McpStatus>
+        newToken: () => Promise<McpStatus>
+        log:      () => Promise<{ at: number; tool: string; connection?: string; detail?: string; ok: boolean; error?: string; ms: number }[]>
+        onUiRequest?: (cb: (req: { id: string; command: string; args: Record<string, unknown> }) => void) => () => void
+        respond?: (id: string, answer: { ok: boolean; result?: unknown; error?: string }) => Promise<void>
       }
       onRunQuery?: (cb: () => void) => void
       offRunQuery?: (cb: () => void) => void

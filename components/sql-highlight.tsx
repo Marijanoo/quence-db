@@ -122,7 +122,10 @@ export const quenceTheme = EditorView.theme({
     background: 'var(--background)',
     color: 'var(--foreground)',
   },
-  '.cm-content': { padding: '12px', caretColor: 'var(--primary)' },
+  // minHeight fills the pane even with a short query, so a click anywhere below the last line still
+  // lands inside .cm-content (CodeMirror then places the cursor at the nearest line itself) instead
+  // of in the empty space around it, which otherwise silently drops focus.
+  '.cm-content': { padding: '12px', caretColor: 'var(--primary)', minHeight: '100%' },
   '.cm-focused': { outline: 'none' },
   '.cm-scroller': { overflow: 'auto' },
   '.cm-line': { lineHeight: '1.6' },

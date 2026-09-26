@@ -62,6 +62,15 @@ function migrate(db: Database.Database) {
       updated_at INTEGER NOT NULL
     );
   `)
+  // Columns added later; existing databases get them without losing anything
+  addColumn(db, 'connections', 'options', "TEXT NOT NULL DEFAULT '{}'")   // JSON: environment, color, safe run, SSH
+  addColumn(db, 'connections', 'ssh_password', 'TEXT')
+  addColumn(db, 'connections', 'ssh_passphrase', 'TEXT')
+}
+
+function addColumn(db: Database.Database, table: string, column: string, definition: string) {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]
+  if (!columns.some(c => c.name === column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`)
 }
 
 // ── Connections ───────────────────────────────────────────────────────────────
@@ -78,13 +87,14 @@ export function dbGetConnection(id: string): any {
 export function dbCreateConnection(c: any): void {
   db().prepare(`
     INSERT INTO connections (id, name, db_type, host, port, database, username, password, ssl,
-      vpn_config_path, vpn_username, vpn_password, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      vpn_config_path, vpn_username, vpn_password, options, ssh_password, ssh_passphrase, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     c.id, c.name, c.dbType ?? 'pg', c.host ?? '', c.port ?? 5432,
     c.database ?? '', c.username ?? '', encryptIfPossible(c.password) ?? '',
     c.ssl ? 1 : 0,
     c.vpnConfigPath ?? null, c.vpnUsername ?? null, encryptIfPossible(c.vpnPassword),
+    JSON.stringify(c.options ?? {}), encryptIfPossible(c.sshPassword), encryptIfPossible(c.sshPassphrase),
     c.createdAt ?? Date.now(), c.updatedAt ?? Date.now()
   )
 }
@@ -96,13 +106,15 @@ export function dbUpdateConnection(id: string, data: any): void {
     name: 'name', dbType: 'db_type', host: 'host', port: 'port',
     database: 'database', username: 'username', password: 'password', ssl: 'ssl',
     vpnConfigPath: 'vpn_config_path', vpnUsername: 'vpn_username', vpnPassword: 'vpn_password',
+    options: 'options', sshPassword: 'ssh_password', sshPassphrase: 'ssh_passphrase',
   }
   for (const [k, col] of Object.entries(fields)) {
     if (data[k] !== undefined) {
       sets.push(`${col} = ?`)
       let val = data[k]
       if (k === 'ssl') val = val ? 1 : 0
-      else if (k === 'password' || k === 'vpnPassword') val = encryptIfPossible(val)
+      else if (k === 'password' || k === 'vpnPassword' || k === 'sshPassword' || k === 'sshPassphrase') val = encryptIfPossible(val)
+      else if (k === 'options') val = JSON.stringify(val ?? {})
       vals.push(val)
     }
   }
@@ -153,6 +165,10 @@ export function dbDeleteSavedQuery(id: string): void {
 
 // ── Mappers ───────────────────────────────────────────────────────────────────
 
+function parseJson(text: unknown): Record<string, unknown> {
+  try { const v = JSON.parse(String(text ?? '{}')); return v && typeof v === 'object' ? v : {} } catch { return {} }
+}
+
 function toConnection(r: any) {
   return {
     id: r.id, name: r.name, dbType: r.db_type,
@@ -161,6 +177,9 @@ function toConnection(r: any) {
     vpnConfigPath: r.vpn_config_path ?? undefined,
     vpnUsername: r.vpn_username ?? undefined,
     vpnPassword: decryptIfPossible(r.vpn_password) ?? undefined,
+    options: parseJson(r.options),
+    sshPassword: decryptIfPossible(r.ssh_password) ?? undefined,
+    sshPassphrase: decryptIfPossible(r.ssh_passphrase) ?? undefined,
     createdAt: Number(r.created_at), updatedAt: Number(r.updated_at),
   }
 }

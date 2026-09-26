@@ -92,6 +92,21 @@ contextBridge.exposeInMainWorld('electronAPI', {
     join:         (...parts: string[]) => ipcRenderer.invoke('file:join', { parts }),
   },
 
+  mcp: {
+    status:   () => ipcRenderer.invoke('mcp:status'),
+    update:   (patch: { enabled?: boolean; port?: number; sharedConnectionIds?: string[]; writeMode?: 'off' | 'ask' | 'allow' }) => ipcRenderer.invoke('mcp:update', patch),
+    setDataTool: (args: { tool: string; connectionId?: string; enabled: boolean | null }) => ipcRenderer.invoke('mcp:set-data-tool', args),
+    newToken: () => ipcRenderer.invoke('mcp:new-token'),
+    log:      () => ipcRenderer.invoke('mcp:log'),
+    // Commands from MCP clients for the window; the handler's answer goes back with respond()
+    onUiRequest: (cb: (req: { id: string; command: string; args: Record<string, unknown> }) => void) => {
+      const listener = (_e: unknown, req: { id: string; command: string; args: Record<string, unknown> }) => cb(req)
+      ipcRenderer.on('mcp:ui-request', listener)
+      return () => { ipcRenderer.removeListener('mcp:ui-request', listener) }
+    },
+    respond: (id: string, answer: { ok: boolean; result?: unknown; error?: string }) => ipcRenderer.invoke('mcp:ui-response', { id, ...answer }),
+  },
+
   cancelConnect: (id: string) => ipcRenderer.invoke('db:cancel-connect', { id }),
 
   onRunQuery:  (cb: () => void) => ipcRenderer.on('run-query', cb),

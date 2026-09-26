@@ -19,6 +19,10 @@ import {
   prepareCollection, readExportCursor,
 } from './mongo-transfer'
 import { StringDecoder } from 'string_decoder'
+import { startMcpHttpServer, type McpHttpServer, type McpLogEntry } from './mcp-server'
+import { dataToolEnabled, loadMcpSettings, newToken, saveMcpSettings, type DataTool, type DataToolSettings, type McpSettings } from './mcp-settings'
+import { McpToolError, type McpBackend } from './mcp-tools'
+import type { UiBridge } from './mcp-ui-tools'
 
 const isProd = app.isPackaged || process.env.NODE_ENV === 'production'
 
@@ -949,7 +953,132 @@ app.on('ready', () => {
   ipcMain.handle('mongodb:import-indexes', (_e, { id, database, metadata }: { id: string; database: string; metadata: string }) =>
     withMongo(id, client => createIndexesFromMetadata(client, database, metadata))())
 
+  // ── MCP server: read-only tools for Claude and other MCP clients (see mcp-server.ts) ──
+  const mcpDir = app.getPath('userData')
+  let mcpSettings = loadMcpSettings(mcpDir)
+  let mcpServer: McpHttpServer | null = null
+  let mcpError: string | null = null
+  const mcpLog: McpLogEntry[] = []
+  const dbTypeOf = (t: string): 'pg' | 'mysql' | 'mongodb' => t === 'mysql' ? 'mysql' : t === 'mongodb' ? 'mongodb' : 'pg'
+  const isConnected = (c: { id: string; dbType: string }) =>
+    c.dbType === 'mysql' ? mysqlPools.has(c.id) : c.dbType === 'mongodb' ? mongoClients.has(c.id) : pgPools.has(c.id)
+
+  const mcpBackend: McpBackend = {
+    connections: () => {
+      const shared = new Set(mcpSettings.sharedConnectionIds)
+      return savedConnections().filter(c => shared.has(c.id)).map(c => ({
+        id: c.id, name: c.name, dbType: dbTypeOf(c.dbType), database: c.database ?? '', connected: isConnected(c),
+      }))
+    },
+    pg: (id, database) => pgPoolFor(id, database),
+    mysql: id => mysqlPools.get(id),
+    mongo: id => mongoClients.get(id),
+    dataToolAllowed: (tool, connectionId) => dataToolEnabled(mcpSettings.dataTools, tool as DataTool, connectionId),
+  }
+
+  // Commands for the window (open tabs, stage edits, …): sent with an id, answered via mcp:ui-response
+  const uiPending = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>()
+  const mcpUi: UiBridge = {
+    writeMode: () => mcpSettings.writeMode,
+    request: (command, args, timeoutMs = 30_000) => new Promise((resolve, reject) => {
+      const win = mainWindow
+      if (!win || win.isDestroyed()) { reject(new McpToolError('The QuenceDB window is not open')); return }
+      const id = randomUUID()
+      const timer = setTimeout(() => {
+        uiPending.delete(id)
+        reject(new McpToolError(args.approval === 'ask' ? 'The user did not answer the approval request in time' : 'QuenceDB did not answer in time'))
+      }, timeoutMs)
+      uiPending.set(id, { resolve, reject, timer })
+      // Waiting for Allow/Deny: draw the user's attention to the window
+      if (args.approval === 'ask' && !win.isFocused()) win.flashFrame(true)
+      win.webContents.send('mcp:ui-request', { id, command, args: { ...args, sharedConnectionIds: mcpSettings.sharedConnectionIds, dataTools: mcpSettings.dataTools } })
+    }),
+  }
+  ipcMain.handle('mcp:ui-response', (_e, { id, ok, result, error }: { id: string; ok: boolean; result?: unknown; error?: string }) => {
+    const pending = uiPending.get(id)
+    if (!pending) return
+    uiPending.delete(id)
+    clearTimeout(pending.timer)
+    mainWindow?.flashFrame(false)
+    if (ok) pending.resolve(result)
+    else pending.reject(new McpToolError(error ?? 'Failed'))
+  })
+
+  async function applyMcp() {
+    const running = mcpServer
+    mcpServer = null
+    await running?.close().catch(() => {})
+    mcpError = null
+    if (!mcpSettings.enabled) return
+    try {
+      mcpServer = await startMcpHttpServer({
+        port: mcpSettings.port, token: mcpSettings.token, backend: mcpBackend, version: app.getVersion(), ui: mcpUi,
+        log: e => { mcpLog.unshift(e); mcpLog.length = Math.min(mcpLog.length, 200) },
+      })
+    } catch (err) {
+      const code = (err as { code?: string }).code
+      mcpError = code === 'EADDRINUSE' ? `Port ${mcpSettings.port} is already in use. Choose another port.` : err instanceof Error ? err.message : String(err)
+    }
+  }
+
+  // Saved connections; a failing app database must not break the MCP panel (or the server)
+  const savedConnections = () => {
+    try { return dbGetConnections() } catch (err) {
+      console.error('MCP: could not read saved connections:', err)
+      return []
+    }
+  }
+
+  const mcpStatus = () => ({
+    enabled: mcpSettings.enabled,
+    running: !!mcpServer,
+    port: mcpSettings.port,
+    url: mcpServer?.url ?? `http://127.0.0.1:${mcpSettings.port}/mcp`,
+    token: mcpSettings.token,
+    error: mcpError,
+    sharedConnectionIds: mcpSettings.sharedConnectionIds,
+    writeMode: mcpSettings.writeMode,
+    dataTools: mcpSettings.dataTools,
+    connections: savedConnections().map(c => ({ id: c.id, name: c.name, dbType: dbTypeOf(c.dbType), connected: isConnected(c) })),
+  })
+
+  ipcMain.handle('mcp:status', () => mcpStatus())
+  ipcMain.handle('mcp:update', async (_e, patch: Partial<Pick<McpSettings, 'enabled' | 'port' | 'sharedConnectionIds' | 'writeMode'>>) => {
+    const restart = (patch.enabled !== undefined && patch.enabled !== mcpSettings.enabled) || (patch.port !== undefined && patch.port !== mcpSettings.port)
+    mcpSettings = { ...mcpSettings, ...patch }
+    saveMcpSettings(mcpDir, mcpSettings)
+    if (restart) await applyMcp()
+    return mcpStatus()
+  })
+  // tool: global on/off. tool + connectionId: a per-connection override; enabled: null clears the
+  // override (the connection then follows the global switch again).
+  ipcMain.handle('mcp:set-data-tool', (_e, { tool, connectionId, enabled }: { tool: DataTool; connectionId?: string; enabled: boolean | null }) => {
+    const dataTools: DataToolSettings = {
+      global: connectionId ? mcpSettings.dataTools.global : { ...mcpSettings.dataTools.global, [tool]: enabled ?? true },
+      perConnection: { ...mcpSettings.dataTools.perConnection },
+    }
+    if (connectionId) {
+      const existing = { ...dataTools.perConnection[connectionId] }
+      if (enabled === null) delete existing[tool]
+      else existing[tool] = enabled
+      if (Object.keys(existing).length > 0) dataTools.perConnection[connectionId] = existing
+      else delete dataTools.perConnection[connectionId]
+    }
+    mcpSettings = { ...mcpSettings, dataTools }
+    saveMcpSettings(mcpDir, mcpSettings)
+    return mcpStatus()
+  })
+  ipcMain.handle('mcp:new-token', async () => {
+    mcpSettings = { ...mcpSettings, token: newToken() }
+    saveMcpSettings(mcpDir, mcpSettings)
+    await applyMcp()
+    return mcpStatus()
+  })
+  ipcMain.handle('mcp:log', () => mcpLog)
+  void applyMcp()
+
   app.on('will-quit', () => {
+    void mcpServer?.close()
     for (const [id] of vpnProcesses) killVpn(id)
     for (const [id, client] of mongoClients) {
       client.close().catch(() => {})

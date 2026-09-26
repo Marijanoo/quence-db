@@ -24,9 +24,15 @@ import { sqlEditorLanguage, sqlNavigation, type FunctionInfo, type SqlEditorLang
 import { mongoEditorLanguage } from '@/lib/mongo-completion'
 import { FOREIGN_KEYS_SQL, parseForeignKeys, type FkRef } from '@/lib/fk-lookup'
 import { queryLanguageMismatch } from '@/lib/query-language'
+import { quoteMixedCaseIdentifiers } from '@/lib/pg-identifiers'
+import { connectionColor, environmentInfo, parseConnectionOptions, safeRunEnabled, type ConnectionOptions } from '@/lib/connection-options'
+import { cannotRollBack, classifyStatement, mongoScriptWrites, previewWrap, PREVIEW_ROWS, PREVIEW_TOTAL_COLUMN } from '@/lib/safe-run'
+import { ConfirmHost, confirmAction } from '@/components/confirm-dialog'
+import { ConnectionTagFields, EnvironmentBadge } from '@/components/connection-tag-fields'
 import { buildInsertStatement, buildUpdateStatement, cellText as cellEditText, quoteIdent, rowsToTsv } from '@/lib/grid-copy'
 import { BSON_TYPE_LABELS, MONGO_TYPE_OPTIONS, buildMongoCellScript, buildMongoSetScript, mongoIdFilter, type MongoCellEdit } from '@/lib/mongo-cell'
 import { ContextMenuAt, type MenuEntry } from '@/components/context-menu'
+import { McpBridge, type McpAppApi } from '@/components/mcp-bridge'
 import {
   DropdownMenu, DropdownMenuCheckboxItem, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
@@ -62,7 +68,7 @@ function getIpc(dbType: 'postgres' | 'mysql' | 'mongodb') {
   return window.electronAPI!.pg
 }
 
-interface DbConnection {
+export interface DbConnection {
   id: string
   dbType: 'postgres' | 'mysql' | 'mongodb'
   label: string   // user-defined display name
@@ -76,6 +82,10 @@ interface DbConnection {
   vpnConfigPath?: string
   vpnUsername?: string
   vpnPassword?: string
+  // Environment, color, Safe Run and SSH (lib/connection-options); SSH secrets are kept apart
+  options?: ConnectionOptions
+  sshPassword?: string
+  sshPassphrase?: string
   status: 'connected' | 'connecting' | 'disconnected' | 'error'
   errorMsg?: string
   databases: DbDatabase[]
@@ -238,7 +248,7 @@ interface ErdRelation {
   foreignColumn: string
 }
 
-interface QueryTab {
+export interface QueryTab {
   id: string
   kind: 'query' | 'table' | 'design' | 'erd' | 'create-table' | 'create-view' | 'structure-sync' | 'data-sync'
   title: string
@@ -282,6 +292,12 @@ interface QueryTab {
   editError?: { rowIndex: number; message: string }
   // Set when inserting a new row failed; shown as a popup until dismissed
   insertError?: string
+
+  // A cell to scroll to and highlight (MCP select_cell); nonce makes a repeat request count
+  focusCell?: { row: number; col: string; nonce: number }
+
+  // Safe Run: changes made in this open transaction, waiting for Commit or Roll back
+  safeRun?: { sessionId: string; dialect: 'postgres' | 'mysql'; changes: { verb: string; table?: string; rows: number | null }[]; startedAt: number }
   tableSort?: TableSort
 
   sync?: StructureSyncState
@@ -391,7 +407,7 @@ interface SavedQuery {
   schemaName: string
 }
 
-interface QueryResult {
+export interface QueryResult {
   fields: string[]
   rows: Record<string, unknown>[]
   rowCount: number | null
@@ -403,9 +419,10 @@ interface QueryResult {
 
 // ── Small reusable dialogs ────────────────────────────────────────────────────
 
-function NameQueryDialog({ title, initial, onConfirm, onClose }: {
+function NameQueryDialog({ title, initial, placeholder, onConfirm, onClose }: {
   title: string
   initial: string
+  placeholder?: string
   onConfirm: (name: string) => void
   onClose: () => void
 }) {
@@ -430,7 +447,7 @@ function NameQueryDialog({ title, initial, onConfirm, onClose }: {
             ref={inputRef}
             value={value}
             onChange={e => setValue(e.target.value)}
-            placeholder="Query name…"
+            placeholder={placeholder ?? 'Query name…'}
             className="w-full bg-background border border-border rounded px-2 py-1.5 text-sm text-foreground outline-none focus:ring-1 focus:ring-primary"
           />
           <div className="flex justify-end gap-2">
@@ -511,6 +528,42 @@ export function parseConnectionString(str: string, dbType: 'postgres' | 'mysql' 
   }
 }
 
+// The inverse of parseConnectionString: assembles a pastable URL from the dialog's fields.
+// A saved connection as a URL (MongoDB connections already store theirs)
+export function connectionStringOf(conn: Pick<DbConnection, 'dbType' | 'host' | 'port' | 'database' | 'user' | 'password' | 'ssl'>, withPassword: boolean): string {
+  if (conn.dbType === 'mongodb') {
+    if (withPassword) return conn.host
+    try {
+      const url = new URL(conn.host)
+      url.password = ''
+      return url.toString()
+    } catch {
+      return conn.host
+    }
+  }
+  return buildConnectionString(conn.dbType, {
+    host: conn.host, port: String(conn.port), database: conn.database, user: conn.user,
+    password: withPassword ? conn.password : '', ssl: conn.ssl,
+  })
+}
+
+function copyConnectionString(conn: DbConnection, withPassword: boolean) {
+  navigator.clipboard.writeText(connectionStringOf(conn, withPassword)).then(
+    () => toast.success(withPassword ? 'Copied connection string (includes the password)' : 'Copied connection string'),
+    () => toast.error('Could not copy to the clipboard'),
+  )
+}
+
+export function buildConnectionString(dbType: 'postgres' | 'mysql', fields: {
+  host: string; port: string; database: string; user: string; password: string; ssl: boolean
+}): string {
+  const scheme = dbType === 'mysql' ? 'mysql' : 'postgresql'
+  const auth = fields.user ? `${encodeURIComponent(fields.user)}${fields.password ? `:${encodeURIComponent(fields.password)}` : ''}@` : ''
+  const db = fields.database ? `/${encodeURIComponent(fields.database)}` : ''
+  const query = fields.ssl ? (dbType === 'mysql' ? '?ssl=true' : '?sslmode=require') : ''
+  return `${scheme}://${auth}${fields.host}:${fields.port}${db}${query}`
+}
+
 function NewConnectionDialog({ onConnect, onClose, initial, title = 'New Connection' }: NewConnectionDialogProps) {
   const initialType = initial?.dbType ?? 'postgres'
   const [dbType, setDbType] = useState<'postgres' | 'mysql' | 'mongodb'>(initialType)
@@ -525,6 +578,7 @@ function NewConnectionDialog({ onConnect, onClose, initial, title = 'New Connect
   const [vpnConfigPath, setVpnConfigPath] = useState(initial?.vpnConfigPath ?? '')
   const [vpnUsername, setVpnUsername] = useState(initial?.vpnUsername ?? '')
   const [vpnPassword, setVpnPassword] = useState(initial?.vpnPassword ?? '')
+  const [options, setOptions] = useState<ConnectionOptions>(initial?.options ?? {})
   const [loading, setLoading] = useState(false)
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<{ ok: boolean; msg: string } | null>(null)
@@ -578,7 +632,7 @@ function NewConnectionDialog({ onConnect, onClose, initial, title = 'New Connect
     setError('')
     setLoading(true)
     try {
-      await onConnect({ dbType, label: label.trim(), name, host, port: parseInt(port) || (dbType === 'mysql' ? 3306 : dbType === 'mongodb' ? 27017 : 5432), database, user, password, ssl, vpnConfigPath: vpnConfigPath || undefined, vpnUsername: vpnUsername || undefined, vpnPassword: vpnPassword || undefined })
+      await onConnect({ dbType, label: label.trim(), name, host, port: parseInt(port) || (dbType === 'mysql' ? 3306 : dbType === 'mongodb' ? 27017 : 5432), database, user, password, ssl, vpnConfigPath: vpnConfigPath || undefined, vpnUsername: vpnUsername || undefined, vpnPassword: vpnPassword || undefined, options })
       onClose()
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
@@ -646,6 +700,8 @@ function NewConnectionDialog({ onConnect, onClose, initial, title = 'New Connect
             <label className="text-xs text-muted-foreground">Label <span className="text-muted-foreground/50">(optional)</span></label>
             <input value={label} onChange={e => setLabel(e.target.value)} placeholder="e.g. Production DB" className={inputCls} />
           </div>
+
+          <ConnectionTagFields value={options} onChange={setOptions} />
 
           {dbType === 'mongodb' ? (
             <div className="space-y-1">
@@ -793,6 +849,7 @@ function EditConnectionDialog({ conn, onSave, onDisconnectAndEdit, onClose }: Ed
   const [vpnConfigPath, setVpnConfigPath] = useState(conn.vpnConfigPath ?? '')
   const [vpnUsername, setVpnUsername] = useState(conn.vpnUsername ?? '')
   const [vpnPassword, setVpnPassword] = useState(conn.vpnPassword ?? '')
+  const [options, setOptions] = useState<ConnectionOptions>(conn.options ?? {})
   const [loading, setLoading] = useState(false)
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<{ ok: boolean; msg: string } | null>(null)
@@ -822,7 +879,7 @@ function EditConnectionDialog({ conn, onSave, onDisconnectAndEdit, onClose }: Ed
     setLoading(true)
     const name = conn.dbType === 'mongodb' ? (database ? `MongoDB / ${database}` : 'MongoDB') : `${host}:${port}${database ? ' / ' + database : ''}`
     try {
-      await onSave(conn.id, { dbType: conn.dbType, label: label.trim(), name, host, port: parseInt(port) || (conn.dbType === 'mysql' ? 3306 : conn.dbType === 'mongodb' ? 27017 : 5432), database, user, password, ssl, vpnConfigPath: vpnConfigPath || undefined, vpnUsername: vpnUsername || undefined, vpnPassword: vpnPassword || undefined })
+      await onSave(conn.id, { dbType: conn.dbType, label: label.trim(), name, host, port: parseInt(port) || (conn.dbType === 'mysql' ? 3306 : conn.dbType === 'mongodb' ? 27017 : 5432), database, user, password, ssl, vpnConfigPath: vpnConfigPath || undefined, vpnUsername: vpnUsername || undefined, vpnPassword: vpnPassword || undefined, options })
       onClose()
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
@@ -872,6 +929,8 @@ function EditConnectionDialog({ conn, onSave, onDisconnectAndEdit, onClose }: Ed
               <input value={label} onChange={e => setLabel(e.target.value)} placeholder="e.g. Production DB"
                 className="w-full bg-background border border-border rounded px-2 py-1.5 text-sm text-foreground outline-none focus:ring-1 focus:ring-primary" />
             </div>
+
+            <ConnectionTagFields value={options} onChange={setOptions} />
 
             {conn.dbType === 'mongodb' ? (
               <>
@@ -931,6 +990,16 @@ function EditConnectionDialog({ conn, onSave, onDisconnectAndEdit, onClose }: Ed
                     {ssl && <Check className="h-3 w-3 stroke-[3.5]" />}
                   </button>
                   <span className="text-xs text-muted-foreground select-none cursor-pointer" onClick={() => setSsl(!ssl)}>SSL Connection</span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      navigator.clipboard.writeText(buildConnectionString(conn.dbType as 'postgres' | 'mysql', { host, port, database, user, password, ssl }))
+                        .then(() => toast.success('Connection string copied'), () => toast.error('Could not copy to the clipboard'))
+                    }}
+                    className="ml-auto flex items-center gap-1 text-[11px] text-primary hover:underline"
+                  >
+                    <Copy className="h-3 w-3" /> Copy connection string
+                  </button>
                 </div>
                 <div className="space-y-1">
                   <label className="text-xs text-muted-foreground flex items-center gap-1">
@@ -1127,6 +1196,21 @@ function DbToolbar({
 
 // ── Connections tree ──────────────────────────────────────────────────────────
 
+// A clickable "+ Add …" row shown in place of an empty group (no databases, no schemas,
+// no tables, …) so creating the first item is one click from the empty state.
+function AddRow({ label, indent, onClick }: { label: string; indent: number; onClick: () => void }) {
+  return (
+    <button
+      onClick={e => { e.stopPropagation(); onClick() }}
+      className="w-full flex items-center gap-1.5 py-0.5 text-[10px] rounded transition-colors text-left text-muted-foreground/60 hover:bg-accent/20 hover:text-foreground font-sans"
+      style={{ paddingLeft: indent }}
+    >
+      <Plus className="h-3 w-3 shrink-0" />
+      <span className="truncate">{label}</span>
+    </button>
+  )
+}
+
 function ConnectionsPanel({
   connections,
   activeConnId,
@@ -1138,6 +1222,8 @@ function ConnectionsPanel({
   onNewQueryFor,
   onDatabaseAction,
   onNewTableIn,
+  onNewViewIn,
+  onNewCollectionIn,
   onTableChanged,
   onRefresh,
   onRefreshDb,
@@ -1174,6 +1260,8 @@ function ConnectionsPanel({
   onNewQueryFor: (connId: string, dbName?: string) => void
   onDatabaseAction: (action: DatabaseAction) => void
   onNewTableIn: (connId: string, dbName: string, schema: string) => void
+  onNewViewIn: (connId: string, dbName: string, schema: string) => void
+  onNewCollectionIn: (connId: string, dbName: string) => void
   onTableChanged: (connId: string, dbName: string, schema: string, table: string, change: TableChange) => void
   onRefresh: (connId: string) => void
   onRefreshDb: (connId: string, dbName: string) => void
@@ -1235,6 +1323,12 @@ function ConnectionsPanel({
       },
       { label: 'Delete Connection', icon: <Trash2 className="h-3.5 w-3.5" />, destructive: true, onSelect: () => onRemove(conn.id) },
       { label: 'Duplicate Connection…', icon: <Copy className="h-3.5 w-3.5" />, onSelect: () => onDuplicateConnection(conn.id) },
+      {
+        label: 'Copy Connection String', icon: <Link2 className="h-3.5 w-3.5" />, submenu: [
+          { label: 'With Password', onSelect: () => copyConnectionString(conn, true) },
+          { label: 'Without Password', onSelect: () => copyConnectionString(conn, false) },
+        ],
+      },
       { kind: 'separator' },
       { label: 'New Query', icon: <FileCode className="h-3.5 w-3.5" />, disabled: !connected, hint: connected ? undefined : 'not connected', onSelect: () => onNewQueryFor(conn.id) },
       { kind: 'separator' },
@@ -1534,6 +1628,7 @@ function ConnectionsPanel({
                   'text-destructive'
                 )} />
                 <span className="truncate flex-1">{conn.label || conn.name}</span>
+                <EnvironmentBadge options={conn.options} />
                 {conn.dbType === 'mysql'
                   ? <span className="shrink-0 text-[9px] font-semibold px-1 rounded bg-orange-500/20 text-orange-400 leading-4">MySQL</span>
                   : conn.dbType === 'mongodb'
@@ -1697,9 +1792,14 @@ function ConnectionsPanel({
                                       )
                                     })
                                   ) : (
-                                    <div className="text-muted-foreground/45 text-[10px] py-0.5 select-none font-sans italic" style={{ paddingLeft: itemIndent }}>
-                                      {conn.dbType === 'mongodb' ? 'No collections' : 'No tables'}
-                                    </div>
+                                    <AddRow
+                                      label={conn.dbType === 'mongodb' ? 'Add collection' : 'Add table'}
+                                      indent={itemIndent}
+                                      onClick={() => conn.dbType === 'mongodb'
+                                        ? onNewCollectionIn(conn.id, db.name)
+                                        : onNewTableIn(conn.id, db.name, schema.name)
+                                      }
+                                    />
                                   )
                                 )}
                               </>
@@ -1757,10 +1857,12 @@ function ConnectionsPanel({
                                         </div>
                                       )
                                     })
-                                  ) : (
+                                  ) : conn.dbType === 'mongodb' ? (
                                     <div className="text-muted-foreground/45 text-[10px] py-0.5 select-none font-sans italic" style={{ paddingLeft: itemIndent }}>
                                       No views
                                     </div>
+                                  ) : (
+                                    <AddRow label="Add view" indent={itemIndent} onClick={() => onNewViewIn(conn.id, db.name, schema.name)} />
                                   )
                                 )}
                               </>
@@ -2051,9 +2153,19 @@ function ConnectionsPanel({
                       )}
                     </div>
                   )})}
+
+                  {/* No schemas yet (Postgres only — MySQL/Mongo databases have no separate schema level) */}
+                  {db.open && !db.error && conn.dbType === 'postgres' && db.schemas.length === 0 && (
+                    <AddRow label="Add schema" indent={32} onClick={() => onDatabaseAction({ kind: 'schema', connId: conn.id, dbName: db.name })} />
+                  )}
                 </div>
               )
               })}
+
+              {/* No databases yet (Postgres only — MySQL/Mongo connections list what the server already has) */}
+              {isOpen && conn.status === 'connected' && conn.dbType === 'postgres' && conn.databases.length === 0 && (
+                <AddRow label="Add database" indent={16} onClick={() => onDatabaseAction({ kind: 'create', connId: conn.id, dbName: connectionBaseDb(conn) })} />
+              )}
             </div>
           )
         })}
@@ -2116,13 +2228,14 @@ const DB_TYPE_COLORS = { postgres: 'text-blue-400', mysql: 'text-orange-400', mo
 const DB_TYPE_LABELS = { postgres: 'PostgreSQL', mysql: 'MySQL', mongodb: 'MongoDB' } as const
 
 function QueryTabBar({
-  tabs, activeId, onSelect, onClose, dbTypeOf,
+  tabs, activeId, onSelect, onClose, dbTypeOf, colorOf,
 }: {
   tabs: QueryTab[]
   activeId: string
   onSelect: (id: string) => void
   onClose: (id: string) => void
   dbTypeOf: (tab: QueryTab) => 'postgres' | 'mysql' | 'mongodb' | undefined
+  colorOf?: (tab: QueryTab) => string | null
 }) {
   // Scroll the active tab into view when it changes (e.g. opening something that already has a tab)
   const stripRef = useRef<HTMLDivElement>(null)
@@ -2157,6 +2270,7 @@ function QueryTabBar({
                 ? 'bg-background text-foreground border-b-2 border-b-primary -mb-px'
                 : 'text-muted-foreground hover:text-foreground hover:bg-accent/10'
             )}
+            style={colorOf?.(tab) ? { boxShadow: `inset 0 2px 0 ${colorOf(tab)}` } : undefined}
           >
             {tab.kind === 'table' ? (
               <Table2 className={cn('h-3 w-3 shrink-0', dbColor)} />
@@ -2244,6 +2358,8 @@ interface TableGridProps {
   onOpenReferencedTable?: (fk: FkRef) => void
   // An empty editable table shows one blank row; saving what is typed into it inserts a row
   allowNewRow?: boolean
+  // Scroll to this cell and select it (row: index into the result's rows)
+  focusCell?: { row: number; col: string; nonce: number }
 }
 
 // Grid interactions a row forwards to its grid. Rows read them through a ref, so a row that skips
@@ -2456,7 +2572,7 @@ const GridRow = React.memo(function GridRow({
   )
 }, gridRowPropsEqual)
 
-function SingleResultGrid({ result, columnTypes, dbType, editable = false, pendingEdits, onCellEdit, errorRowIndex, serverSort, foreignKeys, fkTarget, onOpenReferencedTable, table, onDeleteRow, deleteBlockedReason, onMongoEdit, allowNewRow }: { result: QueryResult; columnTypes?: ColumnInfo[]; dbType?: 'postgres' | 'mysql' | 'mongodb' } & TableGridProps) {
+function SingleResultGrid({ result, columnTypes, dbType, editable = false, pendingEdits, onCellEdit, errorRowIndex, serverSort, foreignKeys, fkTarget, onOpenReferencedTable, table, onDeleteRow, deleteBlockedReason, onMongoEdit, allowNewRow, focusCell }: { result: QueryResult; columnTypes?: ColumnInfo[]; dbType?: 'postgres' | 'mysql' | 'mongodb' } & TableGridProps) {
   const [selectedCell, setSelectedCell] = useState<{ ri: number; col: string } | null>(null)
   const [cellMenu, setCellMenu] = useState<{ x: number; y: number; ri: number; rowIndex: number; col: string; anchor: DOMRect } | null>(null)
   // `typed`: editing was started by typing this character on the selected cell
@@ -2521,17 +2637,23 @@ function SingleResultGrid({ result, columnTypes, dbType, editable = false, pendi
     input.setSelectionRange(value.length, value.length)
     return value
   }
-  // The blank row of an empty editable table; its row index is one past the loaded rows
-  const draftRow = useMemo<Record<string, unknown> | null>(
-    () => (allowNewRow && editable && result.rows.length === 0 ? {} : null),
-    [allowNewRow, editable, result.rows.length],
+  // New rows, after the loaded ones: the blank row of an empty editable table, and rows that have
+  // edits staged past the loaded rows (added through MCP insert_rows); row indexes continue on
+  const lastDraftIndex = useMemo(() => {
+    let last = allowNewRow && editable && result.rows.length === 0 ? 0 : -1
+    if (editable) for (const e of Object.values(pendingEdits ?? {})) if (e.rowIndex >= result.rows.length) last = Math.max(last, e.rowIndex - result.rows.length)
+    return last
+  }, [allowNewRow, editable, result.rows.length, pendingEdits])
+  const draftRows = useMemo<Record<string, unknown>[]>(
+    () => Array.from({ length: lastDraftIndex + 1 }, () => ({})),
+    [lastDraftIndex],
   )
   const rowIndexOf = useMemo(() => {
     const map = new Map<Record<string, unknown>, number>(result.rows.map((r, i) => [r, i]))
-    if (draftRow) map.set(draftRow, result.rows.length)
+    draftRows.forEach((d, k) => map.set(d, result.rows.length + k))
     return map
-  }, [result.rows, draftRow])
-  const rowAt = (rowIndex: number): Record<string, unknown> => result.rows[rowIndex] ?? draftRow ?? {}
+  }, [result.rows, draftRows])
+  const rowAt = (rowIndex: number): Record<string, unknown> => result.rows[rowIndex] ?? draftRows[rowIndex - result.rows.length] ?? {}
 
   const startColumnResize = (e: React.MouseEvent, col: string) => {
     e.preventDefault()
@@ -2706,7 +2828,7 @@ function SingleResultGrid({ result, columnTypes, dbType, editable = false, pendi
   useEffect(() => {
     if (!selectedCell || editingCell) return
     const fields = visibleFields
-    const rowCount = result.rows.length + (draftRow ? 1 : 0)
+    const rowCount = result.rows.length + draftRows.length
     const handler = (e: KeyboardEvent) => {
       // Type-to-edit: a printable key on the selected cell opens its editor with that character
       if (editable && e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
@@ -2743,7 +2865,7 @@ function SingleResultGrid({ result, columnTypes, dbType, editable = false, pendi
     }
     document.addEventListener('keydown', handler)
     return () => document.removeEventListener('keydown', handler)
-  }, [selectedCell, editingCell, result, visibleFields, draftRow, editable, dbType])
+  }, [selectedCell, editingCell, result, visibleFields, draftRows, editable, dbType])
 
   useEffect(() => {
     if (!selectedCell) return
@@ -2779,6 +2901,29 @@ function SingleResultGrid({ result, columnTypes, dbType, editable = false, pendi
     })
   }, [visibleRows, sortCol, sortDir, serverSort])
   useEffect(() => { shownRowsRef.current = sortedRows }, [sortedRows])
+
+  // Point at a requested cell: select it and scroll it into view. A row hidden by the row filter
+  // clears the filter first (the effect runs again with the rows shown).
+  const focusHandledRef = useRef(0)
+  useEffect(() => {
+    if (!focusCell || focusHandledRef.current === focusCell.nonce) return
+    const target = rowAt(focusCell.row)
+    const ri = [...sortedRows, ...draftRows].indexOf(target)
+    if (ri < 0 && rowFilter) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setRowSearch(''); setRowFilter('')
+      return
+    }
+    focusHandledRef.current = focusCell.nonce
+    if (ri < 0) return
+    setSelectedCell({ ri, col: focusCell.col })
+    requestAnimationFrame(() => {
+      gridRef.current?.querySelector(`[data-cell="${ri}:${CSS.escape(focusCell.col)}"]`)
+        ?.scrollIntoView({ block: 'center', inline: 'center', behavior: 'smooth' })
+    })
+  // rowAt reads result/draftRows, listed here
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusCell, sortedRows, draftRows, rowFilter])
 
   const gridActions: GridActions = {
     select: (ri, col) => {
@@ -2829,7 +2974,7 @@ function SingleResultGrid({ result, columnTypes, dbType, editable = false, pendi
     },
     endEdit: () => { flushPendingCommit(); setEditingCell(null) },
     tab: (ri, col, backwards) => {
-      const rowCount = result.rows.length + (draftRow ? 1 : 0)
+      const rowCount = result.rows.length + draftRows.length
       const next = nextTabCell(ri, visibleFields.indexOf(col), visibleFields.length, rowCount, backwards)
       setSelectedCell({ ri: next.ri, col: visibleFields[next.ci] })
     },
@@ -3125,7 +3270,7 @@ function SingleResultGrid({ result, columnTypes, dbType, editable = false, pendi
             </tr>
           </thead>
           <tbody>
-            {(draftRow ? [...sortedRows, draftRow] : sortedRows).map((row, ri) => {
+            {[...sortedRows, ...draftRows].map((row, ri) => {
               const rowIndex = rowIndexOf.get(row) ?? -1
               return (
                 <GridRow
@@ -3133,7 +3278,7 @@ function SingleResultGrid({ result, columnTypes, dbType, editable = false, pendi
                   row={row}
                   ri={ri}
                   rowIndex={rowIndex}
-                  isDraft={row === draftRow}
+                  isDraft={rowIndex >= result.rows.length}
                   fields={visibleFields}
                   colWidths={colWidths}
                   selectedCol={selectedCell?.ri === ri ? selectedCell.col : null}
@@ -3213,7 +3358,7 @@ function SingleResultGrid({ result, columnTypes, dbType, editable = false, pendi
   )
 }
 
-function ResultsGrid({ results, running, statusBorder, columnTypes, dbType, editable, pendingEdits, onCellEdit, errorRowIndex, serverSort, foreignKeys, fkTarget, onOpenReferencedTable, table, onDeleteRow, deleteBlockedReason, onMongoEdit, allowNewRow }: {
+function ResultsGrid({ results, running, statusBorder, columnTypes, dbType, editable, pendingEdits, onCellEdit, errorRowIndex, serverSort, foreignKeys, fkTarget, onOpenReferencedTable, table, onDeleteRow, deleteBlockedReason, onMongoEdit, allowNewRow, focusCell }: {
   results: QueryResult[]
   running: boolean
   statusBorder: 'top' | 'bottom'
@@ -3275,7 +3420,7 @@ function ResultsGrid({ results, running, statusBorder, columnTypes, dbType, edit
       </div>
     )
   } else if (result) {
-    grid = <SingleResultGrid result={result} columnTypes={columnTypes} dbType={dbType} editable={editable} pendingEdits={pendingEdits} onCellEdit={onCellEdit} errorRowIndex={errorRowIndex} serverSort={serverSort} foreignKeys={foreignKeys} fkTarget={fkTarget} onOpenReferencedTable={onOpenReferencedTable} table={table} onDeleteRow={onDeleteRow} deleteBlockedReason={deleteBlockedReason} onMongoEdit={onMongoEdit} allowNewRow={allowNewRow} />
+    grid = <SingleResultGrid result={result} columnTypes={columnTypes} dbType={dbType} editable={editable} pendingEdits={pendingEdits} onCellEdit={onCellEdit} errorRowIndex={errorRowIndex} serverSort={serverSort} foreignKeys={foreignKeys} fkTarget={fkTarget} onOpenReferencedTable={onOpenReferencedTable} table={table} onDeleteRow={onDeleteRow} deleteBlockedReason={deleteBlockedReason} onMongoEdit={onMongoEdit} allowNewRow={allowNewRow} focusCell={focusCell} />
   } else {
     grid = <div className="flex-1 flex items-center justify-center"><p className="text-xs text-muted-foreground">No results yet</p></div>
   }
@@ -3521,7 +3666,20 @@ function SqlEditor({ value, onChange, onRun, onOpenFind, onNavigate, editorRef, 
     }
   }, [value])
 
-  return <div ref={containerRef} className="h-full overflow-hidden" />
+  // Clicking empty space below the last line (inside the editor's own box, but past .cm-content's
+  // bottom edge when the doc is short) should still focus the editor and put the cursor at the end,
+  // the way clicking anywhere in a plain <textarea> does. CodeMirror only owns clicks on .cm-content
+  // itself, so without this the surrounding empty area silently drops focus instead.
+  const handleContainerMouseDown = (e: React.MouseEvent) => {
+    const view = viewRef.current
+    if (!view) return
+    if ((e.target as HTMLElement).closest('.cm-content')) return   // let CodeMirror handle its own area
+    e.preventDefault()
+    view.dispatch({ selection: { anchor: view.state.doc.length } })
+    view.focus()
+  }
+
+  return <div ref={containerRef} className="h-full overflow-hidden" onMouseDown={handleContainerMouseDown} />
 }
 
 // ── SQL Search/Replace bar ────────────────────────────────────────────────────
@@ -4941,13 +5099,20 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
     }
 
     const selection = editorRef.current?.getSelection() ?? ''
-    const sqlToRun = selection.trim() || tab.sql.trim()
+    let sqlToRun = selection.trim() || tab.sql.trim()
     if (!sqlToRun) return
     const connId = tab.connectionId ?? connections.find(c => c.status === 'connected')?.id
     if (!connId) return
 
     const connForRun = connections.find(c => c.id === connId)
     const isMongoRun = connForRun?.dbType === 'mongodb'
+
+    // Names typed with capitals get their quotes; the editor shows the query that ran
+    const quotedSql = quotePgNames(selection.trim() ? sqlToRun : tab.sql, connForRun, tab.databaseName)
+    if (quotedSql !== (selection.trim() ? sqlToRun : tab.sql)) {
+      if (!selection.trim()) onChange(tab.id, { sql: quotedSql })
+      sqlToRun = quotedSql.trim()
+    }
 
     const mismatch = queryLanguageMismatch(connForRun?.dbType, sqlToRun)
     if (mismatch) {
@@ -4957,6 +5122,77 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
 
     // For MongoDB, send the whole text as one shell script (no SQL splitting)
     const statements = isMongoRun ? [sqlToRun] : splitSqlStatements(sqlToRun)
+
+    if (tab.safeRun) { toast.error('Commit or roll back the Safe Run first'); return }
+    const place = `${connForRun?.label || connForRun?.name || ''}${tab.databaseName ? ` · ${tab.databaseName}` : ''}`
+    const safe = safeRunEnabled(connForRun?.options)
+
+    if (isMongoRun) {
+      if (safe && mongoScriptWrites(sqlToRun) && !await confirmAction({
+        title: 'Run this MongoDB code?', subtitle: place, danger: true, confirmLabel: 'Run',
+        message: 'This connection uses Safe Run. MongoDB changes can’t be held for review like a SQL transaction, so they are saved as soon as this runs.',
+        details: sqlToRun,
+      })) return
+    } else {
+      const infos = statements.map(classifyStatement)
+      // Before anything runs: statements that would change every row
+      const everyRow = infos.filter(i => i.missingWhere)
+      if (everyRow.length && !await confirmAction({
+        title: 'Change every row?', subtitle: place, danger: true, confirmLabel: 'Run anyway',
+        message: `${everyRow.length === 1 ? 'This statement has' : 'These statements have'} no WHERE clause, so ${everyRow.length === 1 ? 'it changes' : 'they change'} every row of the table:`,
+        details: everyRow.map(i => `${i.verb} ${i.table ?? ''}`.trim()).join('\n'),
+      })) return
+
+      if (safe && infos.some(i => i.kind !== 'read') && connForRun && connForRun.dbType !== 'mongodb') {
+        const dialect = connForRun.dbType
+        const irreversible = infos.filter(i => cannotRollBack(dialect, i))
+        if (irreversible.length && !await confirmAction({
+          title: 'Run statements that can’t be rolled back?', subtitle: place, danger: true, confirmLabel: 'Run',
+          message: 'MySQL saves CREATE, ALTER, DROP and TRUNCATE immediately, even inside a transaction, so Safe Run can’t hold them for review.',
+          details: irreversible.map(i => `${i.verb} ${i.table ?? ''}`.trim()).join('\n'),
+        })) return
+
+        // Safe Run: everything in one transaction that waits for Commit or Roll back
+        const api = dialect === 'mysql' ? window.electronAPI!.mysql : window.electronAPI!.pg
+        onChange(tab.id, { running: true, results: [], connectionId: connId, dbType: dialect })
+        const opened = dialect === 'mysql'
+          ? await window.electronAPI!.mysql.sessionOpen(connId, tab.databaseName ?? undefined)
+          : await window.electronAPI!.pg.sessionOpen(connId, tab.databaseName ?? undefined)
+        if (!opened.ok || !opened.sessionId) {
+          onChange(tab.id, { running: false, results: [{ fields: [], rows: [], rowCount: null, ms: 0, error: opened.error ?? 'Could not start a transaction', statement: sqlToRun }] })
+          return
+        }
+        const sessionId = opened.sessionId
+        const collected: QueryResult[] = []
+        const changes: { verb: string; table?: string; rows: number | null }[] = []
+        for (const [k, stmt] of statements.entries()) {
+          const info = infos[k]
+          const sql = dialect === 'postgres' ? previewWrap(stmt, info) : stmt
+          const started = Date.now()
+          const res = await api.sessionQuery(sessionId, sql)
+          if (!res.ok) {
+            await api.sessionClose(sessionId, false).catch(() => {})
+            collected.push({ fields: [], rows: [], rowCount: null, ms: Date.now() - started, statement: stmt, error: `${res.error}\n\nSafe Run rolled back: nothing was changed.` })
+            onChange(tab.id, { running: false, results: collected })
+            setQueryHistory(prev => [{ sql: sqlToRun, ts: Date.now(), ms: 0, error: res.error }, ...prev].slice(0, 50))
+            return
+          }
+          let rows = res.rows ?? []
+          let rowCount = res.rowCount ?? null
+          if (sql !== stmt) {
+            // The preview wrap: at most PREVIEW_ROWS rows, and the real total in its own column
+            rowCount = rows.length ? Number(rows[0][PREVIEW_TOTAL_COLUMN]) : 0
+            rows = rows.map(({ [PREVIEW_TOTAL_COLUMN]: _total, ...rest }) => rest)
+          }
+          const fields = rows.length ? Object.keys(rows[0]) : []
+          collected.push({ fields, rows, rowCount, ms: Date.now() - started, statement: stmt })
+          if (info.kind !== 'read') changes.push({ verb: info.verb, table: info.table, rows: info.kind === 'dml' ? rowCount : null })
+        }
+        onChange(tab.id, { running: false, results: collected, safeRun: { sessionId, dialect, changes, startedAt: Date.now() } })
+        setQueryHistory(prev => [{ sql: sqlToRun, ts: Date.now(), ms: collected.reduce((n, r) => n + r.ms, 0) }, ...prev].slice(0, 50))
+        return
+      }
+    }
 
     onChange(tab.id, { running: true, results: [], connectionId: connId, dbType: connForRun?.dbType })
 
@@ -4989,6 +5225,22 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
     }
   }, [tab, connections, onChange, onAfterRun, dbIpc])
 
+  const finishSafeRun = useCallback(async (commit: boolean) => {
+    const pending = tab.safeRun
+    if (!pending) return
+    const api = pending.dialect === 'mysql' ? window.electronAPI!.mysql : window.electronAPI!.pg
+    const res = await api.sessionClose(pending.sessionId, commit)
+    onChange(tab.id, { safeRun: undefined })
+    if (!res.ok) {
+      toast.error(commit
+        ? `Commit failed, nothing was saved: ${res.error}`
+        : `The transaction had already ended: ${res.error}`)
+      return
+    }
+    toast.success(commit ? 'Committed' : 'Rolled back: nothing was changed')
+    if (commit && tab.databaseName && pending.changes.some(c => c.rows === null)) onAfterRun?.(tab, true)
+  }, [tab, onChange, onAfterRun])
+
   const explainQuery = useCallback(async () => {
     if (tab.running) return
 
@@ -5006,14 +5258,18 @@ WHERE event_object_schema = '${schema.replace(/'/g, "''")}' AND event_object_tab
     }
 
     const isMongo = dbType === 'mongodb'
+    const explained = quotePgNames(sqlToRun, connections.find(c => c.id === connId), tab.databaseName)
+    // EXPLAIN ANALYZE really runs the statement: for one that changes data, show the plan only
+    const writes = !isMongo && classifyStatement(sqlToRun).kind !== 'read'
+    if (writes) toast.info('Showing the plan without running it', { description: 'EXPLAIN ANALYZE would execute this statement and change data.' })
     const explainStmt = isMongo
       ? `${sqlToRun.replace(/;\s*$/, '')}.explain("executionStats")`
-      : `EXPLAIN (ANALYZE, COSTS, VERBOSE, BUFFERS) ${sqlToRun};`
+      : writes ? `EXPLAIN ${explained};` : `EXPLAIN (ANALYZE, COSTS, VERBOSE, BUFFERS) ${explained};`
     onChange(tab.id, { running: true, results: [], connectionId: connId })
 
     let res = await dbIpc(connId).query(connId, explainStmt, tab.databaseName ?? undefined)
     if (!res.ok && !isMongo) {
-      const fallbackStmt = `EXPLAIN ${sqlToRun};`
+      const fallbackStmt = `EXPLAIN ${explained};`
       res = await dbIpc(connId).query(connId, fallbackStmt, tab.databaseName ?? undefined)
     }
 
@@ -5447,6 +5703,7 @@ ORDER BY p.oid DESC LIMIT 1`, tab.databaseName, [createdRoutine.name, createdRou
             onCellEdit={handleCellEdit}
             errorRowIndex={tab.editError?.rowIndex}
             allowNewRow={tableDbType !== 'mongodb'}
+            focusCell={tab.focusCell}
             foreignKeys={tab.foreignKeyRefs}
             fkTarget={fkTarget}
             onOpenReferencedTable={fk => onOpenTable(tab.connectionId!, tableDbType === 'mysql' ? fk.refSchema : tab.databaseName!, fk.refSchema, fk.refTable)}
@@ -6906,11 +7163,34 @@ ORDER BY p.oid DESC LIMIT 1`, tab.databaseName, [createdRoutine.name, createdRou
         <ResizableHandle className="h-px bg-border" />
         <ResizablePanel defaultSize={50} minSize={20}>
           <div className="flex flex-col h-full">
+            {tab.safeRun && (
+              <div className="flex items-start gap-3 px-3 py-2 border-b border-amber-500/40 bg-amber-500/10 shrink-0">
+                <AlertTriangle className="h-4 w-4 text-amber-400 shrink-0 mt-0.5" />
+                <div className="flex-1 min-w-0 space-y-0.5">
+                  <div className="text-xs font-semibold text-amber-300">Safe Run: nothing is saved yet</div>
+                  <div className="text-[11px] text-muted-foreground">
+                    {tab.safeRun.changes.map((c, i) => (
+                      <span key={i} className="mr-3 font-mono">
+                        {c.verb}{c.table ? ` ${c.table}` : ''}{c.rows !== null ? `: ${c.rows.toLocaleString()} row${c.rows === 1 ? '' : 's'}` : ''}
+                      </span>
+                    ))}
+                  </div>
+                  <div className="text-[10px] text-muted-foreground/70">
+                    The changed rows are in the results below (up to {PREVIEW_ROWS} per statement). Rows are locked until you decide; an idle transaction rolls back after 15 minutes.
+                  </div>
+                </div>
+                <button onClick={() => void finishSafeRun(false)}
+                  className="px-2.5 h-6 rounded border border-border text-xs text-muted-foreground hover:text-foreground hover:bg-accent/20 shrink-0">Roll back</button>
+                <button onClick={() => void finishSafeRun(true)}
+                  className="px-2.5 h-6 rounded bg-primary text-primary-foreground text-xs font-medium hover:bg-primary/90 shrink-0">Commit</button>
+              </div>
+            )}
             <ResultsGrid
               results={tab.results}
               running={tab.running}
               statusBorder="top"
               dbType={getTabDbType(tab, connections)}
+              focusCell={tab.focusCell}
             />
           </div>
         </ResizablePanel>
@@ -7123,6 +7403,7 @@ async function loadPersistedConnectionsFromDb(): Promise<PersistedConnection[]> 
       host: r.host, port: r.port, database: r.database,
       user: r.username, password: r.password, ssl: r.ssl,
       vpnConfigPath: r.vpnConfigPath, vpnUsername: r.vpnUsername, vpnPassword: r.vpnPassword,
+      options: parseConnectionOptions(r.options), sshPassword: r.sshPassword, sshPassphrase: r.sshPassphrase,
     }))
   } catch (err) {
     toast.error(`Could not load saved connections: ${err instanceof Error ? err.message : String(err)}`)
@@ -7150,6 +7431,7 @@ async function savePersistedConnections(conns: DbConnection[], prev: DbConnectio
         id: c.id, name: c.label || c.name, dbType, host: c.host, port: c.port,
         database: c.database, username: c.user, password: c.password, ssl: c.ssl,
         vpnConfigPath: c.vpnConfigPath ?? null, vpnUsername: c.vpnUsername ?? null, vpnPassword: c.vpnPassword ?? null,
+        options: c.options ?? {}, sshPassword: c.sshPassword ?? null, sshPassphrase: c.sshPassphrase ?? null,
         createdAt: Date.now(), updatedAt: Date.now(),
       }).catch(reportConnectionSaveError)
     } else {
@@ -7157,9 +7439,34 @@ async function savePersistedConnections(conns: DbConnection[], prev: DbConnectio
         name: c.label || c.name, dbType, host: c.host, port: c.port,
         database: c.database, username: c.user, password: c.password, ssl: c.ssl,
         vpnConfigPath: c.vpnConfigPath ?? null, vpnUsername: c.vpnUsername ?? null, vpnPassword: c.vpnPassword ?? null,
+        options: c.options ?? {}, sshPassword: c.sshPassword ?? null, sshPassphrase: c.sshPassphrase ?? null,
       }).catch(reportConnectionSaveError)
     }
   }
+}
+
+// Exact names of what a PostgreSQL query in this database can refer to, as loaded in the sidebar
+function pgKnownNames(conn: DbConnection | undefined, database: string | null | undefined): Set<string> {
+  const names = new Set<string>()
+  const db = conn?.databases.find(d => d.name === database)
+  for (const s of db?.schemas ?? []) {
+    names.add(s.name)
+    for (const list of [s.tables, s.views, s.materializedViews, s.functions, s.enums, s.types]) for (const o of list) names.add(o.name)
+    for (const cols of Object.values(s.columns)) for (const c of cols) names.add(c.name)
+  }
+  return names
+}
+
+// PostgreSQL reads unquoted names as lowercase; quotes the typed names that only exist with their
+// capitals (see lib/pg-identifiers) and says so
+function quotePgNames(sql: string, conn: DbConnection | undefined, database: string | null | undefined): string {
+  if (conn?.dbType !== 'postgres') return sql
+  const fix = quoteMixedCaseIdentifiers(sql, pgKnownNames(conn, database))
+  if (fix.quoted.length === 0) return sql
+  toast.info(`Quoted ${fix.quoted.map(n => `"${n}"`).join(', ')}`, {
+    description: 'PostgreSQL reads unquoted names as lowercase, so names with capitals need quotes.',
+  })
+  return fix.sql
 }
 
 function getTabDbType(tab: QueryTab, connections: DbConnection[]): 'postgres' | 'mysql' | 'mongodb' {
@@ -7456,6 +7763,7 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
   }, [])
   const [saveNameDialog, setSaveNameDialog] = useState<QueryTab | null>(null)
   const [renameDialog, setRenameDialog] = useState<{ id: string; title: string } | null>(null)
+  const [newCollectionDialog, setNewCollectionDialog] = useState<{ connId: string; dbName: string } | null>(null)
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null)
   const [tabs, setTabs] = useState<QueryTab[]>(
     _initialPersistedTabs && _initialPersistedTabs.tabs.length > 0
@@ -7493,6 +7801,12 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
 
   const newTableIn = useCallback((connId: string, dbName: string, schema: string) => {
     const tab = makeCreateTableTab(connId, dbName, schema)
+    setTabs(prev => [...prev, tab])
+    setActiveTabId(tab.id)
+  }, [])
+
+  const newViewIn = useCallback((connId: string, dbName: string, schema: string) => {
+    const tab = makeCreateViewTab(connId, dbName, schema)
     setTabs(prev => [...prev, tab])
     setActiveTabId(tab.id)
   }, [])
@@ -7619,6 +7933,20 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
 
   const tabsRef = useRef(tabs)
   useEffect(() => { tabsRef.current = tabs }, [tabs])
+
+  // A tab closed while its Safe Run was still open: roll the transaction back now, instead of
+  // holding its locks until the idle timeout
+  const safeRunsRef = useRef(new Map<string, NonNullable<QueryTab['safeRun']>>())
+  useEffect(() => {
+    const open = new Map(tabs.filter(t => t.safeRun).map(t => [t.id, t.safeRun!]))
+    for (const [tabId, pending] of safeRunsRef.current) {
+      if (tabs.some(t => t.id === tabId)) continue
+      const api = pending.dialect === 'mysql' ? window.electronAPI?.mysql : window.electronAPI?.pg
+      void api?.sessionClose(pending.sessionId, false).catch(() => {})
+      toast.info('Safe Run rolled back', { description: 'Its tab was closed before the changes were committed.' })
+    }
+    safeRunsRef.current = open
+  }, [tabs])
   const newQueryRef = useRef(newQuery)
   useEffect(() => { newQueryRef.current = newQuery }, [newQuery])
   const closeTabRef = useRef(closeTab)
@@ -7880,6 +8208,17 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
       databases: c.databases.map(d => d.name === dbName ? { ...d, open: true, loading: false, loaded: true, error: undefined, schemas } : d),
     }))
   }, [dbIpc])
+
+  const createCollection = useCallback(async (connId: string, dbName: string, name: string) => {
+    const script = `db.createCollection(${JSON.stringify(name)})`
+    const res = await window.electronAPI!.mongodb.query(connId, script, dbName)
+    if (res.ok) {
+      toast.success(`Collection "${name}" created`)
+      handleRefreshDb(connId, dbName)
+    } else {
+      toast.error(res.error || 'Failed to create collection.')
+    }
+  }, [handleRefreshDb])
 
   const handleSaveDesign = useCallback(async (tab: QueryTab): Promise<boolean> => {
     const ddl = generateTableAlterSql(tab)
@@ -8269,9 +8608,25 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
     return true
   }, [runTableTab])
 
-  const handleSaveTableEdits = useCallback(async (tab: QueryTab): Promise<boolean> => {
+  // confirmed: the save was already approved (an MCP client's request the user allowed)
+  const handleSaveTableEdits = useCallback(async (tab: QueryTab, opts: { confirmed?: boolean } = {}): Promise<boolean> => {
     const edits = Object.values(tab.pendingEdits ?? {})
     if (edits.length === 0) return true
+    const conn = connections.find(c => c.id === tab.connectionId)
+    if (!opts.confirmed && safeRunEnabled(conn?.options)) {
+      const rows = tab.results[0]?.rows ?? []
+      const lines = edits.slice().sort((a, b) => a.rowIndex - b.rowIndex).slice(0, 200).map(e => rows[e.rowIndex]
+        ? `row ${e.rowIndex + 1}  ${e.col}: ${JSON.stringify(cellEditText(rows[e.rowIndex][e.col]))} → ${e.value === null ? 'NULL' : JSON.stringify(e.value)}`
+        : `new row  ${e.col} = ${e.value === null ? 'NULL' : JSON.stringify(e.value)}`)
+      const ok = await confirmAction({
+        title: `Save ${edits.length} change${edits.length === 1 ? '' : 's'}?`,
+        subtitle: `${conn?.label || conn?.name} · ${tab.schemaName}.${tab.tableName}`,
+        message: 'This connection uses Safe Run. Check the changes before they are saved.',
+        details: lines.join('\n') + (edits.length > 200 ? `\n… and ${edits.length - 200} more` : ''),
+        confirmLabel: 'Save',
+      })
+      if (!ok) return false
+    }
     const dbType = getTabDbType(tab, connections)
     if (dbType === 'mongodb') return saveMongoEdits(tab, edits)
     const primaryKeys = tab.primaryKeys ?? []
@@ -8660,12 +9015,43 @@ WHERE n.nspname = '${esc(schema)}' AND t.typname = '${esc(typeName)}';`
   const activeTab = tabs.find(t => t.id === activeTabId) ?? tabs[0]
   const activeConn = connections.find(c => c.id === activeConnId) ?? null
 
+  // Lent to the MCP bridge (components/mcp-bridge.tsx). Its accessors read refs, so commands that
+  // wait for the UI see the latest state.
+  const tabCounterRef = useRef(tabCounter)
+  useEffect(() => { tabCounterRef.current = tabCounter }, [tabCounter])
+  const mcpApi: McpAppApi = {
+    tabs: () => tabsRef.current,
+    activeTabId: () => activeTabIdRef.current,
+    connections: () => connectionsRef.current,
+    setTabs,
+    setActiveTabId: id => { activeTabIdRef.current = id; setActiveTabId(id) },
+    reconnect: handleReconnect,
+    disconnect: handleDisconnect,
+    runTableTab,
+    sortTable: handleTableSort,
+    saveTableEdits: tab => handleSaveTableEdits(tab, { confirmed: true }),
+    closeTab,
+    openErd: handleOpenErd,
+    nextTabNumber: () => { const n = tabCounterRef.current; tabCounterRef.current = n + 1; setTabCounter(n + 1); return n },
+    ipc: dbType => getIpc(dbType) as ReturnType<McpAppApi['ipc']>,
+    dbTypeOf: tab => getTabDbType(tab, connectionsRef.current),
+    makeTab: (n, connId, database) => makeTab(n, connId, database),
+    makeTableTab: (connId, database, schema, table, dbType) => makeTableTab(connId, database, schema, table, dbType),
+    cellEditKey,
+    splitSql: splitSqlStatements,
+    processMongoRows,
+    buildRowDelete,
+    pageSize: TABLE_PAGE_SIZE,
+  }
+
   if (!isMounted) {
     return <div className="flex flex-col flex-1 min-h-0 bg-background" />
   }
 
   return (
     <div className="flex flex-col flex-1 min-h-0">
+      <McpBridge api={mcpApi} />
+      <ConfirmHost />
       <DbToolbar
         onNewConnection={() => openNewConnection()}
         onNewQuery={newQuery}
@@ -8694,6 +9080,8 @@ WHERE n.nspname = '${esc(schema)}' AND t.typname = '${esc(typeName)}';`
             onNewQueryFor={newQueryFor}
             onDatabaseAction={handleDatabaseAction}
             onNewTableIn={newTableIn}
+            onNewViewIn={newViewIn}
+            onNewCollectionIn={(connId, dbName) => setNewCollectionDialog({ connId, dbName })}
             onTableChanged={handleTableChanged}
             onRefresh={handleRefresh}
             onRefreshDb={handleRefreshDb}
@@ -8732,7 +9120,23 @@ WHERE n.nspname = '${esc(schema)}' AND t.typname = '${esc(typeName)}';`
               onSelect={setActiveTabId}
               onClose={closeTab}
               dbTypeOf={t => connections.find(c => c.id === t.connectionId)?.dbType ?? t.dbType}
+              colorOf={t => connectionColor(connections.find(c => c.id === t.connectionId)?.options)}
             />
+            {activeTab && (() => {
+              // The active tab's connection, when tagged: a colored strip, and its environment spelled out
+              const conn = connections.find(c => c.id === activeTab.connectionId)
+              const color = connectionColor(conn?.options)
+              const env = environmentInfo(conn?.options?.environment)
+              if (!conn || !color) return null
+              return (
+                <div className="flex items-center gap-2 px-3 h-5 shrink-0 text-[10px] font-semibold tracking-wide"
+                  style={{ background: `color-mix(in oklch, ${color} 16%, transparent)`, borderBottom: `1px solid color-mix(in oklch, ${color} 45%, transparent)`, color }}>
+                  <span className="h-1.5 w-1.5 rounded-full" style={{ background: color }} />
+                  {env ? env.label.toUpperCase() : 'CONNECTION'}
+                  <span className="font-normal text-muted-foreground truncate">{conn.label || conn.name}{activeTab.databaseName ? ` · ${activeTab.databaseName}` : ''}</span>
+                </div>
+              )
+            })()}
             {activeTab && (
               <div className="flex-1 min-h-0">
                 <QueryPane
@@ -8849,6 +9253,16 @@ WHERE n.nspname = '${esc(schema)}' AND t.typname = '${esc(typeName)}';`
           initial={renameDialog.title}
           onConfirm={name => commitRename(renameDialog.id, name)}
           onClose={() => setRenameDialog(null)}
+        />
+      )}
+
+      {newCollectionDialog && (
+        <NameQueryDialog
+          title="New Collection"
+          initial=""
+          placeholder="Collection name…"
+          onConfirm={name => { createCollection(newCollectionDialog.connId, newCollectionDialog.dbName, name); setNewCollectionDialog(null) }}
+          onClose={() => setNewCollectionDialog(null)}
         />
       )}
 

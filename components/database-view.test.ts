@@ -8,6 +8,7 @@ import {
   processMongoRows,
   buildRowSavePlans,
   buildRowDelete,
+  connectionStringOf,
   cellEditText,
   buildTableOrderBy,
   buildMongoSort,
@@ -366,5 +367,19 @@ describe('refreshMongoDocuments', () => {
     const patched = await refreshMongoDocuments('c', 'db', 'posts', result, [0, 1])
     expect(patched.fields).toEqual(['_id', 'title', 'views', 'tags'])
     expect(patched.rows[1]).toBe(result.rows[1])
+  })
+})
+
+describe('connectionStringOf', () => {
+  const base = { host: 'db.example.com', port: 5432, database: 'my db', user: 'app user', password: 'p@ss:word', ssl: true }
+  it('builds URLs with or without the password', () => {
+    expect(connectionStringOf({ ...base, dbType: 'postgres' }, true)).toBe('postgresql://app%20user:p%40ss%3Aword@db.example.com:5432/my%20db?sslmode=require')
+    expect(connectionStringOf({ ...base, dbType: 'postgres' }, false)).toBe('postgresql://app%20user@db.example.com:5432/my%20db?sslmode=require')
+    expect(connectionStringOf({ ...base, dbType: 'mysql', port: 3306, ssl: false }, false)).toBe('mysql://app%20user@db.example.com:3306/my%20db')
+  })
+  it('keeps MongoDB URIs, dropping the password on request', () => {
+    const mongo = { ...base, dbType: 'mongodb' as const, host: 'mongodb://me:secret@localhost:27017/?authSource=admin' }
+    expect(connectionStringOf(mongo, true)).toBe(mongo.host)
+    expect(connectionStringOf(mongo, false)).toBe('mongodb://me@localhost:27017/?authSource=admin')
   })
 })

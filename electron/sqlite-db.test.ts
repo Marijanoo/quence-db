@@ -101,3 +101,48 @@ describe('sqlite-db credential encryption', () => {
     expect(conn.vpnPassword).toBeUndefined()
   })
 })
+
+describe('sqlite-db connection options', () => {
+  beforeEach(() => {
+    encryptionAvailable = true
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quence-db-test-'))
+    vi.resetModules()
+  })
+
+  afterEach(() => {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }) } catch {}
+  })
+
+  it('upgrades a database from before the options columns without losing connections', async () => {
+    const old = new Database(path.join(tmpDir, 'quence-db.db'))
+    old.exec(`CREATE TABLE connections (
+      id TEXT PRIMARY KEY, name TEXT NOT NULL, db_type TEXT NOT NULL DEFAULT 'pg', host TEXT NOT NULL DEFAULT '',
+      port INTEGER NOT NULL DEFAULT 5432, database TEXT NOT NULL DEFAULT '', username TEXT NOT NULL DEFAULT '',
+      password TEXT NOT NULL DEFAULT '', ssl INTEGER NOT NULL DEFAULT 0, vpn_config_path TEXT, vpn_username TEXT,
+      vpn_password TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`)
+    old.prepare(`INSERT INTO connections (id, name, created_at, updated_at) VALUES ('old', 'Old one', 1, 1)`).run()
+    old.close()
+
+    const { dbGetConnections } = await import('./sqlite-db')
+    const [conn] = dbGetConnections()
+    expect(conn).toMatchObject({ id: 'old', name: 'Old one', options: {} })
+    expect(conn.sshPassword).toBeUndefined()
+  })
+
+  it('round-trips options, and encrypts the SSH secrets', async () => {
+    const { dbCreateConnection, dbUpdateConnection, dbGetConnection } = await import('./sqlite-db')
+    const options = { environment: 'production', color: 'red', ssh: { enabled: true, host: 'bastion', port: 22, user: 'me', auth: 'key', keyPath: '/k' } }
+    dbCreateConnection({ id: 'c1', name: 'conn1', options, sshPassword: 'sshpw', sshPassphrase: 'keypw' })
+
+    const raw = new Database(path.join(tmpDir, 'quence-db.db'))
+    const row = raw.prepare('SELECT options, ssh_password, ssh_passphrase FROM connections WHERE id = ?').get('c1') as any
+    raw.close()
+    expect(JSON.parse(row.options)).toEqual(options)
+    expect(row.ssh_password.startsWith('enc:v1:')).toBe(true)
+    expect(row.ssh_passphrase.startsWith('enc:v1:')).toBe(true)
+
+    expect(dbGetConnection('c1')).toMatchObject({ options, sshPassword: 'sshpw', sshPassphrase: 'keypw' })
+    dbUpdateConnection('c1', { options: { environment: 'staging' } })
+    expect(dbGetConnection('c1').options).toEqual({ environment: 'staging' })
+  })
+})

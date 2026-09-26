@@ -1,18 +1,22 @@
 'use client'
 
-import { useEffect, useState } from 'react'
-import { Minus, Square, X, Settings2 } from 'lucide-react'
+import { useCallback, useEffect, useState } from 'react'
+import { Minus, Square, X, Settings2, Plug } from 'lucide-react'
 import Image from 'next/image'
 import { DatabaseView } from '@/components/database-view'
 import { UpdateBar } from '@/components/update-bar'
 import { SettingsPanel, applySettings, DEFAULTS } from '@/components/settings-panel'
+import { McpPanel } from '@/components/mcp-panel'
 
-const version = '0.4.0'
+const version = '0.5.0'
 
 export default function Home() {
   const [updateProgress, setUpdateProgress] = useState<number | null>(null)
   const [updateDownloaded, setUpdateDownloaded] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [mcpOpen, setMcpOpen] = useState(false)
+  const [mcpRunning, setMcpRunning] = useState(false)
+  const onMcpStatus = useCallback((s: McpServerStatus) => setMcpRunning(s.running), [])
 
   useEffect(() => {
     try {
@@ -28,6 +32,10 @@ export default function Home() {
     api.onUpdateAvailable?.(() => setUpdateProgress(0))
     api.onUpdateProgress?.((p) => setUpdateProgress(p))
     api.onUpdateDownloaded(() => { setUpdateProgress(100); setUpdateDownloaded(true) })
+  }, [])
+
+  useEffect(() => {
+    window.electronAPI?.mcp?.status().then(s => setMcpRunning(s.running)).catch(() => {})
   }, [])
 
   return (
@@ -73,13 +81,14 @@ export default function Home() {
           <DatabaseView />
         </div>
         <SettingsPanel open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+        <McpPanel open={mcpOpen} onClose={() => setMcpOpen(false)} onStatus={onMcpStatus} />
       </div>
 
       {/* Bottom bar */}
       <div className="flex items-center gap-2 px-3 h-7 border-t border-border bg-card shrink-0 overflow-hidden">
         <div className="flex items-center gap-2 shrink-0">
           <button
-            onClick={() => setSettingsOpen(o => !o)}
+            onClick={() => { setSettingsOpen(o => !o); setMcpOpen(false) }}
             title="Appearance settings"
             className={`flex items-center gap-1.5 px-2 h-5 rounded text-xs transition-colors ${
               settingsOpen
@@ -89,6 +98,19 @@ export default function Home() {
           >
             <Settings2 className="h-3.5 w-3.5 shrink-0" />
             <span>Appearance</span>
+          </button>
+          <button
+            onClick={() => { setMcpOpen(o => !o); setSettingsOpen(false) }}
+            title={mcpRunning ? 'MCP server is running' : 'MCP server (off)'}
+            className={`flex items-center gap-1.5 px-2 h-5 rounded text-xs transition-colors ${
+              mcpOpen
+                ? 'text-foreground bg-accent/20'
+                : 'text-muted-foreground hover:text-foreground hover:bg-accent/20'
+            }`}
+          >
+            <Plug className="h-3.5 w-3.5 shrink-0" />
+            <span>MCP</span>
+            <span className={`h-1.5 w-1.5 rounded-full ${mcpRunning ? 'bg-green-500' : 'bg-muted-foreground/40'}`} />
           </button>
           <span className="text-xs text-muted-foreground/40 select-none">v{version}</span>
         </div>
