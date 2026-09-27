@@ -14,6 +14,8 @@ import {
   dbGetSavedQueries, dbCreateSavedQuery, dbUpdateSavedQuery, dbDeleteSavedQuery,
 } from './sqlite-db'
 import { runMongoShell } from './mongo-shell'
+import { closeAllTunnels, closeTunnel, mongoTunnelTarget, openTunnel, redisTunnelTarget } from './ssh-tunnel'
+import { knownHostsStore } from './ssh-known-hosts'
 import {
   redisCloseAll, redisCommand, redisConnect, redisConnected, redisDatabases, redisDisconnect, redisEdit, redisGet,
   redisInfo, redisScan, type RedisEdit,
@@ -31,6 +33,7 @@ import { startMcpHttpServer, type McpHttpServer, type McpLogEntry } from './mcp-
 import { dataToolEnabled, loadMcpSettings, newToken, saveMcpSettings, type DataTool, type DataToolSettings, type McpSettings } from './mcp-settings'
 import { McpToolError, type McpBackend } from './mcp-tools'
 import type { UiBridge } from './mcp-ui-tools'
+import { checkUrl, linkPreview } from './link-preview'
 
 const isProd = app.isPackaged || process.env.NODE_ENV === 'production'
 
@@ -129,6 +132,17 @@ async function createWindow() {
   })
 
   mainWindow.webContents.on('will-reload' as any, (event: Electron.Event) => event.preventDefault())
+  // The app never leaves its own page: links open in the browser, never in (or over) the app
+  const appOrigin = isProd ? 'app://-' : `http://localhost:${process.argv[2] || 3000}`
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    if (url.startsWith(appOrigin)) return
+    event.preventDefault()
+    if (/^https?:\/\//i.test(url)) void shell.openExternal(url)
+  })
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:\/\//i.test(url)) void shell.openExternal(url)
+    return { action: 'deny' }
+  })
   mainWindow.on('resize', saveWindowState)
   mainWindow.on('move', saveWindowState)
   mainWindow.on('closed', () => { saveWindowState(); mainWindow = null })
@@ -304,6 +318,20 @@ app.on('ready', () => {
 
   // ── Postgres connections ────────────────────────────────────────────────────
   const pgPools = new Map<string, Pool>()
+
+  // ── SSH tunnels (see ssh-tunnel.ts): opened when a connection's options enable SSH ──
+  type SshArgs = {
+    options?: { ssh?: { enabled?: boolean; host: string; port: number; user: string; auth: 'password' | 'key' | 'agent'; keyPath?: string } }
+    sshPassword?: string
+    sshPassphrase?: string
+  }
+  const knownHosts = knownHostsStore(app.getPath('userData'))
+  // The address the driver should use: the tunnel's local end, or null when SSH is off
+  async function throughTunnel(id: string, a: SshArgs, target: { host: string; port: number }) {
+    const ssh = a.options?.ssh
+    if (!ssh?.enabled) { closeTunnel(id); return null }
+    return openTunnel(id, { ...ssh, password: a.sshPassword, passphrase: a.sshPassphrase }, target, knownHosts.check)
+  }
   const vpnProcesses = new Map<string, ChildProcess>()
 
   function spawnVpn(id: string, configPath: string, username?: string, password?: string): Promise<void> {
@@ -393,11 +421,28 @@ app.on('ready', () => {
     }
   }
 
+  // Binary values sent back from the renderer arrive as Uint8Array; the drivers want Buffers
+  function bufferParams(params: unknown[] | undefined) {
+    return params?.map(p => p instanceof Uint8Array && !Buffer.isBuffer(p) ? Buffer.from(p) : p)
+  }
+
   function connectFailure(attempt: { cancelled: boolean }, id: string, err: unknown) {
     // A cancelled attempt must not kill the VPN: it may already belong to the newer attempt
     if (attempt.cancelled) return { ok: false, cancelled: true, error: CANCELLED }
     killVpn(id)
-    return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    return { ok: false, error: describeConnectError(err) }
+  }
+
+  // Some failures have no message: a refused connection to a name with several addresses (localhost is
+  // ::1 and 127.0.0.1) is an AggregateError whose message is empty; the details are in its errors.
+  function describeConnectError(err: unknown): string {
+    if (!(err instanceof Error)) return String(err) || 'Unknown error'
+    if (err.message) return err.message
+    const inner = err instanceof AggregateError ? err.errors : []
+    const parts = [...new Set(inner.map(e => (e instanceof Error ? e.message : String(e))).filter(Boolean))]
+    if (parts.length) return parts.join('; ')
+    const code = (err as { code?: string }).code
+    return code ? `${code}: couldn't reach the server` : `${err.name || 'Error'}: couldn't reach the server`
   }
 
   ipcMain.handle('db:cancel-connect', (_e, { id }: { id: string }) => {
@@ -418,7 +463,8 @@ app.on('ready', () => {
   // pg emits 'error' when an idle pooled client drops (VPN down, server restart). Without a
   // listener that is an uncaught exception in the main process.
   function newPgPool(config: ConstructorParameters<typeof Pool>[0]) {
-    const pool = new Pool(config)
+    // Named, so the app's own connections are recognisable in pg_stat_activity (and its server monitor)
+    const pool = new Pool({ application_name: 'QuenceDB', ...config })
     pool.on('error', err => console.warn('[pg] idle client error:', err.message))
     return pool
   }
@@ -432,22 +478,24 @@ app.on('ready', () => {
     }
   }
 
-  ipcMain.handle('pg:connect', async (_e, { id, host, port, database, user, password, ssl, vpnConfigPath, vpnUsername, vpnPassword }: {
+  ipcMain.handle('pg:connect', async (_e, { id, host, port, database, user, password, ssl, vpnConfigPath, vpnUsername, vpnPassword, ...sshArgs }: {
     id: string; host: string; port: number; database: string; user: string; password: string; ssl: boolean; vpnConfigPath?: string; vpnUsername?: string; vpnPassword?: string
-  }) => {
+  } & SshArgs) => {
     const attempt = beginConnectAttempt(id)
     let pool: Pool | undefined
     try {
       endPgPoolsFor(id)
       killVpn(id)
       if (vpnConfigPath) await attempt.race(spawnVpn(id, vpnConfigPath, vpnUsername, vpnPassword))
-      pool = newPgPool({ host, port, database, user, password, ssl: ssl ? { rejectUnauthorized: false } : false, connectionTimeoutMillis: 30000 })
+      const tunnel = await attempt.race(throughTunnel(id, sshArgs, { host, port }))
+      pool = newPgPool({ host: tunnel?.host ?? host, port: tunnel?.port ?? port, database, user, password, ssl: ssl ? { rejectUnauthorized: false } : false, connectionTimeoutMillis: 30000 })
       const client = await attempt.race(withTimeout(pool.connect(), 30000, 'Connection timed out after 30s'))
       client.release()
       pgPools.set(id, pool)
       return { ok: true }
     } catch (err) {
       pool?.end().catch(() => {})
+      closeTunnel(id)
       return connectFailure(attempt, id, err)
     } finally {
       attempt.finish()
@@ -456,6 +504,7 @@ app.on('ready', () => {
 
   ipcMain.handle('pg:disconnect', async (_e, { id }: { id: string }) => {
     endPgPoolsFor(id)
+    closeTunnel(id)
     killVpn(id)
     return { ok: true }
   })
@@ -512,7 +561,7 @@ app.on('ready', () => {
           client.release()
         }
       } else {
-        result = await pool.query(sql, params)
+        result = await pool.query(sql, bufferParams(params))
       }
       return { ok: true, rows: result.rows, fields: result.fields.map(f => f.name), rowCount: result.rowCount, ms: Date.now() - start }
     } catch (err) {
@@ -575,7 +624,7 @@ app.on('ready', () => {
     const session = touchSession(sessionId)
     if (!session) return { ok: false, error: 'Transaction session not found (it may have timed out and been rolled back)' }
     try {
-      const result = await session.client.query(sql, params)
+      const result = await session.client.query(sql, bufferParams(params))
       return { ok: true, rows: result.rows, rowCount: result.rowCount }
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) }
@@ -681,9 +730,9 @@ app.on('ready', () => {
   // ── MySQL connections ───────────────────────────────────────────────────────
   const mysqlPools = new Map<string, mysql.Pool>()
 
-  ipcMain.handle('mysql:connect', async (_e, { id, host, port, database, user, password, ssl, vpnConfigPath, vpnUsername, vpnPassword }: {
+  ipcMain.handle('mysql:connect', async (_e, { id, host, port, database, user, password, ssl, vpnConfigPath, vpnUsername, vpnPassword, ...sshArgs }: {
     id: string; host: string; port: number; database: string; user: string; password: string; ssl: boolean; vpnConfigPath?: string; vpnUsername?: string; vpnPassword?: string
-  }) => {
+  } & SshArgs) => {
     const attempt = beginConnectAttempt(id)
     let pool: mysql.Pool | undefined
     try {
@@ -691,8 +740,9 @@ app.on('ready', () => {
       mysqlPools.delete(id)
       killVpn(id)
       if (vpnConfigPath) await attempt.race(spawnVpn(id, vpnConfigPath, vpnUsername, vpnPassword))
+      const tunnel = await attempt.race(throughTunnel(id, sshArgs, { host, port }))
       pool = mysql.createPool({
-        host, port, database: database || undefined, user, password,
+        host: tunnel?.host ?? host, port: tunnel?.port ?? port, database: database || undefined, user, password,
         ssl: ssl ? { rejectUnauthorized: false } : undefined,
         connectTimeout: 10000, waitForConnections: true, connectionLimit: 5,
       })
@@ -702,6 +752,7 @@ app.on('ready', () => {
       return { ok: true }
     } catch (err) {
       pool?.end().catch(() => {})
+      closeTunnel(id)
       return connectFailure(attempt, id, err)
     } finally {
       attempt.finish()
@@ -711,6 +762,7 @@ app.on('ready', () => {
   ipcMain.handle('mysql:disconnect', async (_e, { id }: { id: string }) => {
     mysqlPools.get(id)?.end().catch(() => {})
     mysqlPools.delete(id)
+    closeTunnel(id)
     killVpn(id)
     return { ok: true }
   })
@@ -767,7 +819,7 @@ app.on('ready', () => {
     const session = touchMysqlSession(sessionId)
     if (!session) return { ok: false, error: 'Transaction session not found (it may have timed out and been rolled back)' }
     try {
-      const [rows] = await session.conn.query(sql, params) as [any, mysql.FieldPacket[]]
+      const [rows] = await session.conn.query(sql, bufferParams(params)) as [any, mysql.FieldPacket[]]
       return Array.isArray(rows)
         ? { ok: true, rows, rowCount: rows.length }
         : { ok: true, rows: [], rowCount: (rows as mysql.ResultSetHeader).affectedRows ?? 0 }
@@ -798,12 +850,14 @@ app.on('ready', () => {
       try {
         if (database) await conn.query(`USE \`${database}\``)
         const start = Date.now()
-        const [rows, fields] = await conn.query({ sql, rowsAsArray: false }, params) as [any[], mysql.FieldPacket[]]
+        const [rows, fields] = await conn.query({ sql, rowsAsArray: false }, bufferParams(params)) as [any[], mysql.FieldPacket[]]
         const ms = Date.now() - start
         const fieldNames = Array.isArray(fields) ? fields.map((f: any) => f.name) : []
         const normalizedRows = Array.isArray(rows) ? rows : []
         const rowCount = Array.isArray(rows) ? rows.length : ((rows as mysql.ResultSetHeader).affectedRows ?? 0)
-        return { ok: true, rows: normalizedRows, fields: fieldNames, rowCount, ms }
+        // The AUTO_INCREMENT value an INSERT generated (MySQL has no RETURNING)
+        const insertId = Array.isArray(rows) ? undefined : (rows as mysql.ResultSetHeader).insertId || undefined
+        return { ok: true, rows: normalizedRows, fields: fieldNames, rowCount, ms, insertId }
       } finally { conn.release() }
     } catch (err) { return { ok: false, error: err instanceof Error ? err.message : String(err) } }
   })
@@ -867,18 +921,29 @@ app.on('ready', () => {
   // ── MongoDB connections ─────────────────────────────────────────────────────
   const mongoClients = new Map<string, MongoClient>()
 
-  ipcMain.handle('mongodb:connect', async (_e, { id, host }: { id: string; host: string }) => {
+  ipcMain.handle('mongodb:connect', async (_e, { id, host, ...sshArgs }: { id: string; host: string } & SshArgs) => {
     const attempt = beginConnectAttempt(id)
     let client: MongoClient | undefined
     try {
       mongoClients.get(id)?.close().catch(() => {})
       mongoClients.delete(id)
-      client = new MongoClient(host, { connectTimeoutMS: 15000, serverSelectionTimeoutMS: 15000 })
+      let uri = host
+      let tunnelled = false
+      if (sshArgs.options?.ssh?.enabled) {
+        const target = mongoTunnelTarget(host)
+        const local = await attempt.race(throughTunnel(id, sshArgs, target))
+        if (local) { uri = target.rewrite(local); tunnelled = true }
+      } else {
+        closeTunnel(id)
+      }
+      // Through a tunnel the certificate names the real server, not 127.0.0.1
+      client = new MongoClient(uri, { connectTimeoutMS: 15000, serverSelectionTimeoutMS: 15000, ...(tunnelled ? { tlsAllowInvalidHostnames: true } : {}) })
       await attempt.race(client.connect())
       mongoClients.set(id, client)
       return { ok: true }
     } catch (err) {
       client?.close().catch(() => {})
+      closeTunnel(id)
       return connectFailure(attempt, id, err)
     } finally {
       attempt.finish()
@@ -888,6 +953,7 @@ app.on('ready', () => {
   ipcMain.handle('mongodb:disconnect', async (_e, { id }: { id: string }) => {
     mongoClients.get(id)?.close().catch(() => {})
     mongoClients.delete(id)
+    closeTunnel(id)
     return { ok: true }
   })
 
@@ -964,9 +1030,25 @@ app.on('ready', () => {
   const redisOk = async <T>(fn: () => Promise<T>) => {
     try { return { ok: true, ...(await fn()) } } catch (err) { return { ok: false, error: err instanceof Error ? err.message : String(err) } }
   }
-  ipcMain.handle('redis:connect', (_e, { id, host, port, user, password, database, ssl }: { id: string; host: string; port?: number; user?: string; password?: string; database?: string; ssl?: boolean }) =>
-    redisOk(async () => { await redisConnect(id, { host, port, user, password, database, ssl }); return {} }))
-  ipcMain.handle('redis:disconnect', async (_e, { id }: { id: string }) => { await redisDisconnect(id); return { ok: true } })
+  ipcMain.handle('redis:connect', (_e, { id, host, port, user, password, database, ssl, ...sshArgs }: { id: string; host: string; port?: number; user?: string; password?: string; database?: string; ssl?: boolean } & SshArgs) =>
+    redisOk(async () => {
+      try {
+        if (sshArgs.options?.ssh?.enabled) {
+          const target = redisTunnelTarget(host, port)
+          const local = await throughTunnel(id, sshArgs, target)
+          const at = target.rewrite(local!)
+          await redisConnect(id, { host: at.host, port: at.port, user, password, database, ssl, servername: target.host })
+        } else {
+          closeTunnel(id)
+          await redisConnect(id, { host, port, user, password, database, ssl })
+        }
+      } catch (err) {
+        closeTunnel(id)
+        throw err
+      }
+      return {}
+    }))
+  ipcMain.handle('redis:disconnect', async (_e, { id }: { id: string }) => { await redisDisconnect(id); closeTunnel(id); return { ok: true } })
   ipcMain.handle('redis:databases', (_e, { id }: { id: string }) => redisOk(async () => ({ databases: await redisDatabases(id) })))
   ipcMain.handle('redis:info', (_e, { id }: { id: string }) => redisOk(async () => ({ info: await redisInfo(id) })))
   ipcMain.handle('redis:scan', (_e, { id, db, pattern, cursor, count, type }: { id: string; db: number; pattern?: string; cursor?: string; count?: number; type?: string }) =>
@@ -1122,6 +1204,13 @@ app.on('ready', () => {
     saveMcpSettings(mcpDir, mcpSettings)
     return mcpStatus()
   })
+  ipcMain.handle('link:preview', async (_e, { url }: { url: string }) => {
+    try { return { ok: true, preview: await linkPreview(url) } } catch (err) { return { ok: false, error: err instanceof Error ? err.message : String(err) } }
+  })
+  ipcMain.handle('link:open', async (_e, { url }: { url: string }) => {
+    try { await shell.openExternal(checkUrl(url).href); return { ok: true } } catch (err) { return { ok: false, error: err instanceof Error ? err.message : String(err) } }
+  })
+
   ipcMain.handle('mcp:new-token', async () => {
     mcpSettings = { ...mcpSettings, token: newToken() }
     saveMcpSettings(mcpDir, mcpSettings)
@@ -1133,6 +1222,7 @@ app.on('ready', () => {
 
   app.on('will-quit', () => {
     sqliteCloseAll()
+    closeAllTunnels()
     void redisCloseAll()
     void mcpServer?.close()
     for (const [id] of vpnProcesses) killVpn(id)

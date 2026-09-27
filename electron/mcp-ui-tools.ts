@@ -108,11 +108,16 @@ export function registerUiTools(server: McpServer, register: Register, tool: Wra
 
   register('open_er_diagram', {
     title: 'Open the ER diagram',
-    description: 'Opens the entity-relationship diagram of a database.',
-    inputSchema: { connection, database },
+    description: 'Opens the entity-relationship diagram of a database schema, optionally centered on one table.',
+    inputSchema: {
+      connection, database,
+      schema: z.string().optional().describe('PostgreSQL schema (default: the one selected in the app, else public)'),
+      table: z.string().optional().describe('A table to center on and highlight'),
+    },
     annotations: view,
   }, tool('open_er_diagram', (a: { connection: string }) => ({ connection: a.connection }),
-    async (a: { connection: string; database?: string }) => run('openErd', { connectionId: connected(a.connection).id, database: a.database })))
+    async (a: { connection: string; database?: string; schema?: string; table?: string }) =>
+      run('openErd', { connectionId: connected(a.connection).id, database: a.database, schema: a.schema, table: a.table })))
 
   register('focus_tab', {
     title: 'Switch to a tab',

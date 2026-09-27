@@ -10,5 +10,7 @@ export default defineConfig({
   test: {
     environment: 'node',
     exclude: [...configDefaults.exclude, 'dist-electron/**'],
+    // The opt-in database tests create and drop whole databases, which is slow when they all run at once
+    testTimeout: 30_000,
   },
 })

@@ -16,6 +16,7 @@ import {
 } from '@/lib/table-actions'
 import { fetchSchemaSnapshot, snapshotSearchPath, tableDisplayDdl } from '@/lib/structure-sync'
 import { SqlHighlight } from '@/components/sql-highlight'
+import { quoteIdent } from '@/lib/grid-copy'
 import { RESTART_MESSAGE } from '@/components/structure-sync'
 
 export type TableChange =
@@ -345,7 +346,7 @@ export function TableActionsBar({ target, onOpenData, onChanged }: {
         <DropdownMenuContent align="end" className="w-56">
           <DropdownMenuItem onSelect={onOpenData} className="text-xs gap-2"><Table2 className="h-3.5 w-3.5" />Open data</DropdownMenuItem>
           <DropdownMenuItem onSelect={() => { void copyCreate() }} className="text-xs gap-2"><Copy className="h-3.5 w-3.5" />Copy CREATE statement</DropdownMenuItem>
-          <DropdownMenuItem onSelect={() => { void navigator.clipboard.writeText(`${schema}.${table}`).then(() => toast.success('Name copied')) }} className="text-xs gap-2">
+          <DropdownMenuItem onSelect={() => { const q = quoteIdent(dbType === 'mysql' ? 'mysql' : 'postgres'); void navigator.clipboard.writeText(`${q(schema)}.${q(table)}`).then(() => toast.success('Name copied')) }} className="text-xs gap-2">
             <Copy className="h-3.5 w-3.5" />Copy name
           </DropdownMenuItem>
           <DropdownMenuSeparator />

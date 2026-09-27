@@ -153,6 +153,9 @@ function tokenMatches(header: string | undefined, token: string): boolean {
   return a.length === b.length && timingSafeEqual(a, b)
 }
 
+const FIX_TOKEN = 'Copy the current setup from QuenceDB → MCP Server and add the server again (in Claude Code: claude mcp remove quence-db, then the add command shown there).'
+const NO_OAUTH = `QuenceDB doesn't use OAuth sign-in; it takes the access token in the Authorization header. The token your client sent is wrong or out of date. ${FIX_TOKEN}`
+
 function reject(res: http.ServerResponse, status: number, message: string) {
   res.writeHead(status, { 'Content-Type': 'application/json' })
   res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32000, message }, id: null }))
@@ -183,12 +186,16 @@ export function startMcpHttpServer(opts: {
   const server = http.createServer(async (req, res) => {
     try {
       const url = new URL(req.url ?? '/', 'http://127.0.0.1')
+      // Clients that got a 401 look for OAuth (discovery, then client registration); there is none
+      if (/^\/(\.well-known\/oauth-|register$|authorize$|token$)/.test(url.pathname)) {
+        return reject(res, 404, NO_OAUTH)
+      }
       if (url.pathname !== '/mcp') return reject(res, 404, 'Not found. The MCP endpoint is /mcp')
       if (!hosts.has((req.headers.host ?? '').toLowerCase())) return reject(res, 403, 'Forbidden host')
       if (req.headers.origin) return reject(res, 403, 'Requests from web pages are not allowed')
       if (!tokenMatches(req.headers.authorization, opts.token)) {
         res.setHeader('WWW-Authenticate', 'Bearer')
-        return reject(res, 401, 'Missing or wrong access token (see QuenceDB → MCP)')
+        return reject(res, 401, `Missing or wrong access token. ${FIX_TOKEN}`)
       }
       if (req.method !== 'POST') return reject(res, 405, 'Method not allowed')
 

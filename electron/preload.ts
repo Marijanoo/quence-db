@@ -102,6 +102,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
     pickFile:     (create?: boolean) => ipcRenderer.invoke('sqlite:pick-file', { create }),
   },
 
+  // Web links in cells: previews fetched by the main process, and opening them in the browser
+  links: {
+    preview: (url: string) => ipcRenderer.invoke('link:preview', { url }),
+    open:    (url: string) => ipcRenderer.invoke('link:open', { url }),
+  },
+
   files: {
     saveDialog:   (opts: { title?: string; defaultName?: string; filters?: { name: string; extensions: string[] }[] }) => ipcRenderer.invoke('file:save-dialog', opts),
     openWrite:    (filePath: string) => ipcRenderer.invoke('file:open-write', { filePath }),

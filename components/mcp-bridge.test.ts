@@ -42,6 +42,7 @@ function fakeApp() {
     splitSql: code => code.split(';').map(s => s.trim()).filter(Boolean),
     processMongoRows: rows => ({ rows, fields: Object.keys(rows[0] ?? {}) }),
     buildRowDelete: (_t, schema, table, pks, row) => ({ sql: `DELETE FROM ${schema}.${table} WHERE ${pks[0]} = $1`, params: [row[pks[0]]] }),
+    recordDeletes: () => {},
     pageSize: 200,
   }
   const shared = { sharedConnectionIds: ['c1'] }

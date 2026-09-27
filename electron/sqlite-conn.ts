@@ -68,7 +68,8 @@ function plainRow(row: Record<string, unknown>): Record<string, unknown> {
 
 // Parameters: numbers that are really integers bind as integers; big integers given as text stay text
 function bindable(params: unknown[] | undefined): unknown[] {
-  return (params ?? []).map(p => typeof p === 'boolean' ? (p ? 1 : 0) : p === undefined ? null : p)
+  return (params ?? []).map(p => typeof p === 'boolean' ? (p ? 1 : 0) : p === undefined ? null
+    : p instanceof Uint8Array && !Buffer.isBuffer(p) ? Buffer.from(p) : p)
 }
 
 // The app builds PostgreSQL-style $1, $2 placeholders; SQLite reads $1 as a named parameter and

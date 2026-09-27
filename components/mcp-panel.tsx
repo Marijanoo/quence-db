@@ -35,7 +35,7 @@ function CopyBlock({ label, value, secret }: { label: string; value: string; sec
           {copied ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}{copied ? 'Copied' : 'Copy'}
         </button>
       </div>
-      <pre className="text-[10px] font-mono bg-background border border-border rounded px-2 py-1.5 whitespace-pre-wrap break-all text-muted-foreground max-h-40 overflow-y-auto">{shown}</pre>
+      <pre className="text-[10px] font-mono bg-background border border-border rounded px-2 py-1.5 whitespace-pre-wrap break-all text-muted-foreground max-h-40 overflow-y-auto select-text cursor-text">{shown}</pre>
     </div>
   )
 }
@@ -45,6 +45,7 @@ export function McpPanel({ open, onClose, onStatus }: { open: boolean; onClose: 
   const [log, setLog] = useState<LogEntry[]>([])
   const [portText, setPortText] = useState('')
   const [showToken, setShowToken] = useState(false)
+  const [tokenCopied, setTokenCopied] = useState(false)
   const [expandedConns, setExpandedConns] = useState<Set<string>>(new Set())
   const api = typeof window !== 'undefined' ? window.electronAPI?.mcp : undefined
 
@@ -91,6 +92,12 @@ export function McpPanel({ open, onClose, onStatus }: { open: boolean; onClose: 
   }
 
   const token = status?.token ?? ''
+  const copyToken = () => {
+    navigator.clipboard.writeText(token).then(() => {
+      setTokenCopied(true)
+      setTimeout(() => setTokenCopied(false), 1500)
+    }, () => toast.error('Could not copy to the clipboard'))
+  }
   const url = status?.url ?? ''
   const claudeCode = `claude mcp add --transport http quence-db ${url} --header "Authorization: Bearer ${token}"`
   const clientJson = JSON.stringify({ mcpServers: { 'quence-db': { type: 'http', url, headers: { Authorization: `Bearer ${token}` } } } }, null, 2)
@@ -159,6 +166,9 @@ export function McpPanel({ open, onClose, onStatus }: { open: boolean; onClose: 
               <div className="flex items-center justify-between text-xs text-muted-foreground">
                 <span>Access token</span>
                 <span className="flex items-center gap-2">
+                  <button onClick={copyToken} title="Copy token" className="hover:text-foreground">
+                    {tokenCopied ? <Check className="h-3.5 w-3.5 text-green-500" /> : <Copy className="h-3.5 w-3.5" />}
+                  </button>
                   <button onClick={() => setShowToken(v => !v)} title={showToken ? 'Hide' : 'Show'} className="hover:text-foreground">
                     {showToken ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
                   </button>
@@ -167,7 +177,7 @@ export function McpPanel({ open, onClose, onStatus }: { open: boolean; onClose: 
                     className="hover:text-foreground"><RefreshCw className="h-3.5 w-3.5" /></button>
                 </span>
               </div>
-              <div className="text-[10px] font-mono bg-background border border-border rounded px-2 py-1 break-all text-muted-foreground">
+              <div className="text-[10px] font-mono bg-background border border-border rounded px-2 py-1 break-all text-muted-foreground select-text cursor-text">
                 {showToken ? token : '•'.repeat(24)}
               </div>
             </div>

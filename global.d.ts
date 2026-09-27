@@ -46,6 +46,10 @@ declare global {
       onUpdateDownloaded: (cb: () => void) => void
       installUpdate?: () => void
       cancelConnect: (id: string) => Promise<{ ok: boolean }>
+      links?: {
+        preview: (url: string) => Promise<{ ok: boolean; preview?: import('./electron/link-preview').LinkPreview; error?: string }>
+        open:    (url: string) => Promise<{ ok: boolean; error?: string }>
+      }
       // Writing exports: pick a path, then stream text into it
       files?: {
         saveDialog:   (opts: { title?: string; defaultName?: string; filters?: { name: string; extensions: string[] }[] }) => Promise<string | null>
@@ -92,7 +96,7 @@ declare global {
         }
       }
       pg: {
-        connect:        (opts: { id: string; host: string; port: number; database: string; user: string; password: string; ssl: boolean; vpnConfigPath?: string; vpnUsername?: string; vpnPassword?: string }) => Promise<{ ok: boolean; cancelled?: boolean; error?: string }>
+        connect:        (opts: { id: string; host: string; port: number; database: string; user: string; password: string; ssl: boolean; vpnConfigPath?: string; vpnUsername?: string; vpnPassword?: string; [key: string]: unknown }) => Promise<{ ok: boolean; cancelled?: boolean; error?: string }>
         disconnect:     (id: string) => Promise<{ ok: boolean; error?: string }>
         query:          (id: string, sql: string, database?: string, params?: unknown[], opts?: { searchPath?: string; settings?: Record<string, string> }) => Promise<{ ok: boolean; rows?: Record<string, unknown>[]; fields?: string[]; rowCount?: number | null; ms?: number; error?: string }>
         sessionOpen:    (id: string, database?: string, settings?: Record<string, string>, readOnly?: boolean, autocommit?: boolean) => Promise<{ ok: boolean; sessionId?: string; error?: string }>
@@ -107,9 +111,9 @@ declare global {
         selectOvpnFile: () => Promise<string | null>
       }
       mysql: {
-        connect:      (opts: { id: string; host: string; port: number; database: string; user: string; password: string; ssl: boolean; vpnConfigPath?: string; vpnUsername?: string; vpnPassword?: string }) => Promise<{ ok: boolean; cancelled?: boolean; error?: string }>
+        connect:      (opts: { id: string; host: string; port: number; database: string; user: string; password: string; ssl: boolean; vpnConfigPath?: string; vpnUsername?: string; vpnPassword?: string; [key: string]: unknown }) => Promise<{ ok: boolean; cancelled?: boolean; error?: string }>
         disconnect:   (id: string) => Promise<{ ok: boolean; error?: string }>
-        query:        (id: string, sql: string, database?: string, params?: unknown[]) => Promise<{ ok: boolean; rows?: Record<string, unknown>[]; fields?: string[]; rowCount?: number | null; ms?: number; error?: string }>
+        query:        (id: string, sql: string, database?: string, params?: unknown[]) => Promise<{ ok: boolean; rows?: Record<string, unknown>[]; fields?: string[]; rowCount?: number | null; ms?: number; insertId?: number; error?: string }>
         sessionOpen:  (id: string, database?: string, opts?: { autocommit?: boolean; consistentSnapshot?: boolean }) => Promise<{ ok: boolean; sessionId?: string; error?: string }>
         sessionQuery: (sessionId: string, sql: string, params?: unknown[]) => Promise<{ ok: boolean; rows?: Record<string, unknown>[]; rowCount?: number | null; error?: string }>
         sessionClose: (sessionId: string, commit: boolean) => Promise<{ ok: boolean; error?: string }>
@@ -141,7 +145,7 @@ declare global {
         pickFile:     (create?: boolean) => Promise<string | null>
       }
       mongodb: {
-        connect:      (opts: { id: string; host: string; port: number; database: string; user: string; password: string; ssl: boolean; vpnConfigPath?: string; vpnUsername?: string; vpnPassword?: string }) => Promise<{ ok: boolean; cancelled?: boolean; error?: string }>
+        connect:      (opts: { id: string; host: string; port: number; database: string; user: string; password: string; ssl: boolean; vpnConfigPath?: string; vpnUsername?: string; vpnPassword?: string; [key: string]: unknown }) => Promise<{ ok: boolean; cancelled?: boolean; error?: string }>
         disconnect:   (id: string) => Promise<{ ok: boolean; error?: string }>
         // params is accepted for signature parity with pg/mysql but ignored. typed keeps Int32/Double/Long
         // distinct in find results; types holds each row's BSON field types (dotted paths).

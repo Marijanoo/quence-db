@@ -11,6 +11,8 @@ import { cn } from '@/lib/utils'
 export type MenuEntry =
   | { kind: 'separator' }
   | { kind: 'label'; label: string }
+  // Wrapped, non-clickable text, e.g. why a connection failed
+  | { kind: 'note'; text: string; tone?: 'error' }
   | {
       kind?: 'item'
       label: string
@@ -32,6 +34,14 @@ function MenuEntries({ entries }: { entries: MenuEntry[] }) {
     <>
       {entries.map((entry, i) => {
         if (entry.kind === 'separator') return <DropdownMenuSeparator key={i} />
+        if (entry.kind === 'note') {
+          return (
+            <div key={i} className={cn('px-2 py-1.5 text-[11px] leading-snug whitespace-pre-wrap break-words max-w-80 max-h-40 overflow-y-auto select-text',
+              entry.tone === 'error' ? 'text-red-300' : 'text-muted-foreground')}>
+              {entry.text}
+            </div>
+          )
+        }
         if (entry.kind === 'label') return <DropdownMenuLabel key={i} className="text-[11px] py-1 font-normal text-muted-foreground truncate max-w-72">{entry.label}</DropdownMenuLabel>
         const body = (
           <>

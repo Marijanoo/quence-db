@@ -11,6 +11,7 @@ export interface RedisConnectOptions {
   password?: string
   database?: string   // default database index, as text
   ssl?: boolean
+  servername?: string // TLS: the real server name when connecting through an SSH tunnel
 }
 
 export type RedisType = 'string' | 'hash' | 'list' | 'set' | 'zset' | 'stream' | 'ReJSON-RL' | string
@@ -27,7 +28,7 @@ function baseOptions(o: RedisConnectOptions): { options: RedisOptions; url?: str
       port: o.port || 6379,
       username: o.user || undefined,
       password: o.password || undefined,
-      tls: o.ssl ? {} : undefined,
+      tls: o.ssl ? (o.servername ? { servername: o.servername } : {}) : undefined,
     },
   }
 }

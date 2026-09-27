@@ -28,7 +28,7 @@ export interface McpAppApi {
   sortTable(tab: QueryTab, column: string, dir: 'asc' | 'desc' | null): void
   saveTableEdits(tab: QueryTab): Promise<boolean>
   closeTab(id: string): void
-  openErd(connId: string, database: string): void
+  openErd(connId: string, database: string, schema?: string, table?: string): void
   nextTabNumber(): number
   // helpers of the database view
   ipc(dbType: DbType): Ipc
@@ -39,6 +39,8 @@ export interface McpAppApi {
   splitSql(code: string): string[]
   processMongoRows(rows: Record<string, unknown>[]): { rows: Record<string, unknown>[]; fields: string[] }
   buildRowDelete(dbType: 'postgres' | 'mysql', schema: string, table: string, primaryKeys: string[], row: Record<string, unknown>): { sql: string; params: unknown[] }
+  // Lets the user undo rows deleted here (SQL tables)
+  recordDeletes(tab: QueryTab, rows: Record<string, unknown>[]): void
   pageSize: number
 }
 
@@ -300,9 +302,9 @@ export async function runMcpCommand(api: McpAppApi, command: string, args: Args,
       const conn = connOf(args.connectionId)
       const database = defaultDb(conn, args.database)
       const before = new Set(api.tabs().map(t => t.id))
-      api.openErd(conn.id, database)
+      api.openErd(conn.id, database, args.schema, args.table)
       await sleep(100)
-      const erd = api.tabs().find(t => t.kind === 'erd' && t.connectionId === conn.id && t.databaseName === database)
+      const erd = api.tabs().find(t => t.id === api.activeTabId() && t.kind === 'erd')
       return { tab: erd?.id ?? null, opened: erd ? !before.has(erd.id) : false }
     }
 
@@ -466,13 +468,17 @@ export async function runMcpCommand(api: McpAppApi, command: string, args: Args,
       const ipc = api.ipc(dbType)
       let deleted = 0
       const errors: string[] = []
+      const deletedRows: Record<string, unknown>[] = []
       for (const { i, row } of rows) {
         const res = dbType === 'mongodb'
           ? await ipc.query(t.connectionId!, buildMongoCellScript(t.tableName!, row._id, r.types?.[i]?._id, { kind: 'deleteDocument' }), t.databaseName ?? undefined)
           : await (() => { const d = api.buildRowDelete(dbType === 'mysql' ? 'mysql' : 'postgres', t.schemaName!, t.tableName!, t.primaryKeys!, row); return ipc.query(t.connectionId!, d.sql, t.databaseName ?? undefined, d.params) })()
         if (!res.ok) { errors.push(`row ${i}: ${res.error}`); continue }
-        deleted += dbType === 'mongodb' ? Number(res.rows?.[0]?.deletedCount ?? 0) : (res.rowCount ?? 0)
+        const n = dbType === 'mongodb' ? Number(res.rows?.[0]?.deletedCount ?? 0) : (res.rowCount ?? 0)
+        deleted += n
+        if (n > 0 && dbType !== 'mongodb') deletedRows.push(row)
       }
+      if (deletedRows.length) api.recordDeletes(t, deletedRows)
       await api.runTableTab({ ...t, totalRows: undefined }, t.page ?? 0)
       await settle(t.id, idle)
       return { deleted, errors: errors.length ? errors : undefined }
