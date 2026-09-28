@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest'
+import { Int32, ObjectId, type MongoClient } from 'mongodb'
+import { runMongoShell } from '../electron/mongo-shell'
 import { buildMongoCellScript, buildMongoSetScript, convertMongoValue, mongoIdFilter, typedLiteral, typedValueFromText } from './mongo-cell'
 
 describe('convertMongoValue', () => {
@@ -115,7 +117,66 @@ describe('buildMongoSetScript', () => {
     ])).toBe('db.getCollection("posts").updateOne({ _id: ObjectId("64b7f0c2a1b2c3d4e5f60718") }, { $set: { "title": "Hi", "stats.views": NumberInt(10) } })')
   })
 
-  it('refuses to change _id', () => {
-    expect(() => buildMongoSetScript('posts', 1, 'int', [{ col: '_id', text: '2', type: 'int' }])).toThrow(/_id can't be changed/)
+  it("changes _id by copying, and refuses parts of a compound _id or an empty one", () => {
+    const script = buildMongoSetScript('posts', 1, 'int', [{ col: '_id', text: '2', type: 'int' }])
+    expect(script).toContain('__doc._id = NumberInt(2)')
+    expect(script.indexOf('insertOne')).toBeLessThan(script.indexOf('deleteOne'))
+    expect(() => buildMongoSetScript('posts', { a: 1 }, 'object', [{ col: '_id.a', text: '2', type: 'int' }])).toThrow(/as a whole/)
+    expect(() => buildMongoSetScript('posts', 1, 'int', [{ col: '_id', text: ' ', type: 'int' }])).toThrow(/can't be empty/)
+    expect(() => buildMongoSetScript('posts', '64b7f0c2a1b2c3d4e5f60718', 'objectId', [{ col: '_id', text: 'nope', type: 'objectId' }])).toThrow()
+  })
+})
+
+// The copy script run by the real shell, against an in-memory collection that behaves like the
+// driver (values come back as plain numbers unless promoteValues is false)
+describe('changing _id, run in the shell', () => {
+  // Like MongoDB: ObjectIds by value, numbers by value whatever their BSON type
+  const num = (v: unknown) => v && typeof v === 'object' && '_bsontype' in v && !(v instanceof ObjectId) ? Number(v.valueOf()) : v
+  const same = (a: unknown, b: unknown) => a instanceof ObjectId ? (b instanceof ObjectId && a.equals(b)) : num(a) === num(b)
+  function fakeClient(docs: Record<string, unknown>[]) {
+    const matches = (d: Record<string, unknown>, f: Record<string, unknown>) => Object.entries(f).every(([k, v]) => same(d[k], v))
+    const promote = (d: Record<string, unknown>) => Object.fromEntries(Object.entries(d).map(([k, v]) => [k, v instanceof Int32 ? v.value : v]))
+    const coll = {
+      findOne: async (f: Record<string, unknown>, o: { promoteValues?: boolean } = {}) => {
+        const d = docs.find(x => matches(x, f))
+        return d ? (o.promoteValues === false ? { ...d } : promote(d)) : null
+      },
+      updateOne: async (f: Record<string, unknown>, u: { $set: Record<string, unknown> }) => {
+        const d = docs.find(x => matches(x, f)); if (d) Object.assign(d, u.$set)
+        return { matchedCount: d ? 1 : 0 }
+      },
+      insertOne: async (d: Record<string, unknown>) => { if (docs.some(x => same(x._id, d._id))) throw new Error('E11000 duplicate key'); docs.push(d); return { acknowledged: true } },
+      deleteOne: async (f: Record<string, unknown>) => { const i = docs.findIndex(x => matches(x, f)); if (i >= 0) docs.splice(i, 1); return { deletedCount: i >= 0 ? 1 : 0 } },
+    }
+    const db = { databaseName: 'test', collection: () => coll }
+    return { db: () => db } as unknown as MongoClient
+  }
+  const oid = '64b7f0c2a1b2c3d4e5f60718'
+
+  it('moves the document to the new _id with its other edits, keeping field types', async () => {
+    const docs: Record<string, unknown>[] = [{ _id: new ObjectId(oid), title: 'Old', views: new Int32(7) }]
+    const script = buildMongoSetScript('posts', oid, 'objectId', [
+      { col: '_id', text: '64b7f0c2a1b2c3d4e5f60799', type: 'objectId' },
+      { col: 'title', text: 'New', type: 'string' },
+    ])
+    const res = await runMongoShell(fakeClient(docs), 'test', script)
+    expect(res.rows[0]).toMatchObject({ matchedCount: 1, idChanged: true })
+    expect(docs).toHaveLength(1)
+    expect(String(docs[0]._id)).toBe('64b7f0c2a1b2c3d4e5f60799')
+    expect(docs[0]._id).toBeInstanceOf(ObjectId)
+    expect(docs[0].title).toBe('New')
+    expect(docs[0].views).toBeInstanceOf(Int32)
+  })
+
+  it('refuses an _id that is taken, leaving both documents alone', async () => {
+    const docs: Record<string, unknown>[] = [{ _id: 1, a: 'x' }, { _id: 2, a: 'y' }]
+    const script = buildMongoSetScript('t', 1, 'double', [{ col: '_id', text: '2', type: 'double' }])
+    await expect(runMongoShell(fakeClient(docs), 'test', script)).rejects.toThrow(/already has that _id/)
+    expect(docs.map(d => d._id)).toEqual([1, 2])
+  })
+
+  it('reports a document that is gone', async () => {
+    const script = buildMongoSetScript('t', 5, 'double', [{ col: '_id', text: '6', type: 'double' }])
+    await expect(runMongoShell(fakeClient([]), 'test', script)).rejects.toThrow(/Document not found/)
   })
 })

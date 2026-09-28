@@ -390,7 +390,8 @@ export async function runMcpCommand(api: McpAppApi, command: string, args: Args,
       for (const e of args.edits as { row: number; column: string; value: unknown }[]) {
         if (e.row > lastRow) fail(`No row ${e.row} (use insert_rows to add rows)`)
         if (!r.fields.includes(e.column)) fail(`No column ${JSON.stringify(e.column)} (columns: ${r.fields.join(', ')})`)
-        if (dbType === 'mongodb' && (e.column === '_id' || e.column.startsWith('_id.'))) fail("_id can't be changed")
+        // A new _id is saved by copying the document under it (see buildMongoSetScript)
+        if (dbType === 'mongodb' && e.column.startsWith('_id.')) fail('Edit _id as a whole, not its parts')
         const text = e.value === null || e.value === undefined ? null : String(e.value)
         const key = api.cellEditKey(e.row, e.column)
         const row = r.rows[e.row]

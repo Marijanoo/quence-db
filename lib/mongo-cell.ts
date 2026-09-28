@@ -185,15 +185,37 @@ export function typedValueFromText(text: string | null, type: string | undefined
   }
 }
 
-// One update for all edited fields of a document; dotted names set nested fields
+// One update for all edited fields of a document; dotted names set nested fields.
+// A new _id: MongoDB never changes a document's _id, so the document is copied under the new one
+// (after the other edits, keeping every value's exact BSON type) and then the old one is deleted.
+// The copy goes first, so a failure never loses the document.
 export function buildMongoSetScript(collection: string, id: unknown, idType: string | undefined, fields: { col: string; text: string | null; type: string | undefined }[]): string {
   const filter = mongoIdFilter(id, idType)
   if (!filter) throw new Error('This document\'s _id type is not supported for editing')
-  const sets = fields.map(f => {
-    if (f.col === '_id' || f.col.startsWith('_id.')) throw new Error("_id can't be changed")
+  const coll = `db.getCollection(${lit(collection)})`
+  const idEdit = fields.find(f => f.col === '_id')
+  const sets = fields.filter(f => f !== idEdit).map(f => {
+    if (f.col.startsWith('_id.')) throw new Error('Edit _id as a whole, not its parts')
     return `${lit(f.col)}: ${typedValueFromText(f.text, f.type)}`
   })
-  return `db.getCollection(${lit(collection)}).updateOne(${filter}, { $set: { ${sets.join(', ')} } })`
+  const update = `${coll}.updateOne(${filter}, { $set: { ${sets.join(', ')} } })`
+  if (!idEdit) return update
+
+  if (idEdit.text === null || idEdit.text.trim() === '') throw new Error("_id can't be empty")
+  const newId = typedValueFromText(idEdit.text.trim(), idType)
+  if (newId === typedLiteral(id, idType)) return sets.length ? update : '({ matchedCount: 1 })'
+  return [
+    `const __coll = ${coll}`,
+    `if (await __coll.findOne({ _id: ${newId} }, { _id: 1 })) throw new Error("Another document already has that _id")`,
+    ...(sets.length ? [`await ${update}`] : []),
+    `const __doc = await __coll.findOne(${filter}, null, { promoteValues: false })`,
+    `if (!__doc) throw new Error("Document not found. It may have been changed or deleted; refresh and try again.")`,
+    `__doc._id = ${newId}`,
+    `await __coll.insertOne(__doc)`,
+    `const __del = await __coll.deleteOne(${filter})`,
+    `if (__del.deletedCount !== 1) throw new Error("Copied the document under the new _id, but couldn't delete the old one; delete it by hand")`,
+    `({ matchedCount: 1, idChanged: true })`,
+  ].join(';\n')
 }
 
 // Filter expression matching the document by _id, or null when its _id type can't be rebuilt

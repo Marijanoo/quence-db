@@ -2489,9 +2489,10 @@ export function nextTabCell(ri: number, ci: number, columns: number, rows: numbe
   return ri > 0 ? { ri: ri - 1, ci: columns - 1 } : { ri, ci }
 }
 
-// MongoDB cells that can't be edited as text: _id, and whole sub-documents (they expand instead)
+// MongoDB cells that can't be edited as text: parts of a compound _id (the whole _id can be), and
+// whole sub-documents (they expand instead)
 function isLockedMongoCell(col: string, raw: unknown) {
-  if (col === '_id' || col.startsWith('_id.')) return true
+  if (col.startsWith('_id.')) return true
   return !!raw && typeof raw === 'object' && !Array.isArray(raw) && !(raw as { _bsontype?: string })._bsontype && !(raw instanceof Date)
 }
 
@@ -3039,7 +3040,8 @@ function SingleResultGrid({ result, columnTypes, dbType, editable = false, pendi
   }, [selectedCell])
 
   const needle = rowFilter.toLowerCase()
-  const visibleRows = needle
+  // Memoized: a new array on every render would re-run everything that follows the rows
+  const visibleRows = React.useMemo(() => needle
     ? result.rows.filter(row =>
         result.fields.some(col => {
           const v = row[col]
@@ -3047,7 +3049,7 @@ function SingleResultGrid({ result, columnTypes, dbType, editable = false, pendi
           return String(typeof v === 'object' ? JSON.stringify(v) : v).toLowerCase().includes(needle)
         })
       )
-    : result.rows
+    : result.rows, [needle, result.rows, result.fields])
 
   // While searching: how many of the matching rows match in each shown column (headers light up)
   const matchCounts = React.useMemo(() => {
@@ -3084,12 +3086,17 @@ function SingleResultGrid({ result, columnTypes, dbType, editable = false, pendi
   // Tell the tab which cell is selected, by its row in the result (not its place on screen)
   const onSelectCellRef = useRef(onSelectCell)
   useEffect(() => { onSelectCellRef.current = onSelectCell }, [onSelectCell])
+  // Only real changes are reported: reporting sets the tab's state, which renders this grid again
+  const reportedCellRef = useRef<string | null>(null)
   useEffect(() => {
     if (!onSelectCellRef.current) return
-    if (!selectedCell) { onSelectCellRef.current(null); return }
-    const row = [...sortedRows, ...draftRows][selectedCell.ri]
+    const row = selectedCell ? [...sortedRows, ...draftRows][selectedCell.ri] : undefined
     const rowIndex = row ? rowIndexOf.get(row) : undefined
-    onSelectCellRef.current(rowIndex === undefined ? null : { rowIndex, col: selectedCell.col })
+    const cell = selectedCell && rowIndex !== undefined ? { rowIndex, col: selectedCell.col } : null
+    const key = cell ? `${cell.rowIndex}\u0000${cell.col}` : null
+    if (key === reportedCellRef.current) return
+    reportedCellRef.current = key
+    onSelectCellRef.current(cell)
   // rowIndexOf follows sortedRows/draftRows
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedCell, sortedRows, draftRows])
@@ -3125,7 +3132,7 @@ function SingleResultGrid({ result, columnTypes, dbType, editable = false, pendi
     activate: (ri, col, isDoc) => {
       setSelectedCell({ ri, col })
       if (!isDoc) {
-        if (dbType === 'mongodb' && (col === '_id' || col.startsWith('_id.'))) return
+        if (dbType === 'mongodb' && col.startsWith('_id.')) return
         setEditingCell({ ri, col })
         return
       }
@@ -3210,10 +3217,12 @@ function SingleResultGrid({ result, columnTypes, dbType, editable = false, pendi
       const type = types[col]
       const isId = col === '_id' || col.startsWith('_id.')
       const idOk = mongoIdFilter(row._id, types._id) !== null
-      const blocked = isId ? "_id can't be changed" : !idOk ? '_id type not supported' : undefined
+      // _id can be retyped (saving copies the document under the new one), not nulled or retyped as another type
+      const editBlocked = col.startsWith('_id.') ? 'edit _id as a whole' : !idOk ? '_id type not supported' : undefined
+      const blocked = isId ? 'not for _id' : !idOk ? '_id type not supported' : undefined
       entries.push(
         ...(editable && !isLockedMongoCell(col, raw)
-          ? [{ label: 'Edit Cell', shortcut: 'Double-click', disabled: !!blocked, hint: blocked, onSelect: () => setEditingCell({ ri, col }) }]
+          ? [{ label: col === '_id' ? 'Edit _id' : 'Edit Cell', shortcut: 'Double-click', disabled: !!editBlocked, hint: editBlocked, onSelect: () => setEditingCell({ ri, col }) }]
           : []),
         ...(dateKind && !blocked
           ? [{ label: 'Pick Date…', icon: <CalendarDays className="h-3.5 w-3.5" />, onSelect: () => setDatePopup({ rowIndex, col, kind: dateKind, anchor: menu.anchor }) }]
@@ -5784,7 +5793,7 @@ ORDER BY p.oid DESC LIMIT 1`, tab.databaseName, [createdRoutine.name, createdRou
     setSelected(null); setFormRow(0)
   }, [resultRows])
   const onSelectCell = useCallback((cell: { rowIndex: number; col: string } | null) => {
-    setSelected(cell)
+    setSelected(prev => prev && cell && prev.rowIndex === cell.rowIndex && prev.col === cell.col ? prev : cell)
     if (cell) setFormRow(cell.rowIndex)
   }, [])
 
@@ -9284,6 +9293,8 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
 
     const savedRows: number[] = []
     let failure: { rowIndex: number; message: string } | undefined
+    // A document saved under a new _id can't be re-read by its old one: the page is reloaded
+    let idChanged = false
     for (const [rowIndex, rowEdits] of [...byRow.entries()].sort(([a], [b]) => a - b)) {
       const row = result.rows[rowIndex]
       const types = result.types?.[rowIndex] ?? {}
@@ -9292,6 +9303,7 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
         const res = await getIpc('mongodb').query(connId, script, tab.databaseName ?? undefined)
         if (!res.ok) throw new Error(res.error ?? 'Unknown error')
         if (Number(res.rows?.[0]?.matchedCount ?? 0) === 0) throw new Error('Document not found. It may have been changed or deleted; refresh and try again.')
+        if (res.rows?.[0]?.idChanged) idChanged = true
         savedRows.push(rowIndex)
       } catch (err) {
         failure = { rowIndex, message: err instanceof Error ? err.message : String(err) }
@@ -9301,6 +9313,11 @@ export function DatabaseView({ isActive = true }: { isActive?: boolean }) {
 
     // Saved documents are re-read and patched in place; their edits stop being pending. Edits of the
     // failed document and the ones after it stay pending.
+    if (idChanged && !failure) {
+      await runTableTab({ ...tab, pendingEdits: undefined })
+      toast.success(`Saved ${savedRows.length} document${savedRows.length === 1 ? '' : 's'}`, { description: 'A changed _id is saved by copying the document under the new _id and deleting the old one.' })
+      return true
+    }
     let patched: QueryResult | undefined
     if (savedRows.length > 0) {
       try {
