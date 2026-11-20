@@ -9,6 +9,77 @@ import { Switch } from '@/components/ui/switch'
 import { cn } from '@/lib/utils'
 import { DATA_TOOLS, DATA_TOOL_LABELS, dataToolEnabled, type DataTool } from '@/lib/mcp-data-tools'
 
+// The databases of one shared connection, with a way to narrow MCP down to some of them. Default is
+// all (nothing stored); "Deselect all" starts an empty pick to tick the wanted ones from.
+function DatabasePicker({ conn, picked, onChange }: {
+  conn: McpServerStatus['connections'][number]
+  picked: string[] | undefined
+  onChange: (databases: string[] | null) => void
+}) {
+  const api = window.electronAPI?.mcp
+  const [expanded, setExpanded] = useState(false)
+  const [all, setAll] = useState<string[] | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  // Loaded when opened and re-read when the connection comes up, since it has to be connected to list them
+  useEffect(() => {
+    if (!expanded || !api) return
+    let stale = false
+    api.databases(conn.id).then(res => {
+      if (stale) return
+      if (res.ok) { setAll(res.databases ?? []); setError(null) } else setError(res.error ?? 'Could not list databases')
+    }, () => { if (!stale) setError('Could not list databases') })
+    return () => { stale = true }
+  }, [expanded, conn.id, conn.connected, api])
+
+  const restricted = picked !== undefined
+  // Picked names that no longer exist stay listed so they can be unticked
+  const names = [...new Set([...(all ?? []), ...(picked ?? [])])].sort((a, b) => a.localeCompare(b))
+  const toggle = (name: string) => {
+    const set = new Set(picked ?? all ?? [])
+    if (set.has(name)) set.delete(name); else set.add(name)
+    // Everything ticked is the same as the default, so store nothing
+    onChange(all && all.every(d => set.has(d)) ? null : [...set])
+  }
+
+  return (
+    <div>
+      <button onClick={() => setExpanded(v => !v)} className="w-full flex items-center gap-1.5 px-2 py-1 text-xs text-left hover:bg-accent/20 transition-colors">
+        {expanded ? <ChevronDown className="h-3 w-3 shrink-0 text-muted-foreground" /> : <ChevronRight className="h-3 w-3 shrink-0 text-muted-foreground" />}
+        <span className="truncate flex-1">{conn.name}</span>
+        <span className={cn('shrink-0 text-[10px]', restricted ? 'text-amber-400' : 'text-muted-foreground')}>
+          {restricted ? `${picked.length} selected` : 'All'}
+        </span>
+        <span className={cn('shrink-0 text-[9px] font-semibold px-1 rounded leading-4', TYPE_BADGE[conn.dbType]?.cls)}>{TYPE_BADGE[conn.dbType]?.label}</span>
+      </button>
+      {expanded && (
+        <div className="pb-1.5 pl-6 pr-2 space-y-1">
+          {error ? (
+            <p className="text-[11px] text-muted-foreground/70">{error}</p>
+          ) : all === null ? (
+            <p className="text-[11px] text-muted-foreground/70">Loading…</p>
+          ) : (
+            <>
+              <div className="flex gap-3 text-[11px]">
+                <button className="text-primary hover:underline disabled:opacity-40 disabled:no-underline" disabled={!restricted} onClick={() => onChange(null)}>Select all</button>
+                <button className="text-primary hover:underline disabled:opacity-40 disabled:no-underline" disabled={restricted && picked.length === 0} onClick={() => onChange([])}>Deselect all</button>
+              </div>
+              {names.length === 0 && <p className="text-[11px] text-muted-foreground/70">No databases.</p>}
+              {names.map(name => (
+                <label key={name} className="flex items-center gap-2 text-[11px] py-0.5 cursor-pointer select-none">
+                  <input type="checkbox" checked={!restricted || picked.includes(name)} onChange={() => toggle(name)} />
+                  <span className={cn('truncate font-mono', restricted && !picked.includes(name) && 'text-muted-foreground')}>{name}</span>
+                </label>
+              ))}
+              {restricted && picked.length === 0 && <p className="text-[11px] text-amber-400/90">No databases shared: clients see nothing on this connection.</p>}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 type LogEntry = Awaited<ReturnType<NonNullable<NonNullable<Window['electronAPI']>['mcp']>['log']>>[number]
 
 const TYPE_BADGE: Record<string, { label: string; cls: string }> = {
@@ -213,6 +284,24 @@ export function McpPanel({ open, onClose, onStatus }: { open: boolean; onClose: 
               With changing data off, queries run read-only; for a hard guarantee, connect with a database user that can only read.
             </p>
           </section>
+
+          {sharedConns.length > 0 && (
+            <section className="space-y-2">
+              <p className="text-[11px] font-semibold uppercase tracking-widest text-muted-foreground">Databases</p>
+              <p className="text-[11px] text-muted-foreground/70">
+                Every database of a shared connection is available by default. Open a connection to deselect all and pick only the ones you want.
+              </p>
+              <div className="border border-border rounded divide-y divide-border/50">
+                {sharedConns.map(c => (
+                  <DatabasePicker key={c.id} conn={c} picked={status.databases[c.id]}
+                    onChange={databases => { void api.setDatabases({ connectionId: c.id, databases }).then(apply) }} />
+                ))}
+              </div>
+              <p className="text-[11px] text-muted-foreground/70">
+                A MySQL query can still name another database on the same server (db.table); use a MySQL user limited to the databases you pick if that matters.
+              </p>
+            </section>
+          )}
 
           <section className="space-y-2">
             <p className="text-[11px] font-semibold uppercase tracking-widest text-muted-foreground">Data tools</p>

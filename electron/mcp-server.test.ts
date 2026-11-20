@@ -10,7 +10,7 @@ import * as mysql from 'mysql2/promise'
 import { MongoClient, ObjectId } from 'mongodb'
 import { startMcpHttpServer, type McpHttpServer, type McpLogEntry } from './mcp-server'
 import { checkMongoReadOnly, checkReadOnlySql, formatRows, type McpBackend, type McpConnectionInfo } from './mcp-tools'
-import { dataToolEnabled, type DataToolSettings } from './mcp-settings'
+import { databaseAllowed, dataToolEnabled, type DataToolSettings } from './mcp-settings'
 
 const TOKEN = 'test-token-0123456789abcdef'
 
@@ -59,6 +59,7 @@ describe('MCP server access', () => {
     connections: () => [{ id: 'c1', name: 'Local PG', dbType: 'pg', database: 'app', connected: false }],
     pg: () => undefined, mysql: () => undefined, mongo: () => undefined,
     dataToolAllowed: () => true,
+    databaseAllowed: () => true,
   }
 
   beforeAll(async () => { server = await startMcpHttpServer({ port: 0, token: TOKEN, backend, log: e => log.push(e), version: 'test' }) })
@@ -119,6 +120,7 @@ describe('data tool gating', () => {
       connections: () => [{ id: 'c1', name: 'Local PG', dbType: 'pg', database: 'app', connected: true }],
       pg: () => undefined, mysql: () => undefined, mongo: () => undefined,
       dataToolAllowed: tool => allowed[tool] ?? true,
+      databaseAllowed: () => true,
     }
     const server = await startMcpHttpServer({ port: 0, token: TOKEN, backend, log: () => {}, version: 'test' })
     try {
@@ -126,6 +128,47 @@ describe('data tool gating', () => {
       try {
         const res = await call(client, 'run_query', { connection: 'Local PG', sql: 'SELECT 1' })
         expect(res).toEqual({ isError: true, text: expect.stringMatching(/run_query is turned off/) })
+      } finally {
+        await client.close()
+      }
+    } finally {
+      await server.close()
+    }
+  })
+})
+
+describe('database selection', () => {
+  it('allows everything until a connection has a pick, then only the picked ones', () => {
+    expect(databaseAllowed({}, 'c1', 'anything')).toBe(true)
+    expect(databaseAllowed({ c2: ['x'] }, 'c1', 'anything')).toBe(true)   // another connection's pick
+    expect(databaseAllowed({ c1: ['app'] }, 'c1', 'app')).toBe(true)
+    expect(databaseAllowed({ c1: ['app'] }, 'c1', 'other')).toBe(false)
+    expect(databaseAllowed({ c1: [] }, 'c1', 'app')).toBe(false)         // deselected all
+  })
+
+  it('tools only see and reach the picked databases', async () => {
+    const picks: Record<string, string[]> = { c1: ['app'] }
+    const backend: McpBackend = {
+      connections: () => [{ id: 'c1', name: 'Local Mongo', dbType: 'mongodb', database: 'secret', connected: true }],
+      pg: () => undefined, mysql: () => undefined,
+      mongo: () => ({
+        db: () => ({ admin: () => ({ listDatabases: async () => ({ databases: [{ name: 'app', sizeOnDisk: 1 }, { name: 'secret', sizeOnDisk: 2 }] }) }) }),
+      }) as never,
+      dataToolAllowed: () => true,
+      databaseAllowed: (id, db) => databaseAllowed(picks, id, db),
+    }
+    const server = await startMcpHttpServer({ port: 0, token: TOKEN, backend, log: () => {}, version: 'test' })
+    try {
+      const client = await connectClient(server.url)
+      try {
+        const dbs = await call(client, 'list_databases', { connection: 'Local Mongo' })
+        expect(dbs.text).toContain('"app"')
+        expect(dbs.text).not.toContain('secret')
+        // asked for by name, or reached through the connection's own (unshared) default database
+        expect(await call(client, 'list_tables', { connection: 'Local Mongo', database: 'secret' })).toEqual({ isError: true, text: expect.stringMatching(/not shared/) })
+        expect(await call(client, 'list_tables', { connection: 'Local Mongo' })).toEqual({ isError: true, text: expect.stringMatching(/Say which database/) })
+        picks.c1 = []
+        expect((await call(client, 'list_databases', { connection: 'Local Mongo' })).text).toBe('[]')
       } finally {
         await client.close()
       }
@@ -143,6 +186,7 @@ describe('MCP UI tools', () => {
     connections: () => [{ id: 'c1', name: 'Shop', dbType: 'pg', database: 'shop', connected: false }],
     pg: () => undefined, mysql: () => undefined, mongo: () => undefined,
     dataToolAllowed: () => true,
+    databaseAllowed: () => true,
   }
 
   beforeAll(async () => {

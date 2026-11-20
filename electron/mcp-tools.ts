@@ -37,6 +37,7 @@ export interface McpBackend {
   mysql(id: string): mysql.Pool | undefined
   mongo(id: string): MongoClient | undefined
   dataToolAllowed(tool: DataToolName, connectionId: string): boolean
+  databaseAllowed(connectionId: string, database: string): boolean   // the databases the user picked for MCP
 }
 
 export const LIMITS = {
@@ -172,6 +173,11 @@ async function mysqlReadOnly<T>(backend: McpBackend, conn: McpConnectionInfo, da
 
 export async function listDatabases(backend: McpBackend, ref: string) {
   const conn = findConnection(backend, ref)
+  return (await listAllDatabases(backend, conn)).filter(d => backend.databaseAllowed(conn.id, d.name))
+}
+
+// Every database on the connection, whatever the user picked for MCP
+export async function listAllDatabases(backend: McpBackend, conn: McpConnectionInfo): Promise<{ name: string; [k: string]: unknown }[]> {
   if (conn.dbType === 'pg') {
     return pgReadOnly(backend, conn, undefined, async q => (await q(
       `SELECT datname AS name, pg_size_pretty(pg_database_size(datname)) AS size FROM pg_database WHERE NOT datistemplate AND datallowconn ORDER BY datname`)).rows)
@@ -185,15 +191,16 @@ export async function listDatabases(backend: McpBackend, ref: string) {
   return res.databases.filter(d => !['admin', 'local', 'config'].includes(d.name)).map(d => ({ name: d.name, size_bytes: d.sizeOnDisk }))
 }
 
-const dbFor = (conn: McpConnectionInfo, database?: string) => {
-  const db = database || conn.database
+const dbFor = (backend: McpBackend, conn: McpConnectionInfo, database?: string) => {
+  const db = database || (backend.databaseAllowed(conn.id, conn.database) ? conn.database : '')
   if (!db) throw new McpToolError('Say which database (see list_databases)')
+  if (!backend.databaseAllowed(conn.id, db)) throw new McpToolError(`Database "${db}" is not shared with MCP clients on "${conn.name}" (see list_databases; the user picks them in QuenceDB → MCP → Databases)`)
   return db
 }
 
 export async function listTables(backend: McpBackend, ref: string, database?: string, schema?: string) {
   const conn = findConnection(backend, ref)
-  const db = dbFor(conn, database)
+  const db = dbFor(backend, conn, database)
   if (conn.dbType === 'pg') {
     return pgReadOnly(backend, conn, db, async q => (await q(`
       SELECT n.nspname AS schema, c.relname AS name,
@@ -224,7 +231,7 @@ export async function listTables(backend: McpBackend, ref: string, database?: st
 
 export async function describeTable(backend: McpBackend, ref: string, table: string, database?: string, schema?: string) {
   const conn = findConnection(backend, ref)
-  const db = dbFor(conn, database)
+  const db = dbFor(backend, conn, database)
   if (conn.dbType === 'pg') {
     const s = schema || 'public'
     return pgReadOnly(backend, conn, db, async q => {
@@ -296,7 +303,7 @@ export async function runQueryResult(backend: McpBackend, ref: string, sql: stri
   const conn = findConnection(backend, ref)
   if (conn.dbType === 'mongodb') throw new McpToolError(`"${conn.name}" is a MongoDB connection; use mongo_find or mongo_aggregate`)
   requireDataTool(backend, 'run_query', conn)
-  const db = dbFor(conn, database)
+  const db = dbFor(backend, conn, database)
   const limit = clampRows(maxRows)
   const body = checkReadOnlySql(conn.dbType, sql)
   const started = Date.now()
@@ -345,7 +352,7 @@ export async function mongoFind(backend: McpBackend, ref: string, collection: st
   requireDataTool(backend, 'mongo_find', conn)
   const limit = clampRows(opts.limit)
   const started = Date.now()
-  const coll = backend.mongo(conn.id)!.db(dbFor(conn, opts.database)).collection(collection)
+  const coll = backend.mongo(conn.id)!.db(dbFor(backend, conn, opts.database)).collection(collection)
   const docs = await coll.find(parseMongoJson(opts.filter, 'filter') ?? {}, {
     projection: parseMongoJson(opts.projection, 'projection'),
     sort: parseMongoJson(opts.sort, 'sort'),
@@ -363,7 +370,7 @@ export async function mongoAggregate(backend: McpBackend, ref: string, collectio
   if (!Array.isArray(stages)) throw new McpToolError('pipeline must be a JSON array of stages')
   const limit = clampRows(opts.limit)
   const started = Date.now()
-  const coll = backend.mongo(conn.id)!.db(dbFor(conn, opts.database)).collection(collection)
+  const coll = backend.mongo(conn.id)!.db(dbFor(backend, conn, opts.database)).collection(collection)
   const docs = await coll.aggregate([...stages, { $limit: limit + 1 }], { maxTimeMS: LIMITS.statementTimeoutMs }).toArray()
   return formatRows(mongoRows(docs.slice(0, limit)), { ms: Date.now() - started }, docs.length > limit)
 }

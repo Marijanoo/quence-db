@@ -58,3 +58,22 @@ export function parseDataToolSettings(raw: unknown): DataToolSettings {
   }
   return { global, perConnection }
 }
+
+// Which databases of a connection MCP clients may use. No entry for a connection means all of
+// them (the default); an entry is the only ones allowed, and an empty list means none.
+export type DatabaseSelection = Record<string, string[]>
+
+export function databaseAllowed(selection: DatabaseSelection | undefined, connectionId: string, database: string | null | undefined): boolean {
+  const picked = selection?.[connectionId]
+  if (!picked || !database) return true
+  return picked.includes(database)
+}
+
+export function parseDatabaseSelection(raw: unknown): DatabaseSelection {
+  const out: DatabaseSelection = {}
+  if (!raw || typeof raw !== 'object') return out
+  for (const [connId, list] of Object.entries(raw)) {
+    if (Array.isArray(list)) out[connId] = list.filter((x): x is string => typeof x === 'string')
+  }
+  return out
+}

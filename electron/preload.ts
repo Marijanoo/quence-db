@@ -126,6 +126,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     status:   () => ipcRenderer.invoke('mcp:status'),
     update:   (patch: { enabled?: boolean; port?: number; sharedConnectionIds?: string[]; writeMode?: 'off' | 'ask' | 'allow' }) => ipcRenderer.invoke('mcp:update', patch),
     setDataTool: (args: { tool: string; connectionId?: string; enabled: boolean | null }) => ipcRenderer.invoke('mcp:set-data-tool', args),
+    setDatabases: (args: { connectionId: string; databases: string[] | null }) => ipcRenderer.invoke('mcp:set-databases', args),
+    databases: (connectionId: string) => ipcRenderer.invoke('mcp:databases', { connectionId }),
     newToken: () => ipcRenderer.invoke('mcp:new-token'),
     log:      () => ipcRenderer.invoke('mcp:log'),
     // Commands from MCP clients for the window; the handler's answer goes back with respond()

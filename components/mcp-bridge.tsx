@@ -10,7 +10,7 @@ import type { DbConnection, QueryResult, QueryTab } from '@/components/database-
 import { DialogShell, buttonCls, primaryCls } from '@/components/database-transfer'
 import { buildMongoCellScript } from '@/lib/mongo-cell'
 import { cellText } from '@/lib/grid-copy'
-import { dataToolEnabled, type DataTool, type DataToolSettings } from '@/lib/mcp-data-tools'
+import { databaseAllowed, dataToolEnabled, type DataTool, type DataToolSettings, type DatabaseSelection } from '@/lib/mcp-data-tools'
 
 type DbType = 'postgres' | 'mysql' | 'mongodb' | 'sqlite' | 'redis'
 type Ipc = { query: (id: string, sql: string, database?: string, params?: unknown[]) => Promise<{ ok: boolean; rows?: Record<string, unknown>[]; fields?: string[]; rowCount?: number | null; ms?: number; error?: string; types?: Record<string, string>[] }> }
@@ -44,7 +44,7 @@ export interface McpAppApi {
   pageSize: number
 }
 
-type Args = Record<string, any> & { sharedConnectionIds: string[]; dataTools?: DataToolSettings }
+type Args = Record<string, any> & { sharedConnectionIds: string[]; dataTools?: DataToolSettings; databases?: DatabaseSelection }
 
 class CommandError extends Error {}
 const fail = (message: string): never => { throw new CommandError(message) }
@@ -118,7 +118,9 @@ export async function runMcpCommand(api: McpAppApi, command: string, args: Args,
   const labelOf = (c: DbConnection) => c.label || c.name
   const connName = (id: string | null) => { const c = conns().find(x => x.id === id); return c ? labelOf(c) : null }
   const connOf = (id: string) => conns().find(c => c.id === id) ?? fail('Unknown connection')
-  const visible = (t: QueryTab) => !!t.connectionId && shared.has(t.connectionId)
+  // Which databases of a connection the user shared (none picked = all). No selection sent means nothing is restricted.
+  const dbOk = (connectionId: string, database: string | null | undefined) => databaseAllowed(args.databases, connectionId, database)
+  const visible = (t: QueryTab) => !!t.connectionId && shared.has(t.connectionId) && dbOk(t.connectionId, t.databaseName)
 
   const findTab = (id: string) => {
     const t = api.tabs().find(x => x.id === id)
@@ -147,9 +149,12 @@ export async function runMcpCommand(api: McpAppApi, command: string, args: Args,
   const idle = (t: QueryTab) => !t.running && !t.savingEdits
 
   const defaultDb = (conn: DbConnection, database?: string) => {
-    if (database) return database
-    if (conn.databases.some(d => d.name === conn.database)) return conn.database
-    return conn.database || conn.databases[0]?.name || fail('Say which database')
+    const db = database
+      || (conn.database && dbOk(conn.id, conn.database) ? conn.database : '')
+      || conn.databases.find(d => dbOk(conn.id, d.name))?.name
+      || fail('Say which database (see app_state for the shared ones)')
+    if (!dbOk(conn.id, db)) fail(`Database "${db}" is not shared with MCP clients on "${labelOf(conn)}" (QuenceDB → MCP → Databases).`)
+    return db
   }
 
   const summary = (t: QueryTab) => ({
@@ -236,7 +241,7 @@ export async function runMcpCommand(api: McpAppApi, command: string, args: Args,
         other_tabs: tabs.filter(t => !visible(t)).length || undefined,
         connections: conns().filter(c => shared.has(c.id)).map(c => ({
           name: labelOf(c), type: c.dbType, status: c.status, error: c.errorMsg,
-          databases: c.databases.map(d => d.name),
+          databases: c.databases.map(d => d.name).filter(d => dbOk(c.id, d)),
         })),
       }
     }
@@ -253,7 +258,7 @@ export async function runMcpCommand(api: McpAppApi, command: string, args: Args,
         }
       }
       const c = connOf(conn.id)
-      return { connection: labelOf(c), status: c.status, databases: c.databases.map(d => d.name) }
+      return { connection: labelOf(c), status: c.status, databases: c.databases.map(d => d.name).filter(d => dbOk(c.id, d)) }
     }
 
     case 'disconnect': {

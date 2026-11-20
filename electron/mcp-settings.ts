@@ -12,6 +12,7 @@ export interface McpSettings {
   sharedConnectionIds: string[]   // connections MCP clients may use; none until the user picks
   writeMode: McpWriteMode
   dataTools: DataToolSettings
+  databases: DatabaseSelection   // per connection: the only databases clients may use (none listed = all)
 }
 
 // off: no writes; ask: every write waits for Allow in the app; allow: writes run without asking
@@ -64,12 +65,31 @@ function parseDataToolSettings(raw: unknown): DataToolSettings {
   return { global, perConnection }
 }
 
+// Which databases of a connection MCP clients may use. No entry for a connection means all of
+// them (the default); an entry is the only ones allowed, and an empty list means none.
+export type DatabaseSelection = Record<string, string[]>
+
+export function databaseAllowed(selection: DatabaseSelection | undefined, connectionId: string, database: string | null | undefined): boolean {
+  const picked = selection?.[connectionId]
+  if (!picked || !database) return true
+  return picked.includes(database)
+}
+
+export function parseDatabaseSelection(raw: unknown): DatabaseSelection {
+  const out: DatabaseSelection = {}
+  if (!raw || typeof raw !== 'object') return out
+  for (const [connId, list] of Object.entries(raw)) {
+    if (Array.isArray(list)) out[connId] = list.filter((x): x is string => typeof x === 'string')
+  }
+  return out
+}
+
 export const DEFAULT_MCP_PORT = 7429
 
 export const newToken = () => randomBytes(24).toString('base64url')
 
 export function loadMcpSettings(dir: string): McpSettings {
-  const defaults: McpSettings = { enabled: false, port: DEFAULT_MCP_PORT, token: newToken(), sharedConnectionIds: [], writeMode: 'off', dataTools: defaultDataToolSettings() }
+  const defaults: McpSettings = { enabled: false, port: DEFAULT_MCP_PORT, token: newToken(), sharedConnectionIds: [], writeMode: 'off', dataTools: defaultDataToolSettings(), databases: {} }
   try {
     const raw = JSON.parse(fs.readFileSync(path.join(dir, 'mcp.json'), 'utf8')) as Partial<McpSettings>
     return {
@@ -79,6 +99,7 @@ export function loadMcpSettings(dir: string): McpSettings {
       sharedConnectionIds: Array.isArray(raw.sharedConnectionIds) ? raw.sharedConnectionIds.filter((x): x is string => typeof x === 'string') : [],
       writeMode: raw.writeMode === 'ask' || raw.writeMode === 'allow' ? raw.writeMode : 'off',
       dataTools: parseDataToolSettings(raw.dataTools),
+      databases: parseDatabaseSelection(raw.databases),
     }
   } catch {
     return defaults

@@ -1,4 +1,4 @@
-import type { DataTool, DataToolSettings } from './lib/mcp-data-tools'
+import type { DataTool, DataToolSettings, DatabaseSelection } from './lib/mcp-data-tools'
 
 export {}
 
@@ -28,6 +28,7 @@ interface McpStatus {
   sharedConnectionIds: string[]
   writeMode: 'off' | 'ask' | 'allow'
   dataTools: DataToolSettings
+  databases: DatabaseSelection
   connections: { id: string; name: string; dbType: 'pg' | 'mysql' | 'mongodb'; connected: boolean }[]
 }
 
@@ -69,6 +70,8 @@ declare global {
         status:   () => Promise<McpStatus>
         update:   (patch: { enabled?: boolean; port?: number; sharedConnectionIds?: string[]; writeMode?: 'off' | 'ask' | 'allow' }) => Promise<McpStatus>
         setDataTool: (args: { tool: DataTool; connectionId?: string; enabled: boolean | null }) => Promise<McpStatus>
+        setDatabases: (args: { connectionId: string; databases: string[] | null }) => Promise<McpStatus>
+        databases: (connectionId: string) => Promise<{ ok: boolean; databases?: string[]; error?: string }>
         newToken: () => Promise<McpStatus>
         log:      () => Promise<{ at: number; tool: string; connection?: string; detail?: string; ok: boolean; error?: string; ms: number }[]>
         onUiRequest?: (cb: (req: { id: string; command: string; args: Record<string, unknown> }) => void) => () => void

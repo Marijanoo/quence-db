@@ -30,8 +30,8 @@ import {
 } from './mongo-transfer'
 import { StringDecoder } from 'string_decoder'
 import { startMcpHttpServer, type McpHttpServer, type McpLogEntry } from './mcp-server'
-import { dataToolEnabled, loadMcpSettings, newToken, saveMcpSettings, type DataTool, type DataToolSettings, type McpSettings } from './mcp-settings'
-import { McpToolError, type McpBackend } from './mcp-tools'
+import { databaseAllowed, dataToolEnabled, loadMcpSettings, newToken, saveMcpSettings, type DataTool, type DataToolSettings, type McpSettings } from './mcp-settings'
+import { listAllDatabases, McpToolError, type McpBackend } from './mcp-tools'
 import type { UiBridge } from './mcp-ui-tools'
 import { checkUrl, linkPreview } from './link-preview'
 
@@ -1110,6 +1110,7 @@ app.on('ready', () => {
     mysql: id => mysqlPools.get(id),
     mongo: id => mongoClients.get(id),
     dataToolAllowed: (tool, connectionId) => dataToolEnabled(mcpSettings.dataTools, tool as DataTool, connectionId),
+    databaseAllowed: (connectionId, database) => databaseAllowed(mcpSettings.databases, connectionId, database),
   }
 
   // Commands for the window (open tabs, stage edits, …): sent with an id, answered via mcp:ui-response
@@ -1127,7 +1128,7 @@ app.on('ready', () => {
       uiPending.set(id, { resolve, reject, timer })
       // Waiting for Allow/Deny: draw the user's attention to the window
       if (args.approval === 'ask' && !win.isFocused()) win.flashFrame(true)
-      win.webContents.send('mcp:ui-request', { id, command, args: { ...args, sharedConnectionIds: mcpSettings.sharedConnectionIds, dataTools: mcpSettings.dataTools } })
+      win.webContents.send('mcp:ui-request', { id, command, args: { ...args, sharedConnectionIds: mcpSettings.sharedConnectionIds, dataTools: mcpSettings.dataTools, databases: mcpSettings.databases } })
     }),
   }
   ipcMain.handle('mcp:ui-response', (_e, { id, ok, result, error }: { id: string; ok: boolean; result?: unknown; error?: string }) => {
@@ -1175,6 +1176,7 @@ app.on('ready', () => {
     sharedConnectionIds: mcpSettings.sharedConnectionIds,
     writeMode: mcpSettings.writeMode,
     dataTools: mcpSettings.dataTools,
+    databases: mcpSettings.databases,
     connections: savedConnections().map(c => ({ id: c.id, name: c.name, dbType: dbTypeOf(c.dbType), connected: isConnected(c) })),
   })
 
@@ -1203,6 +1205,24 @@ app.on('ready', () => {
     mcpSettings = { ...mcpSettings, dataTools }
     saveMcpSettings(mcpDir, mcpSettings)
     return mcpStatus()
+  })
+  // The databases MCP clients may use on a connection: null = all of them (the default), a list = only those
+  ipcMain.handle('mcp:set-databases', (_e, { connectionId, databases }: { connectionId: string; databases: string[] | null }) => {
+    const next = { ...mcpSettings.databases }
+    if (databases === null) delete next[connectionId]
+    else next[connectionId] = databases.filter(d => typeof d === 'string')
+    mcpSettings = { ...mcpSettings, databases: next }
+    saveMcpSettings(mcpDir, mcpSettings)
+    return mcpStatus()
+  })
+  // Every database on a shared, connected connection, for the picker in the MCP panel
+  ipcMain.handle('mcp:databases', async (_e, { connectionId }: { connectionId: string }) => {
+    try {
+      const conn = mcpBackend.connections().find(c => c.id === connectionId)
+      if (!conn) return { ok: false, error: 'Not a shared connection' }
+      if (!conn.connected) return { ok: false, error: 'Connect it to see its databases' }
+      return { ok: true, databases: (await listAllDatabases(mcpBackend, conn)).map(d => d.name) }
+    } catch (err) { return { ok: false, error: err instanceof Error ? err.message : String(err) } }
   })
   ipcMain.handle('link:preview', async (_e, { url }: { url: string }) => {
     try { return { ok: true, preview: await linkPreview(url) } } catch (err) { return { ok: false, error: err instanceof Error ? err.message : String(err) } }
